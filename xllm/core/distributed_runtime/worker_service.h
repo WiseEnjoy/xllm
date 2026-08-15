@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "runtime/forward_shared_memory_manager.h"
 #include "runtime/worker.h"
@@ -171,11 +172,13 @@ class WorkerService : public proto::DistributeWorker {
             torch::Tensor& src_seq_idxes,
             torch::Tensor& out_tokens,
             torch::Tensor& out_logprobs);
+  void record_speculative_metrics_from_output(const torch::Tensor& next_tokens);
   DISALLOW_COPY_AND_ASSIGN(WorkerService);
 
  private:
   // runtime options
   runtime::Options options_;
+  std::vector<std::string> speculative_position_labels_;
 
   bool initialized_;
 

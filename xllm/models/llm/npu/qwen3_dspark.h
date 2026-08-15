@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "framework/model_loader.h"
 #include "framework/state_dict/state_dict.h"
+#include "models/llm/npu/dspark_confidence_head.h"
 #include "models/llm/npu/qwen3_dflash.h"
 #include "models/model_registry.h"
 

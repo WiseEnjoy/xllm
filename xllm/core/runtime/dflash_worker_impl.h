@@ -24,9 +24,44 @@ limitations under the License.
 
 #include "framework/kv_cache/embedding_cache.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
+#include "framework/model/model_args.h"
 #include "runtime/speculative_worker_impl.h"
+#include "util/utils.h"
 
 namespace xllm {
+
+namespace dflash_detail {
+
+inline int32_t decode_draft_width(int32_t num_speculative_tokens,
+                                  bool sample_from_anchor) {
+  return sample_from_anchor ? num_speculative_tokens
+                            : num_speculative_tokens + 1;
+}
+
+inline void invalidate_draft_model_geometry(ModelInputParams& input_params) {
+  // Attention metadata is model-owned: DeepSeek-V4 bakes DSA group layout and
+  // sparse tiling values such as ori_win_left into opaque tensors. A draft
+  // input copied from the target must rebuild those tensors for draft geometry.
+  input_params.attn_metadata.reset();
+}
+
+enum class DSparkSasMode : uint8_t {
+  NOT_DSPARK,
+  COMPATIBILITY,
+  NATIVE,
+};
+
+inline DSparkSasMode classify_dspark_sas_mode(const ModelArgs& draft_args,
+                                              bool sample_from_anchor) {
+  if (!sample_from_anchor ||
+      !util::is_deepseek_v4_dspark_model_type(draft_args.model_type())) {
+    return DSparkSasMode::NOT_DSPARK;
+  }
+  return draft_args.dspark_use_native_sas() ? DSparkSasMode::NATIVE
+                                            : DSparkSasMode::COMPATIBILITY;
+}
+
+}  // namespace dflash_detail
 
 class DFlashWorkerImpl : public SpeculativeWorkerImpl {
  public:
@@ -93,6 +128,15 @@ class DFlashWorkerImpl : public SpeculativeWorkerImpl {
                                ForwardInput& validate_input);
 
  private:
+  bool draft_use_block_parallel_rows() const {
+    return draft_sas_mode_ == dflash_detail::DSparkSasMode::COMPATIBILITY;
+  }
+  BatchForwardType draft_batch_forward_type() const {
+    return draft_sas_mode_ == dflash_detail::DSparkSasMode::NATIVE
+               ? BatchForwardType::DECODE
+               : BatchForwardType::CHUNKED_PREFILL;
+  }
+
   void fill_validate_input_from_draft_outputs(const DraftBlock& draft_block,
                                               ForwardInput& validate_input,
                                               Stream& compute_stream);
@@ -136,6 +180,8 @@ class DFlashWorkerImpl : public SpeculativeWorkerImpl {
 #endif
   int32_t mask_token_id_ = -1;
   int64_t expected_context_hidden_size_ = 0;
+  dflash_detail::DSparkSasMode draft_sas_mode_ =
+      dflash_detail::DSparkSasMode::NOT_DSPARK;
 };
 
 }  // namespace xllm
