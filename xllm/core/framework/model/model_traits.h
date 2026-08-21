@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -269,6 +269,25 @@ struct has_dspark_markov_bias<
     T,
     std::void_t<decltype(std::declval<T>()->dspark_markov_bias(
         std::declval<const torch::Tensor&>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_dspark_confidence_probs : std::false_type {};
+
+template <typename T>
+struct has_dspark_confidence_probs<
+    T,
+    std::void_t<decltype(std::declval<T>()->dspark_confidence_probs(
+        std::declval<const torch::Tensor&>(),
+        std::declval<const torch::Tensor&>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_has_dspark_confidence_head : std::false_type {};
+
+template <typename T>
+struct has_has_dspark_confidence_head<
+    T,
+    std::void_t<decltype(std::declval<T>()->has_dspark_confidence_head())>>
+    : std::true_type {};
 
 }  // namespace detail
 }  // namespace xllm
