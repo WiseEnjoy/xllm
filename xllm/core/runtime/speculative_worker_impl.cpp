@@ -16,22 +16,77 @@ limitations under the License.
 #include "speculative_worker_impl.h"
 
 #include <algorithm>
+#include <cctype>
+#include <filesystem>
+#include <system_error>
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/eplb/eplb_utils.h"
+#include "core/framework/kv_cache/kv_cache_capacity.h"
 #include "core/framework/kv_cache/kv_cache_estimation.h"
+#include "core/framework/kv_cache/kv_cache_shape.h"
+#include "core/framework/model/model_args.h"
 #include "core/framework/model/mtp_utils.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/speculative/spec_input_builder.h"
+#include "runtime/llm_worker_impl.h"
+#include "runtime/vlm_worker_impl.h"
+#include "util/hash_util.h"
 #include "util/slice.h"
 #include "util/tensor_helper.h"
 #include "util/timer.h"
 #include "util/utils.h"
 
 namespace xllm {
+
+int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args) {
+  const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
+  const int64_t cp_size = std::max<int64_t>(parallel_args.cp_size(), 1);
+  return std::max<int64_t>(parallel_args.world_size() / dp_size / cp_size, 1);
+}
+
+KVCacheShape build_speculative_draft_kv_cache_shape(
+    const KVCacheShape& target_kv_cache_shape,
+    const ModelArgs& draft_model_args,
+    int64_t block_size,
+    int64_t draft_world_size) {
+  CHECK(!target_kv_cache_shape.key_cache_shape().empty())
+      << "target KV cache shape must contain key cache shape";
+  if (target_kv_cache_shape.has_grouped_cache_layout()) {
+    return target_kv_cache_shape;
+  }
+
+  KVCacheCapacity draft_capacity;
+  draft_capacity.n_blocks(target_kv_cache_shape.key_cache_shape()[0])
+      .block_size(block_size);
+  return KVCacheShape(draft_capacity, draft_model_args, draft_world_size);
+}
+
+KVCacheShape SpeculativeWorkerImpl::draft_kv_cache_shape(
+    const KVCacheShape& target_kv_cache_shape) const {
+  if (draft_impl_ == nullptr) {
+    return target_kv_cache_shape;
+  }
+  return build_draft_kv_cache_shape(target_kv_cache_shape);
+}
+
+KVCacheShape SpeculativeWorkerImpl::build_draft_kv_cache_shape(
+    const KVCacheShape& target_kv_cache_shape,
+    int64_t draft_world_size) const {
+  if (draft_world_size <= 0 &&
+      !target_kv_cache_shape.has_grouped_cache_layout()) {
+    draft_world_size =
+        get_dp_local_tp_size(draft_impl_->context_.get_parallel_args());
+  }
+  return build_speculative_draft_kv_cache_shape(
+      target_kv_cache_shape,
+      draft_impl_->context_.get_model_args(),
+      options_.block_size(),
+      draft_world_size);
+}
 
 namespace {
 #define TENSOR_REPEAT(tensor_, repeats)                                       \
@@ -45,10 +100,48 @@ Slice<int32_t> tensor_slice(const torch::Tensor& tensor) {
   return {tensor.data_ptr<int32_t>(), static_cast<size_t>(tensor.numel())};
 }
 
-int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args) {
-  const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
-  const int64_t cp_size = std::max<int64_t>(parallel_args.cp_size(), 1);
-  return std::max<int64_t>(parallel_args.world_size() / dp_size / cp_size, 1);
+std::string stable_path_digest(const std::string& path_string) {
+  const std::filesystem::path path(path_string);
+  std::error_code error;
+  const std::filesystem::path canonical_path =
+      std::filesystem::weakly_canonical(path, error);
+  const std::string normalized_path =
+      (error ? path.lexically_normal() : canonical_path).generic_string();
+  const XXH3Key path_hash = hash_string(normalized_path);
+
+  constexpr char HEX_DIGITS[] = "0123456789abcdef";
+  std::string digest;
+  digest.reserve(XXH3_128BITS_HASH_VALUE_LEN * 2);
+  for (uint8_t byte : path_hash.data) {
+    digest.push_back(HEX_DIGITS[byte >> 4]);
+    digest.push_back(HEX_DIGITS[byte & 0x0f]);
+  }
+  return digest;
+}
+
+std::string draft_store_key_component(const runtime::Options& options) {
+  std::string algorithm = options.speculative_algorithm();
+  std::transform(algorithm.begin(),
+                 algorithm.end(),
+                 algorithm.begin(),
+                 [](unsigned char character) {
+                   return static_cast<char>(std::tolower(character));
+                 });
+
+  const std::string draft_model_path = options.draft_model_path().value_or("");
+  if (draft_model_path.empty()) {
+    return "spec_draft::" + algorithm + "::embedded";
+  }
+
+  std::string draft_model_name = std::filesystem::path(draft_model_path)
+                                     .lexically_normal()
+                                     .filename()
+                                     .generic_string();
+  if (draft_model_name.empty()) {
+    draft_model_name = "checkpoint";
+  }
+  return "spec_draft::" + algorithm + "::" + draft_model_name +
+         "::" + stable_path_digest(draft_model_path);
 }
 
 KVCacheEstimateOptions make_kv_cache_estimate_options(
@@ -83,11 +176,19 @@ KVCacheEstimateOptions make_kv_cache_estimate_options(
       static_cast<int64_t>(options.num_speculative_tokens());
   estimate_options.max_tokens_per_batch =
       static_cast<int64_t>(options.max_tokens_per_batch());
+  estimate_options.max_tokens_per_chunk_for_prefill =
+      static_cast<int64_t>(options.max_tokens_per_chunk_for_prefill());
   estimate_options.max_linear_state_cache_slots =
       options.max_linear_state_cache_slots();
   estimate_options.is_draft_engine = options.is_draft_engine();
+  estimate_options.enable_chunked_prefill = options.enable_chunked_prefill();
+  estimate_options.enable_schedule_overlap = options.enable_schedule_overlap();
+  const KVCacheConfig& kv_cache_config = KVCacheConfig::get_instance();
   estimate_options.enable_prefix_cache =
-      KVCacheConfig::get_instance().enable_prefix_cache();
+      kv_cache_config.enable_prefix_cache() &&
+      !kv_cache_config.enable_xtensor();
+  estimate_options.enable_disagg_pd = options.enable_disagg_pd();
+  estimate_options.instance_role = options.instance_role();
   return estimate_options;
 }
 
@@ -228,12 +329,31 @@ SpeculativeWorkerImpl::SpeculativeWorkerImpl(
     const ParallelArgs& parallel_args,
     const torch::Device& device,
     const runtime::Options& options,
-    const runtime::Options& target_options)
+    const runtime::Options& target_options,
+    WorkerType worker_type)
     : WorkerImpl(parallel_args, device, options),
       draft_sampling_mode_(
           parse_draft_sampling_mode(options.draft_sampling_mode())) {
-  impl_ =
-      std::make_unique<LLMWorkerImpl>(parallel_args, device, target_options);
+  if (worker_type == WorkerType::LLM) {
+    impl_ =
+        std::make_unique<LLMWorkerImpl>(parallel_args, device, target_options);
+  } else if (worker_type == WorkerType::VLM) {
+    impl_ =
+        std::make_unique<VLMWorkerImpl>(parallel_args, device, target_options);
+  } else {
+    LOG(FATAL) << "Unsupported speculative worker type: "
+               << worker_type.to_string();
+  }
+}
+
+SpeculativeWorkerImpl::~SpeculativeWorkerImpl() {
+  if (impl_ != nullptr) {
+    impl_->clear_hierarchy_kv_cache_transfer();
+  }
+  if (draft_impl_ != nullptr) {
+    draft_impl_->clear_hierarchy_kv_cache_transfer();
+  }
+  clear_hierarchy_kv_cache_transfer();
 }
 
 bool SpeculativeWorkerImpl::init_model(const std::string& model_weights_path,
@@ -241,6 +361,7 @@ bool SpeculativeWorkerImpl::init_model(const std::string& model_weights_path,
                                        MasterStatus master_status) {
   // Base class only loads the target model.
   bool result = true;
+  CHECK(impl_ != nullptr);
   if (impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
     result = impl_->WorkerImpl::init_model(
         model_weights_path, random_seed, master_status);
@@ -299,6 +420,67 @@ bool SpeculativeWorkerImpl::allocate_kv_cache(
   return impl_->allocate_kv_cache(kv_cache_shape);
 }
 
+void SpeculativeWorkerImpl::prepare_hierarchy_kv_cache_transfers() {
+  if (options_.host_blocks_factor() <= 1.0 || draft_impl_ == nullptr) {
+    return;
+  }
+
+  CHECK(impl_ != nullptr);
+  std::shared_ptr<HierarchyKVCacheTransfer> unified_transfer =
+      hierarchy_kv_cache_transfer_;
+  if (unified_transfer == nullptr) {
+    unified_transfer = impl_->get_hierarchy_kv_cache_transfer();
+  }
+  if (unified_transfer == nullptr) {
+    unified_transfer = draft_impl_->get_hierarchy_kv_cache_transfer();
+  }
+  if (unified_transfer == nullptr) {
+    unified_transfer = impl_->create_hierarchy_kv_cache_transfer();
+  }
+
+  if (impl_->get_hierarchy_kv_cache_transfer() == nullptr) {
+    impl_->bind_hierarchy_kv_cache_transfer(
+        unified_transfer,
+        HierarchyKVCacheTransfer::CacheRole::TARGET,
+        compute_stream_.get(),
+        /*store_key_component=*/"main");
+  } else {
+    CHECK_EQ(impl_->get_hierarchy_kv_cache_transfer().get(),
+             unified_transfer.get())
+        << "Speculative target worker hierarchy KV cache transfer changed "
+           "unexpectedly.";
+  }
+
+  if (draft_impl_->get_hierarchy_kv_cache_transfer() == nullptr) {
+    draft_impl_->bind_hierarchy_kv_cache_transfer(
+        unified_transfer,
+        HierarchyKVCacheTransfer::CacheRole::DRAFT,
+        compute_stream_.get(),
+        draft_store_key_component(options_));
+  } else {
+    CHECK_EQ(draft_impl_->get_hierarchy_kv_cache_transfer().get(),
+             unified_transfer.get())
+        << "Speculative draft worker hierarchy KV cache transfer changed "
+           "unexpectedly.";
+  }
+
+  if (hierarchy_kv_cache_transfer_ == nullptr) {
+    set_hierarchy_kv_cache_transfer(std::move(unified_transfer));
+  }
+}
+
+void SpeculativeWorkerImpl::finalize_hierarchy_kv_cache_transfers() {
+  if (options_.host_blocks_factor() <= 1.0 || draft_impl_ == nullptr) {
+    return;
+  }
+
+  CHECK(hierarchy_kv_cache_transfer_ != nullptr)
+      << "Speculative hierarchy KV cache transfer is not prepared.";
+  if (!hierarchy_kv_cache_transfer_->registration_finalized()) {
+    CHECK(hierarchy_kv_cache_transfer_->finalize_registration());
+  }
+}
+
 #if defined(USE_NPU)
 bool SpeculativeWorkerImpl::allocate_kv_cache_with_transfer(
     const KVCacheShape& kv_cache_shape) {
@@ -308,6 +490,9 @@ bool SpeculativeWorkerImpl::allocate_kv_cache_with_transfer(
 
 std::optional<ForwardOutput> SpeculativeWorkerImpl::step(
     const ForwardInput& input) {
+  ModelInputParams& mutable_params =
+      const_cast<ModelInputParams&>(input.input_params);
+  set_hierarchy_layer_synchronizer(mutable_params);
   const bool run_speculative_decode =
       should_run_speculative_decode(input.input_params);
   if (input.input_params.meta.num_sequences == 0 ||
@@ -483,17 +668,24 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
   const int32_t num_val_tokens = num_speculative_tokens + 1;
   const int32_t total_num_val_tokens = num_sequences * num_val_tokens;
   const int32_t block_size = options_.block_size();
+  // Hybrid targets (for example Qwen3.8 GDN) mark validation as spec-verify
+  // before entering this generic builder.  They must keep one sequence row
+  // with an N+1-token query so recurrent state is checkpointed and committed
+  // by the model's spec-verify kernel instead of being expanded into N+1
+  // independent decode rows.
+  const bool use_chunked_spec_verify =
+      ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
+      input.input_params.is_spec_verify;
   specBuilder::DecodeRowContext row_ctx =
       specBuilder::make_decode_row_context(input);
 
   Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
-  Slice<int32_t> positions = tensor_slice(input.positions_host);
   Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
   specBuilder::DecodeBuildBuffers buf;
   buf.out_token_ids.reserve(total_num_val_tokens);
   buf.out_positions.reserve(total_num_val_tokens);
   buf.out_new_cache_slots.reserve(total_num_val_tokens);
-  if (!::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+  if (!use_chunked_spec_verify) {
     buf.out_kv_seq_lens.reserve(total_num_val_tokens);
     buf.out_q_seq_lens.reserve(total_num_val_tokens);
     buf.out_q_cu_seq_lens.reserve(total_num_val_tokens);
@@ -506,13 +698,8 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
   std::vector<int32_t> atb_q_cu_seq_lens_vec = {};
   int32_t atb_kv_max_seq_len = 0;
   for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-    int32_t start_position = positions[seq_id];
     int32_t kv_len =
         specBuilder::calc_kv_len(kv_seq_lens, seq_id, /*offset=*/0);
-    CHECK_EQ(start_position + 1, kv_len)
-        << "validate position/kv_len mismatch, seq_id=" << seq_id
-        << ", start_position=" << start_position << ", kv_len=" << kv_len;
-
     for (int32_t val_idx = 0; val_idx < num_val_tokens; ++val_idx) {
       specBuilder::RowSpec row;
       row.seq_id = seq_id;
@@ -522,16 +709,13 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
         row.token_id = -val_idx;
       }
       row.position_offset = val_idx;
-      row.append_kv_len =
-          !::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
-      row.append_q_len_one =
-          !::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
-      row.append_block_table =
-          !::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
+      row.append_kv_len = !use_chunked_spec_verify;
+      row.append_q_len_one = !use_chunked_spec_verify;
+      row.append_block_table = !use_chunked_spec_verify;
       specBuilder::append_decode_row(row_ctx, row, block_size, buf);
     }
 
-    if (::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+    if (use_chunked_spec_verify) {
       const int32_t kv_len_after_validation = kv_len + num_speculative_tokens;
       specBuilder::update_kv_seq_lens_and_max(
           atb_kv_seq_lens_vec, kv_len_after_validation, atb_kv_max_seq_len);
@@ -551,7 +735,7 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
                                           token_options,
                                           position_options);
   // update the input_params
-  if (!::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+  if (!use_chunked_spec_verify) {
     input_params.meta.num_sequences = total_num_val_tokens;
     input_params.meta.q_max_seq_len = 1;
     input_params.meta.batch_forward_type = BatchForwardType::DECODE;
@@ -559,7 +743,7 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
     input_params.meta.q_max_seq_len = num_val_tokens;
     input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
   }
-  if (::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+  if (use_chunked_spec_verify) {
     specBuilder::update_input_params(input_params,
                                      buf,
                                      num_val_tokens,
@@ -634,7 +818,6 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
       specBuilder::make_decode_row_context(input);
 
   Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
-  Slice<int32_t> positions = tensor_slice(input.positions_host);
   Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
   specBuilder::DecodeBuildBuffers buf;
   buf.out_token_ids.reserve(total_num_val_tokens);
@@ -647,12 +830,8 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
                                row_ctx.block_table_stride);
 
   for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-    int32_t start_position = positions[seq_id];
     int32_t kv_len =
         specBuilder::calc_kv_len(kv_seq_lens, seq_id, /*offset=*/0);
-    CHECK_EQ(start_position + 1, kv_len)
-        << "validate position/kv_len mismatch, seq_id=" << seq_id
-        << ", start_position=" << start_position << ", kv_len=" << kv_len;
     const int32_t seq_val_tokens =
         per_seq_val_tokens[static_cast<size_t>(seq_id)];
 
