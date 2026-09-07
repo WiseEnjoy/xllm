@@ -592,6 +592,13 @@ class DeepseekV4Attention(Attention):
     def process_weights_after_loading(self) -> None:
         for m in (self.q_a_proj, self.kv_proj, self.q_b_proj):
             m.process_weights_after_loading()
+        # Resident bf16 compressor weights: aclnnCompressor consumes bf16 while
+        # the checkpoint keeps wkv/wgate/norm in fp32. Casting per forward
+        # re-allocated ~33MB per layer per step; build the cast once here.
+        if hasattr(self, "cmp_wkv"):
+            self._cmp_wkv_bf16 = self.cmp_wkv.weight.to(torch.bfloat16).contiguous()
+            self._cmp_wgate_bf16 = self.cmp_wgate.weight.to(torch.bfloat16).contiguous()
+            self._cmp_norm_bf16 = self.cmp_norm.weight.to(torch.bfloat16).contiguous()
         # Keep o_b in checkpoint [N, K] layout. Native DSAttention sends this
         # unquantized RowParallelLinear through F.linear(input, weight); the
         # generic NPU preparation transposes it to FRACTAL_NZ and selects a
@@ -746,9 +753,9 @@ class DeepseekV4Attention(Attention):
         bf16 = torch.bfloat16
         # Dump ACTUAL kernel args (post-cast) with stride+format for C++ comparison.
         x_arg = hidden.to(bf16).contiguous()
-        wkv_arg = self.cmp_wkv.weight.to(bf16).contiguous()
-        wgate_arg = self.cmp_wgate.weight.to(bf16).contiguous()
-        norm_arg = self.cmp_norm.weight.to(bf16).contiguous()
+        wkv_arg = self._cmp_wkv_bf16
+        wgate_arg = self._cmp_wgate_bf16
+        norm_arg = self._cmp_norm_bf16
         sin_arg = sin_view.to(bf16).to(hidden.device).contiguous()
         cos_arg = cos_view.to(bf16).to(hidden.device).contiguous()
         compressed_kv, _, _, _, _ = kernels.compressor(
@@ -848,6 +855,11 @@ class DeepseekV4Indexer(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         self.wq_b.process_weights_after_loading()
+        # Resident bf16 compressor weights (same rationale as the attention
+        # compressor: fp32 checkpoint storage vs bf16 kernel contract).
+        self._wkv_bf16 = self.compressor_wkv.weight.to(torch.bfloat16).contiguous()
+        self._wgate_bf16 = self.compressor_wgate.weight.to(torch.bfloat16).contiguous()
+        self._norm_bf16 = self.compressor_norm.weight.to(torch.bfloat16).contiguous()
 
     def select_qli(
         self,
@@ -1126,12 +1138,12 @@ class DeepseekV4Indexer(nn.Module):
         bf16 = torch.bfloat16
         compressed_kv, _, _, _, _ = kernels.compressor(
             x=hidden.to(bf16),
-            wkv=self.compressor_wkv.weight.to(bf16),
-            wgate=self.compressor_wgate.weight.to(bf16),
+            wkv=self._wkv_bf16,
+            wgate=self._wgate_bf16,
             kv_state=kv_state,
             score_state=score_state,
             ape=self.compressor_ape,
-            norm_weight=self.compressor_norm.weight.to(bf16),
+            norm_weight=self._norm_bf16,
             rope_sin=sin_view.to(bf16).to(hidden.device),
             rope_cos=cos_view.to(bf16).to(hidden.device),
             kv_block_table=kv_block_table,
