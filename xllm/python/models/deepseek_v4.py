@@ -1313,15 +1313,7 @@ class DeepseekV4MoE(nn.Module):
 
         # 1) Gate: compute logits + moe_gating_top_k_hash.
         gate_input = hidden.to(torch.float32)
-        if gate_input.detach().isnan().any():
-            from scripts.logger import logger as _dbg
-
-            _dbg.info("NAN-HUNT L%d moe gate_input NaN", self.layer_id)
         logits = self.gate(gate_input)
-        if logits.detach().isnan().any():
-            from scripts.logger import logger as _dbg
-
-            _dbg.info("NAN-HUNT L%d moe gate logits NaN", self.layer_id)
         norm_type = {"softmax": 0, "sigmoid": 1, "sqrtsoftplus": 2}.get(self.scoring_func, 2)
         renorm = 0 if norm_type == 2 else 1
 
@@ -1357,31 +1349,10 @@ class DeepseekV4MoE(nn.Module):
             self.num_total_experts, self.start_expert_id, self.num_experts_per_rank,
             self.cfg.swiglu_limit,
         )
-        if routed_out.detach().isnan().any():
-            from scripts.logger import logger as _dbg
-
-            _dbg.info(
-                "NAN-HUNT L%d moe routed_out NaN count=%s/%s "
-                "topk_weights_nan=%s topk_idx_min=%s max=%s "
-                "hidden_std=%.4f",
-                self.layer_id, int(routed_out.detach().isnan().sum()),
-                routed_out.numel(),
-                int(topk_weights.detach().isnan().sum()),
-                int(topk_idx.min()), int(topk_idx.max()),
-                float(hidden.detach().float().std()),
-            )
         # 4) Shared experts + C++-ordered TP/EP reductions.
         shared_out = self.shared_experts(hidden)
-        if shared_out.detach().isnan().any():
-            from scripts.logger import logger as _dbg
-
-            _dbg.info("NAN-HUNT L%d moe shared_out NaN", self.layer_id)
 
         result = self._reduce_moe_outputs(routed_out, shared_out)
-        if result.detach().isnan().any():
-            from scripts.logger import logger as _dbg
-
-            _dbg.info("NAN-HUNT L%d moe after_reduce NaN", self.layer_id)
         return result
 
     def _reduce_moe_outputs(
@@ -1486,10 +1457,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",
         )
         attn_output = self.self_attn(attn_input, positions, cos_sin_cache)
-        if attn_output.detach().isnan().any():
-            from scripts.logger import logger as _dbg
-
-            _dbg.info("NAN-HUNT L%d attn_output NaN", self.layer_id)
         dsa_dump.snap(
             "attn_output", {"attn_output": attn_output}, layer=self.layer_id,
             kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",
@@ -1497,10 +1464,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden = self.hc.hc_post(
             attn_output, residual_attn, post_attn, comb_attn
         )
-        if hidden.detach().isnan().any():
-            from scripts.logger import logger as _dbg
-
-            _dbg.info("NAN-HUNT L%d hc_post_attn NaN", self.layer_id)
         dsa_dump.snap(
             "hc_post_attn", {"hidden": hidden}, layer=self.layer_id,
             kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",
@@ -1528,10 +1491,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             if isinstance(self.mlp, DeepseekV4MoE)
             else self.mlp(ffn_input)
         )
-        if ffn_output.detach().isnan().any():
-            from scripts.logger import logger as _dbg
-
-            _dbg.info("NAN-HUNT L%d mlp_output NaN", self.layer_id)
         dsa_dump.snap(
             "mlp_output", {"ffn_output": ffn_output}, layer=self.layer_id,
             kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",

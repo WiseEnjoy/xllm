@@ -373,20 +373,6 @@ class DsaAttentionBackend(AttentionBackend):
                 cmp_block_table,
                 compress_ratio,
             )
-            if compressed is not None and compressed.detach().isnan().any():
-                from scripts.logger import logger as _dbg
-
-                _dbg.info("NAN-HUNT L%d compressor_out NaN", layer_id)
-            _kv_state = layer_cache.compress_kv_state
-            _score_state = layer_cache.compress_score_state
-            if _kv_state is not None and _kv_state.detach().isnan().any():
-                from scripts.logger import logger as _dbg
-
-                _dbg.info("NAN-HUNT L%d compressor kv_state NaN", layer_id)
-            if _score_state is not None and _score_state.detach().isnan().any():
-                from scripts.logger import logger as _dbg
-
-                _dbg.info("NAN-HUNT L%d compressor score_state NaN", layer_id)
             _scatter_by_slot(cmp_kv, cmp_slot, compressed)
             dsa_dump.snap(
                 "scatter_cmp_kv",
