@@ -1636,6 +1636,9 @@ class DeepseekV4Model(nn.Module):
         context = get_forward_context()
         backend = context.attention_backend
         metadata = context.metadata
+        # Drop request-owned DSA state (stale metadata/callbacks/tensors) before
+        # attaching this request's rope tables and hidden states.
+        backend.reset_forward(metadata)
         self.attach_rope_tables_to_backend(backend, positions, metadata=metadata)
         prepare_dsa = getattr(backend, "prepare_dsa_metadata_for_forward", None)
         if prepare_dsa is not None:

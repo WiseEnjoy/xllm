@@ -164,6 +164,35 @@ class DsaAttentionBackend(AttentionBackend):
             )
         self._metadata = metadata
 
+    def reset_forward(self, metadata: AttentionMetadata | None = None) -> None:
+        """Drop request-owned DSA state before attaching the next request.
+
+        The model calls this immediately before attaching its current RoPE
+        tables, so a forward that errors early cannot leak stale tensors and
+        callbacks into the next request. ``_cmp_linear_bases`` is deliberately
+        kept: it holds compact-cache pool layout (slot-derived base per layer),
+        not request-owned inputs, and the decode fallback path depends on it.
+        """
+        metadata = self._metadata if metadata is None else metadata
+        if metadata is None:
+            return
+        metadata.dsa_metadata = None
+        metadata.dsa_positions = None
+        metadata.dsa_cos_sin = None
+        metadata.dsa_c4_cos_sin = None
+        metadata.dsa_c128_cos_sin = None
+        metadata.dsa_graph_mode = False
+        for name in (
+            "_compressor_fn",
+            "_indexer_fn",
+            "_current_hidden",
+            "_current_kv_hidden",
+            "_current_qr",
+            "_current_qr_pertoken_scale",
+        ):
+            if hasattr(self, name):
+                delattr(self, name)
+
     def prepare_dsa_metadata_for_forward(
         self,
         metadata: AttentionMetadata | None = None,
