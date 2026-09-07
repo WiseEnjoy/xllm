@@ -209,14 +209,6 @@ def _grouped_moe_with_selected_experts_impl(
         pertoken_scale,
         torch.ones_like(pertoken_scale),
     )
-    if sorted_hidden_i8.detach().isnan().any() or pertoken_scale.detach().isnan().any():
-        from scripts.logger import logger as _dbg
-
-        _dbg.info(
-            "MOE-NAN step2:dynamic_quant NaN i8=%s scale=%s",
-            int(sorted_hidden_i8.detach().isnan().sum()),
-            int(pertoken_scale.detach().isnan().sum()),
-        )
     group_list = expert_tokens.to(torch.int64)
     gemm1_out = _group_gemm(
         x=sorted_hidden_i8,
@@ -229,13 +221,6 @@ def _grouped_moe_with_selected_experts_impl(
         group_list_type=1,
         output_dtype=torch.int32,
     )
-    if gemm1_out.detach().isnan().any():
-        from scripts.logger import logger as _dbg
-
-        _dbg.info(
-            "MOE-NAN step3:gemm1 NaN count=%s/%s",
-            int(gemm1_out.detach().isnan().sum()), gemm1_out.numel(),
-        )
     act_i8, act_pt = _kernels.dequant_swiglu_quant(
         x=gemm1_out,
         weight_scale=w13_scale,
@@ -259,14 +244,6 @@ def _grouped_moe_with_selected_experts_impl(
         torch.ones_like(act_pt),
         act_pt,
     )
-    if act_i8.detach().isnan().any() or act_pt.detach().isnan().any():
-        from scripts.logger import logger as _dbg
-
-        _dbg.info(
-            "MOE-NAN step4:swiglu_quant NaN act_i8=%s act_pt=%s",
-            int(act_i8.detach().isnan().sum()),
-            int(act_pt.detach().isnan().sum()),
-        )
     del w13_offset, w2_offset
     output = _group_gemm(
         x=act_i8,
@@ -279,13 +256,6 @@ def _grouped_moe_with_selected_experts_impl(
         group_list_type=1,
         output_dtype=hidden_states.dtype,
     )
-    if output.detach().isnan().any():
-        from scripts.logger import logger as _dbg
-
-        _dbg.info(
-            "MOE-NAN step5:gemm2 NaN count=%s/%s",
-            int(output.detach().isnan().sum()), output.numel(),
-        )
     # Empty expert groups leave uninitialized rows in the group_gemm output.
     # These garbage rows propagate as NaN through the reduce and poison the
     # hidden states. Replace NaN with 0 (no expert contribution).
