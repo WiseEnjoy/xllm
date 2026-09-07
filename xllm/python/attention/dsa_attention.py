@@ -47,7 +47,10 @@ from xllm.python.attention.dsa_metadata import (
     DsaMetadataBuilder,
     build_cache_specs,
 )
-from xllm.python.model_executor.forward_context import get_forward_context
+from xllm.python.model_executor.forward_context import (
+    get_execution_buffer,
+    get_forward_context,
+)
 from xllm.python.platform import current_platform
 from xllm.python import dsa_dump
 from scripts.logger import logger
@@ -123,6 +126,10 @@ class DsaAttentionBackend(AttentionBackend):
 
         self._kv_caches: list[LayerCache] = []
         self._metadata: AttentionMetadata | None = None
+        self._graph_mode = False
+        self._graph_dsa: DsaMetadata | None = None
+        self._graph_bt_capacity_cols = 0
+        self._graph_slot_capacity = 0
 
     # -- AttentionBackend interface -----------------------------------------
 
@@ -158,11 +165,66 @@ class DsaAttentionBackend(AttentionBackend):
         *,
         graph_mode: bool = False,
     ) -> None:
-        if graph_mode:
-            raise NotImplementedError(
-                "DeepSeek-V4 ACL graph support is not part of the eager DSA backend"
-            )
+        self._graph_mode = graph_mode
         self._metadata = metadata
+        if graph_mode:
+            self._refresh_graph_metadata(metadata)
+
+    def _refresh_graph_metadata(self, metadata: AttentionMetadata) -> None:
+        """Rebuild the DSA metadata into persistent buffers, once per replay.
+
+        Runs OUTSIDE the graph (the runner calls ``prepare`` every step before
+        replay). Mirrors C++ ``prepare_graph_forward_metadata``: the host-side
+        builder re-runs per step, every tensor field lands in an
+        execution-state persistent buffer (fixed address, ``copy_`` refresh),
+        and the precomputed AICPU metadata kernels are rebuilt off-graph into
+        persistent outputs. The captured forward only binds
+        ``self._graph_dsa`` (see ``prepare_dsa_metadata_for_forward``).
+        """
+        multi_block_tables = list(metadata.multi_block_tables)
+        kv_host = metadata.kv_seq_lens_host
+        kv_seq_lens = (
+            kv_host.cpu().tolist()
+            if kv_host is not None and kv_host.numel() > 0
+            else []
+        )
+        q_host = getattr(metadata, "q_seq_lens_host", None)
+        q_seq_lens = (
+            q_host.cpu().tolist()
+            if q_host is not None and q_host.numel() > 0
+            else None
+        )
+        positions = getattr(metadata, "dsa_positions", None)
+        if positions is None:
+            positions = torch.empty(0, dtype=torch.int64)
+        # Bucket-stable capacities: block tables pad to the widest table,
+        # slots pad to the token bucket. The builder's graph padding keeps
+        # every tensor shape constant across steps so persistent buffers can
+        # be refreshed in place (C++ uses the persistent block-table width).
+        batch_rows = max(len(kv_seq_lens), 1)
+        if self._graph_bt_capacity_cols == 0 and multi_block_tables:
+            self._graph_bt_capacity_cols = max(
+                (t.size(1) for t in multi_block_tables), default=0
+            )
+        if self._graph_slot_capacity == 0:
+            self._graph_slot_capacity = max(int(positions.numel()), batch_rows)
+        dsa_metadata = self._builder.build(
+            multi_block_tables=multi_block_tables,
+            kv_seq_lens=kv_seq_lens,
+            q_seq_lens=q_seq_lens,
+            positions=positions,
+            dsa_cos_sin=getattr(metadata, "dsa_cos_sin", None),
+            is_prefill=metadata.is_prefill,
+            is_chunked_prefill=metadata.is_chunked_prefill,
+            enable_graph=True,
+            graph_block_table_capacity_cols=self._graph_bt_capacity_cols,
+            graph_slot_capacity=self._graph_slot_capacity,
+        )
+        self._populate_dsa_rope(dsa_metadata, metadata)
+        self._move_metadata_to_device(dsa_metadata, persistent=True)
+        self._build_precomputed_metadata(dsa_metadata, metadata, persistent=True)
+        self._graph_dsa = dsa_metadata
+        metadata.dsa_metadata = dsa_metadata
 
     def reset_forward(self, metadata: AttentionMetadata | None = None) -> None:
         """Drop request-owned DSA state before attaching the next request.
@@ -200,6 +262,13 @@ class DsaAttentionBackend(AttentionBackend):
         """Build DSA metadata inside model forward, matching C++ ownership/order."""
         metadata = metadata or self._metadata
         assert metadata is not None
+        # Graph capture: the runner's per-step prepare (outside the graph)
+        # already rebuilt and refreshed the persistent DSA buffers in
+        # ``self._graph_dsa``. Binding it here lets the captured forward read
+        # address-stable tensors; the eager path below stays untouched.
+        if self._graph_mode and self._graph_dsa is not None:
+            metadata.dsa_metadata = self._graph_dsa
+            return
         multi_block_tables = list(metadata.multi_block_tables)
         kv_seq_lens_host = metadata.kv_seq_lens_host
         kv_seq_lens = (
@@ -794,6 +863,7 @@ class DsaAttentionBackend(AttentionBackend):
         self,
         dsa: DsaMetadata,
         metadata: AttentionMetadata,
+        persistent: bool = False,
     ) -> None:
         """Build the AICPU tiling metadata for each compress ratio present.
 
@@ -862,6 +932,10 @@ class DsaAttentionBackend(AttentionBackend):
                 has_ori_kv=True,
                 has_cmp_kv=has_cmp,
             )
+            if persistent:
+                sparse_metadata = self._persist_tensor(
+                    ("dsa_sfm_meta", ratio), sparse_metadata
+                )
             if ratio == 1:
                 dsa.c1_metadata = sparse_metadata
             elif ratio == 4:
@@ -916,6 +990,10 @@ class DsaAttentionBackend(AttentionBackend):
                 cmp_ratio=cmp_ratio,
                 device=str(self.device),
             )
+            if persistent:
+                dsa.qli_metadata = self._persist_tensor(
+                    ("dsa_qli_meta",), dsa.qli_metadata
+                )
         else:
             # quant_lightning_indexer 走 CANN 默认版（xllm_ops 已禁止编译该算子），
             # 不再构建 AICPU metadata；deepseek_v4 侧会对空 metadata 兜底。
@@ -933,7 +1011,26 @@ class DsaAttentionBackend(AttentionBackend):
             extra={"soc": current_platform.get_npu_chip(), "v2": use_v2},
         )
 
-    def _move_metadata_to_device(self, dsa: DsaMetadata) -> None:
+    def _persist_tensor(self, key: tuple[object, ...], tensor: torch.Tensor) -> torch.Tensor:
+        """Land ``tensor`` in an execution-state persistent buffer (copy_).
+
+        Only called on the per-replay refresh path (outside the graph). Shapes
+        are bucket-stable once captured; growth re-allocates, which is only
+        safe before capture (the runner freezes bucket shapes first).
+        """
+        buf = get_execution_buffer(key, lambda: tensor.clone())
+        if buf.shape != tensor.shape:
+            state = get_forward_context().execution_state
+            buf = tensor.clone()
+            if state is not None:
+                state.persistent_buffers[key] = buf
+        else:
+            buf.copy_(tensor)
+        return buf
+
+    def _move_metadata_to_device(
+        self, dsa: DsaMetadata, persistent: bool = False
+    ) -> None:
         """Mirror ``deepseek_v4_move_dsa_metadata_to_device`` for eager mode."""
         tensor_fields = (
             "seq_lens",
@@ -951,14 +1048,48 @@ class DsaAttentionBackend(AttentionBackend):
         )
         for name in tensor_fields:
             tensor = getattr(dsa, name, None)
-            if tensor is not None:
+            if tensor is None:
+                continue
+            if persistent:
+                setattr(
+                    dsa, name,
+                    self._persist_tensor(("dsa_dev", name), tensor.to(self.device)),
+                )
+            else:
                 setattr(dsa, name, tensor.to(self.device))
-        for layer_tensors in dsa.block_tables:
+        for layer_idx, layer_tensors in enumerate(dsa.block_tables):
             for index, tensor in enumerate(layer_tensors):
-                layer_tensors[index] = tensor.to(self.device)
-        for layer_tensors in dsa.slot_mappings:
+                if tensor is None:
+                    continue
+                if persistent:
+                    layer_tensors[index] = self._persist_tensor(
+                        ("dsa_bt", layer_idx, index), tensor.to(self.device)
+                    )
+                else:
+                    layer_tensors[index] = tensor.to(self.device)
+        for layer_idx, layer_tensors in enumerate(dsa.slot_mappings):
             for index, tensor in enumerate(layer_tensors):
-                layer_tensors[index] = tensor.to(self.device)
+                if tensor is None:
+                    continue
+                if persistent:
+                    layer_tensors[index] = self._persist_tensor(
+                        ("dsa_slot", layer_idx, index), tensor.to(self.device)
+                    )
+                else:
+                    layer_tensors[index] = tensor.to(self.device)
+        if persistent:
+            # Rope gathers re-allocate every step; persist them so the
+            # captured forward reads address-stable tables.
+            for name in (
+                "cos_table", "sin_table", "c4_cos", "c4_sin",
+                "c128_cos", "c128_sin",
+            ):
+                tensor = getattr(dsa, name, None)
+                if tensor is not None and tensor.numel() > 0:
+                    setattr(
+                        dsa, name,
+                        self._persist_tensor(("dsa_rope", name), tensor),
+                    )
 
 
 # ---------------------------------------------------------------------------
