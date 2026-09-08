@@ -225,12 +225,12 @@ class DsaAttentionBackend(AttentionBackend):
             graph_block_table_capacity_cols=self._graph_bt_capacity_cols,
         )
         self._populate_dsa_rope(dsa_metadata, metadata)
+        # Window indices first, while the builder output is still on CPU
+        # (saves per-layer D2H reads of the block tables).
+        self._build_window_src_indices(dsa_metadata, kv_seq_lens)
         self._move_metadata_to_device(dsa_metadata, persistent=True)
         self._build_precomputed_metadata(dsa_metadata, metadata, persistent=True)
         self._graph_dsa = dsa_metadata
-        # Rebuild the per-layer window source indices (physical block-table
-        # addressing) into the execution buffers the graph gathers through.
-        self._build_window_src_indices(dsa_metadata, kv_seq_lens)
         metadata.dsa_metadata = dsa_metadata
         # Open a dump tick per refresh step: the captured forward's layer-level
         # snaps (kernel wrappers) then land under this tick, so capture-time
@@ -1138,79 +1138,123 @@ class DsaAttentionBackend(AttentionBackend):
             extra={"soc": current_platform.get_npu_chip(), "v2": use_v2},
         )
 
+    def _window_src_for_group(
+        self,
+        dsa_metadata: DsaMetadata,
+        layer_id: int,
+        ori_idx: int,
+        token: torch.Tensor,
+        valid: torch.Tensor,
+        n_seqs: int,
+    ) -> torch.Tensor:
+        """Window source slots for one manager group (vectorized, CPU)."""
+        bs = 128
+        win = self.window_size
+        if (
+            ori_idx < 0
+            or layer_id >= len(dsa_metadata.block_tables)
+            or ori_idx >= len(dsa_metadata.block_tables[layer_id])
+        ):
+            return torch.zeros((n_seqs, win), dtype=torch.int64)
+        bt = dsa_metadata.block_tables[layer_id][ori_idx]
+        if bt is None or bt.numel() == 0:
+            return torch.zeros((n_seqs, win), dtype=torch.int64)
+        bt_host = (
+            bt.detach().cpu()
+            if bt.device.type != "cpu"
+            else bt.detach()
+        ).to(torch.int64)
+        rows = bt_host.size(0)
+        eff_mask = bt_host >= 0  # (R, C)
+        cols_eff = eff_mask.sum(dim=1).clamp(min=1)  # (R,)
+        rank = eff_mask.long().cumsum(dim=1) - 1  # (R, C)
+        eff_vals = bt_host.clamp(min=0)
+        seq_sel = torch.arange(n_seqs).clamp(max=rows - 1)
+        row_rank = rank[seq_sel]
+        row_vals = eff_vals[seq_sel]
+        row_cols_eff = cols_eff[seq_sel]  # (B,)
+        blk_pos = (
+            (token // bs) % row_cols_eff.unsqueeze(1)
+        ).clamp(max=eff_mask.size(1) - 1)  # (B, W)
+        match = row_rank.unsqueeze(1) == blk_pos.unsqueeze(-1)  # (B, W, C)
+        blk = (row_vals.unsqueeze(1) * match).sum(dim=-1)
+        blk = torch.where(match.any(dim=-1), blk, torch.zeros_like(blk))
+        src = blk * bs + (token % bs)
+        return torch.where(valid, src.clamp(min=0), torch.zeros_like(src))
+
     def _build_window_src_indices(
         self,
         dsa_metadata: DsaMetadata,
         kv_seq_lens: Sequence[int],
     ) -> None:
-        """Refresh the per-layer window source-slot indices (host, per step).
+        """Refresh the window source-slot indices for all layers (host).
 
-        For every layer's SWA manager the newest ``window`` tokens are
-        addressed through the REAL block table (physical addressing, no ring
-        wrap assumptions -- the eager wrap formula breaks once the manager
-        allocates blocks beyond the first, see smoke/RESULTS.md X3/ISS-7).
-        The indices land in execution buffers keyed by layer; the captured
-        graph gathers through them, so refreshing the content is enough.
+        Vectorized rebuild per SWA manager (all layers sharing a group read
+        the same block table), landing in ONE merged persist buffer
+        (win_src_all: [n_layers, B, window]) so the per-step refresh pays a
+        single H2D copy. Physical block-table addressing -- no ring wrap
+        assumptions (smoke/RESULTS.md X3/ISS-7).
         """
         bs = 128
         win = self.window_size
         n_layers = len(self.caches_info)
         n_seqs = max(len(kv_seq_lens), 1)
-        for layer_id in range(n_layers):
+        if n_layers == 0:
+            return
+        kv = torch.tensor(
+            list(kv_seq_lens[:n_seqs]) + [0] * max(0, n_seqs - len(kv_seq_lens)),
+            dtype=torch.int64,
+        )
+        k = kv.clamp(max=win)  # (B,)
+        used = kv  # (B,)
+        token = used.unsqueeze(1) - k.unsqueeze(1) + torch.arange(win).unsqueeze(0)
+        # token j (B, W) valid iff j < k
+        valid = torch.arange(win).unsqueeze(0) < k.unsqueeze(1)
+
+        merged: list[torch.Tensor] = []
+        seen: dict[int, int] = {}
+        row_ids: list[int] = []
+        for lid in range(n_layers):
             mapping = self._resolve_cache_mapping(
-                layer_id, self._layer_compress_ratio(layer_id)
+                lid, self._layer_compress_ratio(lid)
             )
             ori_idx = mapping.ori_cache_idx
-            if ori_idx < 0:
+            gid = (
+                self.caches_info[lid][ori_idx].group_id
+                if ori_idx >= 0
+                and lid < len(self.caches_info)
+                and ori_idx < len(self.caches_info[lid])
+                else -1 - lid
+            )
+            if gid in seen:
+                row_ids.append(seen[gid])
                 continue
-            bt = (
-                dsa_metadata.block_tables[layer_id][ori_idx]
-                if layer_id < len(dsa_metadata.block_tables)
-                and ori_idx < len(dsa_metadata.block_tables[layer_id])
-                else None
+            tensor = self._window_src_for_group(
+                dsa_metadata, lid, ori_idx, token, valid, n_seqs
             )
-            slots = (
-                dsa_metadata.slot_mappings[layer_id][ori_idx]
-                if layer_id < len(dsa_metadata.slot_mappings)
-                and ori_idx < len(dsa_metadata.slot_mappings[layer_id])
-                else None
-            )
-            if bt is None or slots is None or bt.numel() == 0:
-                continue
-            bt_host = bt.detach().cpu().tolist()
-            slot_host = (
-                slots.detach().cpu().tolist()
-                if slots.numel() >= n_seqs else [0] * n_seqs
-            )
-            rows = len(bt_host)
-            idx_rows: list[list[int]] = []
-            for seq in range(n_seqs):
-                used = int(kv_seq_lens[seq]) if seq < len(kv_seq_lens) else 0
-                k = min(used, win)
-                row = bt_host[seq] if seq < rows else []
-                # Effective (non -1) columns define the ring's block cycle.
-                eff = [b for b in row if b >= 0]
-                cols_eff = max(len(eff), 1)
-                src: list[int] = []
-                for j in range(win):
-                    if j < k:
-                        token = used - k + j
-                        blk_pos = (token // bs) % cols_eff
-                        blk = (
-                            eff[blk_pos]
-                            if eff
-                            else (slot_host[seq] // bs if slot_host[seq] >= 0 else 0)
-                        )
-                        src.append(blk * bs + (token % bs))
-                    else:
-                        src.append(0)
-                idx_rows.append(src)
-            idx_tensor = torch.tensor(
-                idx_rows, dtype=torch.int64, device=self.device
-            )
-            self._persist_tensor(
-                ("win_src", layer_id), idx_tensor.to(self.device)
-            )
+            seen[gid] = len(merged)
+            row_ids.append(len(merged))
+            merged.append(tensor)
+        out_rows = merged
+        self._win_src_row_map = row_ids
+        merged_buf = get_execution_buffer(
+            ("win_src_all",),
+            lambda: torch.stack(out_rows).to(self.device)
+            if out_rows
+            else torch.zeros(1, n_seqs, win, dtype=torch.int64, device=self.device),
+        )
+        unique = (
+            torch.stack(out_rows)
+            if out_rows
+            else torch.zeros(1, n_seqs, win, dtype=torch.int64)
+        )
+        if merged_buf.shape != unique.shape:
+            state = get_forward_context().execution_state
+            merged_buf = unique.to(self.device)
+            if state is not None:
+                state.persistent_buffers[("win_src_all",)] = merged_buf
+        else:
+            merged_buf.copy_(unique.to(self.device), non_blocking=True)
 
     def _graph_window_compact(
         self,
@@ -1234,12 +1278,15 @@ class DsaAttentionBackend(AttentionBackend):
         n_seqs = seq_kv.size(0)
         device = ori_kv.device
 
-        src_idx = get_execution_buffer(
-            ("win_src", layer_id),
+        src_all = get_execution_buffer(
+            ("win_src_all",),
             lambda: torch.zeros(
-                (n_seqs, win), dtype=torch.int64, device=device
+                (1, n_seqs, win), dtype=torch.int64, device=device
             ),
         )
+        row_map = getattr(self, "_win_src_row_map", None)
+        row = row_map[layer_id] if row_map and layer_id < len(row_map) else 0
+        src_idx = src_all[row]  # (B, W) view into the merged buffer
         offs = torch.arange(win, device=device).unsqueeze(0)  # (1, W)
         k = seq_kv.clamp(max=win).to(torch.int64)  # (B,)
         valid = offs < k.unsqueeze(1)  # (B, W)
@@ -1310,26 +1357,54 @@ class DsaAttentionBackend(AttentionBackend):
                 )
             else:
                 setattr(dsa, name, tensor.to(self.device))
-        for layer_idx, layer_tensors in enumerate(dsa.block_tables):
-            for index, tensor in enumerate(layer_tensors):
-                if tensor is None:
-                    continue
-                if persistent:
-                    layer_tensors[index] = self._persist_tensor(
-                        ("dsa_bt", layer_idx, index), tensor.to(self.device)
+        if persistent:
+            # Manager-level dedup: builder output shares one tensor per
+            # manager across every layer that references the group, so all
+            # layers must share ONE persist buffer (258 per-layer copies
+            # dominated the per-step refresh otherwise).
+            mgr_cache: dict[tuple[str, int], torch.Tensor] = {}
+            for lid, layer_tensors in enumerate(dsa.block_tables):
+                for index, tensor in enumerate(layer_tensors):
+                    if tensor is None:
+                        continue
+                    gid = (
+                        self.caches_info[lid][index].group_id
+                        if lid < len(self.caches_info)
+                        and index < len(self.caches_info[lid])
+                        else -1
                     )
-                else:
-                    layer_tensors[index] = tensor.to(self.device)
-        for layer_idx, layer_tensors in enumerate(dsa.slot_mappings):
-            for index, tensor in enumerate(layer_tensors):
-                if tensor is None:
-                    continue
-                if persistent:
-                    layer_tensors[index] = self._persist_tensor(
-                        ("dsa_slot", layer_idx, index), tensor.to(self.device)
+                    key = ("dsa_bt_mgr", gid)
+                    if key not in mgr_cache:
+                        mgr_cache[key] = self._persist_tensor(
+                            key, tensor.to(self.device)
+                        )
+                    layer_tensors[index] = mgr_cache[key]
+            mgr_cache = {}
+            for lid, layer_tensors in enumerate(dsa.slot_mappings):
+                for index, tensor in enumerate(layer_tensors):
+                    if tensor is None:
+                        continue
+                    gid = (
+                        self.caches_info[lid][index].group_id
+                        if lid < len(self.caches_info)
+                        and index < len(self.caches_info[lid])
+                        else -1
                     )
-                else:
-                    layer_tensors[index] = tensor.to(self.device)
+                    key = ("dsa_slot_mgr", gid)
+                    if key not in mgr_cache:
+                        mgr_cache[key] = self._persist_tensor(
+                            key, tensor.to(self.device)
+                        )
+                    layer_tensors[index] = mgr_cache[key]
+        else:
+            for layer_tensors in dsa.block_tables:
+                for index, tensor in enumerate(layer_tensors):
+                    if tensor is not None:
+                        layer_tensors[index] = tensor.to(self.device)
+            for layer_tensors in dsa.slot_mappings:
+                for index, tensor in enumerate(layer_tensors):
+                    if tensor is not None:
+                        layer_tensors[index] = tensor.to(self.device)
         if persistent:
             # Rope gathers re-allocate every step; persist them so the
             # captured forward reads address-stable tables.
