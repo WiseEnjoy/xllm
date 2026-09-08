@@ -77,6 +77,20 @@ class _StaticAttentionMetadata:
     expanded_decode_metadata: ExpandedDecodeMetadata | None = None
     is_prefill: bool = False
     is_chunked_prefill: bool = False
+    # DSA (DeepSeek-V4) per-manager block tables; static CPU buffers the
+    # backend's per-replay refresh re-consumes. None for non-DSA backends.
+    multi_block_tables: list[torch.Tensor] | None = None
+    dsa_positions: torch.Tensor | None = None
+    kv_seq_lens_host: torch.Tensor | None = None
+    # Slots dataclass: the DSA backend's reset_forward/prepare write these
+    # request-owned fields on the metadata object each forward.
+    dsa_metadata: object = None
+    dsa_cos_sin: torch.Tensor | None = None
+    dsa_c4_cos_sin: torch.Tensor | None = None
+    dsa_c128_cos_sin: torch.Tensor | None = None
+    dsa_graph_mode: bool = False
+    max_query_len: int = 1
+    max_seq_len: int = 1
 
 
 class _DecodeGraphEntry:
@@ -172,6 +186,13 @@ class DecodeAclGraphRunner(BaseRunner):
         block_table = (
             expanded.block_table if expanded is not None else metadata.block_table
         )
+        if block_table is None:
+            # DSA (DeepSeek-V4) framework metadata only carries per-manager
+            # multi_block_tables; the SWA manager table (group 0) is the
+            # row-count reference the generic paged fields normally provide.
+            dsa_multi_bt = getattr(metadata, "multi_block_tables", None) or []
+            if dsa_multi_bt:
+                block_table = dsa_multi_bt[0]
         kv_seq_lens = (
             expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
         )
@@ -205,6 +226,34 @@ class DecodeAclGraphRunner(BaseRunner):
             if expanded is not None
             else metadata.paged_kv_last_page_len
         )
+        # DSA backends consume multi_block_tables + host lengths only; the
+        # generic paged fields may be absent and are not populated for them.
+        # The C++ side pads manager tables to its own bucket (max sequences),
+        # which can exceed the real batch; per-sequence tensors carry real
+        # rows only. Normalize to the real batch and skip the generic paged
+        # validation -- the DSA fill path does not consume those fields.
+        dsa_multi_bt = getattr(metadata, "multi_block_tables", None)
+        if dsa_multi_bt:
+            if kv_seq_lens.dim() != 1 or kv_seq_lens.numel() < 1:
+                raise RuntimeError(
+                    "DSA decode graph requires one row of KV lengths"
+                )
+            real_batch = kv_seq_lens.numel()
+            if (
+                kv_seq_lens_host_values is not None
+                and len(kv_seq_lens_host_values) != real_batch
+            ):
+                raise RuntimeError(
+                    "DSA decode graph host KV lengths must match KV rows"
+                )
+            return (
+                block_table[:real_batch],
+                kv_seq_lens,
+                kv_seq_lens_host_values,
+                torch.empty(0, dtype=torch.int32, device=block_table.device),
+                torch.empty(0, dtype=torch.int32, device=block_table.device),
+                torch.empty(0, dtype=torch.int32, device=block_table.device),
+            )
         if (
             paged_kv_indptr is None
             or paged_kv_indices is None
@@ -281,7 +330,11 @@ class DecodeAclGraphRunner(BaseRunner):
             raise RuntimeError(
                 "ACL graph decode input_ids must contain one token per sequence"
             )
-        if slot_mapping.dim() != 1 or slot_mapping.numel() != sequence_count:
+        if slot_mapping.numel() > 0 and (
+            slot_mapping.dim() != 1 or slot_mapping.numel() != sequence_count
+        ):
+            # DSA (DeepSeek-V4) does not provide a generic slot mapping; its
+            # builder derives slots from the per-manager block tables.
             raise RuntimeError(
                 "ACL graph decode slot_mapping must contain one slot per token"
             )
@@ -313,7 +366,22 @@ class DecodeAclGraphRunner(BaseRunner):
                 metadata.slot_mapping,
                 block_table.shape[0],
             )
-        except (RuntimeError, ValueError):
+        except (RuntimeError, ValueError) as exc:
+            from scripts.logger import logger
+
+            logger.warning(
+                f"decode acl graph incompatible metadata: {exc}; "
+                f"fields: block_table="
+                f"{None if getattr(metadata, 'block_table', None) is None else tuple(metadata.block_table.shape)}, "
+                f"kv_seq_lens="
+                f"{None if getattr(metadata, 'kv_seq_lens', None) is None else tuple(metadata.kv_seq_lens.shape)}, "
+                f"host_values={getattr(metadata, 'kv_seq_lens_host_values', 'MISSING')}, "
+                f"paged_indptr="
+                f"{None if getattr(metadata, 'paged_kv_indptr', None) is None else tuple(metadata.paged_kv_indptr.shape)}, "
+                f"slot_mapping="
+                f"{None if getattr(metadata, 'slot_mapping', None) is None else tuple(metadata.slot_mapping.shape)}, "
+                f"input_ids={tuple(input_ids.shape)}"
+            )
             return False
         batch_size = input_ids.numel()
         is_expanded = resolve_expanded_decode_metadata(metadata) is not None
@@ -490,6 +558,12 @@ class DecodeAclGraphRunner(BaseRunner):
             self.layer_caches,
             execution_state=entry.execution_state,
         )
+        # The captured forward's reset_forward clears metadata.dsa_positions
+        # and the graph-mode attach does not re-set it (it would bind an
+        # in-graph cast). Re-bind the runner-owned static buffer every step
+        # so the refresh always sees the real positions.
+        if entry.static_metadata.multi_block_tables is not None:
+            entry.static_metadata.dsa_positions = entry.static_positions
         with forward_context(prepare_context):
             self.attention_backend.prepare(
                 entry.static_metadata, graph_mode=True
@@ -613,6 +687,22 @@ class DecodeAclGraphRunner(BaseRunner):
             kv_seq_lens_host_values=[1] * padded_batch_size,
             block_table=static_block_table,
         )
+        # DSA per-manager static block tables (CPU, padded rows filled -1).
+        # The capacity mirrors the framework block table width: every DSA
+        # manager uses the same 128-token block size, so the max-model-len
+        # derived column count covers all managers for any sequence length.
+        framework_multi_bt = getattr(metadata, "multi_block_tables", None)
+        if framework_multi_bt:
+            entry.static_metadata.multi_block_tables = [
+                torch.full(
+                    (padded_batch_size, self._max_blocks_per_sequence),
+                    -1,
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+                for _ in framework_multi_bt
+            ]
+            entry.static_metadata.dsa_positions = entry.static_positions
         is_expanded = resolve_expanded_decode_metadata(metadata) is not None
         entry.kv_seq_lens_delta = torch.empty(
             padded_batch_size, dtype=torch.int32, device=device
@@ -671,29 +761,41 @@ class DecodeAclGraphRunner(BaseRunner):
             block_table.shape[0],
         )
         is_expanded = resolve_expanded_decode_metadata(metadata) is not None
-        cumulative_kv_seq_lens = self._cumulative_lengths(
-            kv_seq_lens,
-            None if is_expanded else metadata.kv_cu_seq_lens,
-        )
         graph_positions = positions.to(torch.int32).contiguous()
-        kernels.update_decode_graph_metadata(
-            input_ids,
-            graph_positions,
-            metadata.slot_mapping,
-            cumulative_kv_seq_lens,
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
-            entry.static_input_ids,
-            entry.static_positions,
-            static_metadata.slot_mapping,
-            static_metadata.kv_cu_seq_lens,
-            entry.kv_seq_lens_delta,
-            static_metadata.paged_kv_indptr,
-            static_metadata.paged_kv_indices,
-            static_metadata.paged_kv_last_page_len,
-            padded_batch_size,
-        )
+        if paged_kv_indptr is not None and paged_kv_indptr.numel() > 0:
+            cumulative_kv_seq_lens = self._cumulative_lengths(
+                kv_seq_lens,
+                None if is_expanded else metadata.kv_cu_seq_lens,
+            )
+            kernels.update_decode_graph_metadata(
+                input_ids,
+                graph_positions,
+                metadata.slot_mapping,
+                cumulative_kv_seq_lens,
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len,
+                entry.static_input_ids,
+                entry.static_positions,
+                static_metadata.slot_mapping,
+                static_metadata.kv_cu_seq_lens,
+                entry.kv_seq_lens_delta,
+                static_metadata.paged_kv_indptr,
+                static_metadata.paged_kv_indices,
+                static_metadata.paged_kv_last_page_len,
+                padded_batch_size,
+            )
+        else:
+            # DSA path: no generic paged fields; refresh the static inputs
+            # directly. The backend derives everything else from the
+            # per-manager tables and host lengths refreshed above.
+            entry.static_input_ids[:batch_size].copy_(input_ids)
+            entry.static_input_ids[batch_size:].zero_()
+            entry.static_positions[:batch_size].copy_(
+                graph_positions[:batch_size]
+            )
+            entry.static_positions[batch_size:].zero_()
+            static_metadata.slot_mapping.fill_(-1)
         self._fill_host_metadata(
             entry, kv_seq_lens_host_values, batch_size
         )
@@ -735,6 +837,23 @@ class DecodeAclGraphRunner(BaseRunner):
             if padded_batch_size > batch_size:
                 static_metadata.block_table[batch_size:].zero_()
 
+        # DSA per-manager tables: copy valid rows, keep -1 elsewhere (the
+        # builder treats negative block ids as dummy rows).
+        if static_metadata.multi_block_tables is not None:
+            src_tables = getattr(metadata, "multi_block_tables", None)
+            if not src_tables or len(src_tables) != len(
+                static_metadata.multi_block_tables
+            ):
+                raise RuntimeError(
+                    "DSA decode graph requires per-manager block tables"
+                )
+            for dst, src in zip(
+                static_metadata.multi_block_tables, src_tables
+            ):
+                dst.fill_(-1)
+                cols = min(src.shape[1], dst.shape[1])
+                dst[:batch_size, :cols].copy_(src[:batch_size, :cols])
+
         # Padded lanes must remain valid inputs for sparse MLA tiling.  Their
         # token and slot mapping are dummy values, so one KV token is safe.
         if padded_batch_size > batch_size:
@@ -762,9 +881,12 @@ class DecodeAclGraphRunner(BaseRunner):
         static_kv_seq_lens = static_metadata.kv_seq_lens_host_values
         if static_kv_seq_lens is None:
             raise RuntimeError("decode ACL graph host KV buffer is missing")
+        # Padding lanes must stay valid for the DSA AICPU metadata kernels:
+        # they reject cmp_topk / sliding window > kv_len (C++ dummy_kv_len).
+        dummy_kv = getattr(self.attention_backend, "graph_dummy_kv_len", 1)
         static_kv_seq_lens[:batch_size] = kv_seq_lens
         if padded_batch_size > batch_size:
-            static_kv_seq_lens[batch_size:] = [1] * (
+            static_kv_seq_lens[batch_size:] = [dummy_kv] * (
                 padded_batch_size - batch_size
             )
 
@@ -776,11 +898,37 @@ class DecodeAclGraphRunner(BaseRunner):
             self.layer_caches,
             execution_state=entry.execution_state,
         )
-        with forward_context(context):
-            for _ in range(_CAPTURE_WARMUP_STEPS):
-                self._forward_static(entry)
+        # DSA skips the eager warmup forwards: the first request's prefill
+        # (eager) already attached the model-owned rope tables the refresh
+        # needs, and repeated eager executions of the compressor/indexer
+        # carry per-step accumulated state on the decode path. The CANN ops
+        # capture cold (verified standalone, smoke/RESULTS.md X1).
+        is_dsa = entry.static_metadata.multi_block_tables is not None
+        if not is_dsa:
+            with forward_context(context):
+                for _ in range(_CAPTURE_WARMUP_STEPS):
+                    self._forward_static(entry)
         torch.npu.synchronize()
         entry.graph = torch.npu.NPUGraph()
+        # Warmup-only cache wipe BEFORE the capture executes: warmup replays
+        # leave hundreds of fake steps of KV/state behind. Lazy captures run
+        # on real request data (the prefill just wrote the real KV) and must
+        # NOT be wiped. Clearing is replay-safe (the graph records write
+        # operations, not contents).
+        if is_dsa and getattr(self, "_captures", 0) < 3:
+            for cache in self.layer_caches:
+                for name in (
+                    "swa",
+                    "compress_kv_state",
+                    "compress_score_state",
+                    "compress_index_kv_state",
+                    "compress_index_score_state",
+                    "index",
+                    "indexer_scale",
+                ):
+                    tensor = getattr(cache, name, None)
+                    if tensor is not None and tensor.numel() > 0:
+                        tensor.zero_()
         capture_context = AclGraphCaptureContext(self._stream, [])
         context = ForwardContext(
             self.attention_backend,
@@ -794,6 +942,24 @@ class DecodeAclGraphRunner(BaseRunner):
             with torch.npu.graph(entry.graph, stream=self._stream):
                 entry.static_output = self._forward_static(entry)
         entry.graph_tasks = capture_context.tasks
+        self._captures = getattr(self, "_captures", 0) + 1
+        if is_dsa and self._captures <= 3:
+            # Warmup captures ran on fake inputs: also wipe what the capture
+            # execution just wrote. Lazy captures (real request data) keep
+            # their writes -- they are the request's own first decode step.
+            for cache in self.layer_caches:
+                for name in (
+                    "swa",
+                    "compress_kv_state",
+                    "compress_score_state",
+                    "compress_index_kv_state",
+                    "compress_index_score_state",
+                    "index",
+                    "indexer_scale",
+                ):
+                    tensor = getattr(cache, name, None)
+                    if tensor is not None and tensor.numel() > 0:
+                        tensor.zero_()
 
     def _forward_static(self, entry: _DecodeGraphEntry) -> torch.Tensor:
         if entry.static_input_embedding is None:

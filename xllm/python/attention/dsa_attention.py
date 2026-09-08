@@ -129,7 +129,13 @@ class DsaAttentionBackend(AttentionBackend):
         self._graph_mode = False
         self._graph_dsa: DsaMetadata | None = None
         self._graph_bt_capacity_cols = 0
-        self._graph_slot_capacity = 0
+        self._rope_stash: dict[str, torch.Tensor | None] = {}
+
+    @property
+    def graph_dummy_kv_len(self) -> int:
+        """Padding-lane KV length for graph buckets (C++ fill_empty_dp_rank:
+        the AICPU DSA metadata kernels reject cmp_topk/window > kv_len)."""
+        return max(self.index_topk, self.window_size, 1)
 
     # -- AttentionBackend interface -----------------------------------------
 
@@ -183,11 +189,13 @@ class DsaAttentionBackend(AttentionBackend):
         """
         multi_block_tables = list(metadata.multi_block_tables)
         kv_host = metadata.kv_seq_lens_host
-        kv_seq_lens = (
-            kv_host.cpu().tolist()
-            if kv_host is not None and kv_host.numel() > 0
-            else []
-        )
+        kv_values = getattr(metadata, "kv_seq_lens_host_values", None)
+        if kv_host is not None and kv_host.numel() > 0:
+            kv_seq_lens = kv_host.cpu().tolist()
+        elif kv_values is not None:
+            kv_seq_lens = list(kv_values)
+        else:
+            kv_seq_lens = []
         q_host = getattr(metadata, "q_seq_lens_host", None)
         q_seq_lens = (
             q_host.cpu().tolist()
@@ -197,34 +205,84 @@ class DsaAttentionBackend(AttentionBackend):
         positions = getattr(metadata, "dsa_positions", None)
         if positions is None:
             positions = torch.empty(0, dtype=torch.int64)
-        # Bucket-stable capacities: block tables pad to the widest table,
-        # slots pad to the token bucket. The builder's graph padding keeps
-        # every tensor shape constant across steps so persistent buffers can
-        # be refreshed in place (C++ uses the persistent block-table width).
-        batch_rows = max(len(kv_seq_lens), 1)
+        # Bucket-stable capacities: block tables pad to the widest table
+        # (the builder derives slot capacity from the padded positions).
         if self._graph_bt_capacity_cols == 0 and multi_block_tables:
             self._graph_bt_capacity_cols = max(
                 (t.size(1) for t in multi_block_tables), default=0
             )
-        if self._graph_slot_capacity == 0:
-            self._graph_slot_capacity = max(int(positions.numel()), batch_rows)
         dsa_metadata = self._builder.build(
             multi_block_tables=multi_block_tables,
             kv_seq_lens=kv_seq_lens,
             q_seq_lens=q_seq_lens,
             positions=positions,
-            dsa_cos_sin=getattr(metadata, "dsa_cos_sin", None),
+            dsa_cos_sin=self._rope_stash.get("cos_sin"),
             is_prefill=metadata.is_prefill,
             is_chunked_prefill=metadata.is_chunked_prefill,
             enable_graph=True,
             graph_block_table_capacity_cols=self._graph_bt_capacity_cols,
-            graph_slot_capacity=self._graph_slot_capacity,
         )
         self._populate_dsa_rope(dsa_metadata, metadata)
         self._move_metadata_to_device(dsa_metadata, persistent=True)
         self._build_precomputed_metadata(dsa_metadata, metadata, persistent=True)
         self._graph_dsa = dsa_metadata
         metadata.dsa_metadata = dsa_metadata
+        # Open a dump tick per refresh step: the captured forward's layer-level
+        # snaps (kernel wrappers) then land under this tick, so capture-time
+        # tensors are comparable against eager decode dumps.
+        dsa_dump.start_fwd(
+            "decode",
+            max_layer=len(self._kv_caches) - 1 if self._kv_caches else -1,
+            ntokens=max(len(kv_seq_lens), 1),
+            meta={"graph_mode": True, "kv_lens": kv_seq_lens[:8]},
+        )
+        # Snapshot the refresh inputs (per-manager tables, first manager's
+        # slots) so graph-mode inputs are diffable against eager decode dumps.
+        for mid, table in enumerate(multi_block_tables[:4]):
+            dsa_dump.snap(
+                f"graph_bt_{mid}",
+                {"bt": table},
+                layer=0,
+                kind="moe",
+                extra={"rows": int(table.size(0)), "cols": int(table.size(1))},
+            )
+        if dsa_metadata.block_tables and dsa_metadata.slot_mappings:
+            dsa_dump.snap(
+                "graph_slots_0",
+                {
+                    "bt": dsa_metadata.block_tables[0][0]
+                    if dsa_metadata.block_tables[0] else None,
+                    "slots": dsa_metadata.slot_mappings[0][0]
+                    if dsa_metadata.slot_mappings[0] else None,
+                },
+                layer=0,
+                kind="moe",
+                extra={
+                    "seq_lens": kv_seq_lens[:8],
+                    "positions": positions[:8].tolist()
+                    if positions.numel() else [],
+                },
+            )
+        # Persisted fields the captured graph actually reads: verify their
+        # CONTENT (post copy_) against eager decode dumps.
+        dsa_dump.snap(
+            "graph_meta",
+            {
+                "seq_q": dsa_metadata.actual_seq_lengths_query,
+                "seq_kv": dsa_metadata.actual_seq_lengths_kv,
+                "seq_lens": dsa_metadata.seq_lens,
+                "positions": dsa_metadata.input_positions,
+                "start_pos": dsa_metadata.start_pos,
+                "c4_pos": dsa_metadata.c4_pad_positions,
+                "c1_meta": dsa_metadata.c1_metadata,
+                "c4_meta": dsa_metadata.c4_metadata,
+                "qli_meta": dsa_metadata.qli_metadata,
+            },
+            layer=0,
+            kind="moe",
+            extra={"c1_len": int(dsa_metadata.c1_metadata.numel()) if dsa_metadata.c1_metadata is not None else 0},
+        )
+        dsa_dump.end_fwd()
 
     def reset_forward(self, metadata: AttentionMetadata | None = None) -> None:
         """Drop request-owned DSA state before attaching the next request.
@@ -349,6 +407,8 @@ class DsaAttentionBackend(AttentionBackend):
             if metadata is not None
             else None
         )
+        if css is None:
+            css = self._rope_stash.get("cos_sin")
         if dsa.cos_table is None and css is not None and css.numel() > 0:
             dsa.cos_table, dsa.sin_table = (
                 tensor.contiguous() for tensor in css.chunk(2, dim=-1)
@@ -358,6 +418,8 @@ class DsaAttentionBackend(AttentionBackend):
             if metadata is not None
             else None
         )
+        if c4css is None:
+            c4css = self._rope_stash.get("c4")
         if c4css is not None and dsa.c4_pad_positions.numel() > 0:
             c4_idx = (
                 dsa.c4_pad_positions.clamp(0, c4css.size(0) - 1).long().to(
@@ -373,6 +435,8 @@ class DsaAttentionBackend(AttentionBackend):
             if metadata is not None
             else None
         )
+        if c128css is None:
+            c128css = self._rope_stash.get("c128")
         if c128css is not None and dsa.c128_pad_positions.numel() > 0:
             c128_idx = (
                 dsa.c128_pad_positions.clamp(0, c128css.size(0) - 1).long().to(
@@ -540,7 +604,11 @@ class DsaAttentionBackend(AttentionBackend):
         # produces zero output when block_table contains non-zero block IDs
         # at decode shapes (T=1). Copy the referenced cache blocks into a
         # fresh 0-based compact buffer and set all block_table entries to 0.
-        if not use_prefill_attn:
+        # Graph mode passes the real block table directly instead: the copy
+        # depends on per-step host reads (.item()) that cannot be captured,
+        # and the standalone capture experiment (smoke/RESULTS.md X1) shows
+        # correct decode output with non-zero block IDs under replay.
+        if not use_prefill_attn and not self._graph_mode:
             def _compact_cache(kv, bt, total_tokens=None, newest_slot=None,
                                linear_base=None, copy_slots=0):
                 """Copy referenced blocks into a 0-based buffer, return
@@ -802,6 +870,18 @@ class DsaAttentionBackend(AttentionBackend):
         c128_cos_sin: torch.Tensor | None = None,
         metadata: AttentionMetadata | None = None,
     ) -> None:
+        # In graph mode the model attaches its (stable, model-owned) tables at
+        # every captured forward, but the metadata fields are reset per
+        # forward and the positions tensor is an in-graph cast. Stash the
+        # tables on the backend instead; the per-replay refresh reads the
+        # stash and the runner-owned static positions buffer.
+        self._rope_stash = {
+            "cos_sin": dsa_cos_sin,
+            "c4": c4_cos_sin,
+            "c128": c128_cos_sin,
+        }
+        if self._graph_mode:
+            return
         metadata = metadata or self._metadata
         if metadata is not None:
             metadata.dsa_positions = positions

@@ -305,7 +305,9 @@ def snap(
                 "quant_lightning_indexer_metadata",
                 "logits",
                 "quant_lightning_indexer_v2_out", "quant_lightning_indexer_out",
-                "quant_lightning_indexer_v2", "quant_lightning_indexer"}
+                "quant_lightning_indexer_v2", "quant_lightning_indexer",
+                "graph_bt_0", "graph_bt_1", "graph_bt_2", "graph_bt_3",
+                "graph_slots_0", "graph_meta", "layer_output"}
     if task not in _allowed:
         return
     if not _env_filter_ok(layer, ctx_get()):
