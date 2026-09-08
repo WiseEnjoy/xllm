@@ -233,11 +233,18 @@ class DsaAttentionBackend(AttentionBackend):
         # kernels do not guard against -1 block IDs and compute invalid
         # addresses -> device error 507011 under concurrent batches with
         # padding. The window compact's valid mask already zeroes the
-        # attention contribution of padded lanes.
+        # attention contribution of padded lanes. Builder output shares one
+        # tensor per manager across layers, so dedup by object identity to
+        # process ~6 unique tensors instead of 258 layer-cache entries.
+        _seen_bts: set[int] = set()
         for lid in range(len(dsa_metadata.block_tables)):
             for ci in range(len(dsa_metadata.block_tables[lid])):
                 bt = dsa_metadata.block_tables[lid][ci]
                 if bt is not None and bt.numel() > 0 and bt.device.type == "cpu":
+                    bt_id = id(bt)
+                    if bt_id in _seen_bts:
+                        continue
+                    _seen_bts.add(bt_id)
                     bt[bt < 0] = 0
         self._move_metadata_to_device(dsa_metadata, persistent=True)
         self._build_precomputed_metadata(dsa_metadata, metadata, persistent=True)
@@ -1027,9 +1034,19 @@ class DsaAttentionBackend(AttentionBackend):
         token = kv_cpu.unsqueeze(1) - k.unsqueeze(1) + torch.arange(win).unsqueeze(0)
         valid = torch.arange(win).unsqueeze(0) < k.unsqueeze(1)
 
-        bt_host = (
-            ori_bt.detach().cpu() if ori_bt.device.type != "cpu" else ori_bt.detach()
-        ).to(torch.int64)
+        # Prefer the cached host copy stashed by _move_metadata_to_device
+        # (keyed by the device tensor's data_ptr — the builder dedups per
+        # manager so all layers of a group share one device tensor). This
+        # avoids 43 D2H syncs per decode step.
+        host_cache = getattr(self, "_eager_bt_host", {})
+        bt_cpu = host_cache.get(ori_bt.data_ptr())
+        if bt_cpu is not None:
+            bt_host = bt_cpu.to(torch.int64)
+        else:
+            bt_host = (
+                ori_bt.detach().cpu() if ori_bt.device.type != "cpu"
+                else ori_bt.detach()
+            ).to(torch.int64)
         eff_mask = bt_host >= 0
         cols_eff = eff_mask.sum(dim=1).clamp(min=1)
         rank = eff_mask.long().cumsum(dim=1) - 1
@@ -1337,10 +1354,27 @@ class DsaAttentionBackend(AttentionBackend):
                         )
                     layer_tensors[index] = mgr_cache[key]
         else:
-            for layer_tensors in dsa.block_tables:
+            # Keep CPU originals of the manager block tables so the eager
+            # decode window gather reads them without per-layer D2H syncs
+            # (the builder dedups per manager; ~6 unique tensors).
+            _seen: set[int] = set()
+            host_cache: dict[int, torch.Tensor] = {}
+            for lid, layer_tensors in enumerate(dsa.block_tables):
                 for index, tensor in enumerate(layer_tensors):
                     if tensor is not None:
+                        if tensor.device.type == "cpu" and tensor.numel() > 0:
+                            t_id = id(tensor)
+                            if t_id not in _seen:
+                                _seen.add(t_id)
+                                dev_t = tensor.to(self.device)
+                                layer_tensors[index] = dev_t
+                                # Key by the device tensor's data_ptr so the
+                                # eager window gather can look it up from the
+                                # device tensor it receives in execute().
+                                host_cache[dev_t.data_ptr()] = tensor
+                                continue
                         layer_tensors[index] = tensor.to(self.device)
+            self._eager_bt_host = host_cache
             for layer_tensors in dsa.slot_mappings:
                 for index, tensor in enumerate(layer_tensors):
                     if tensor is not None:

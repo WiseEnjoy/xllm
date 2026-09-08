@@ -564,33 +564,12 @@ class DecodeAclGraphRunner(BaseRunner):
         # so the refresh always sees the real positions.
         if entry.static_metadata.multi_block_tables is not None:
             entry.static_metadata.dsa_positions = entry.static_positions
-        import time as _time
-
-        _t0 = _time.perf_counter()
         with forward_context(prepare_context):
             self.attention_backend.prepare(
                 entry.static_metadata, graph_mode=True
             )
-        _t1 = _time.perf_counter()
         if first_capture:
             self._capture(entry)
-        _t2 = _time.perf_counter()
-        self._step_timings = getattr(self, "_step_timings", [])
-        self._step_timings.append((_t1 - _t0, _t2 - _t1))
-        if len(self._step_timings) == 200:
-            import statistics as _st
-
-            from scripts.logger import logger
-
-            preps = [t[0] * 1000 for t in self._step_timings[10:]]
-            reps = [t[1] * 1000 for t in self._step_timings[10:]]
-            logger.info(
-                f"DIAG-step-timing over 200 steps: refresh(host) "
-                f"mean={_st.mean(preps):.2f}ms p50={_st.median(preps):.2f}ms "
-                f"max={max(preps):.2f}ms | replay+capture "
-                f"mean={_st.mean(reps):.2f}ms p50={_st.median(reps):.2f}ms"
-            )
-            self._step_timings = []
 
         # Replay on the CURRENT (compute) stream. The dedicated capture
         # stream stays for capture only (NPUGraph requires non-default).
