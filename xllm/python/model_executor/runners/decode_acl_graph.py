@@ -564,13 +564,33 @@ class DecodeAclGraphRunner(BaseRunner):
         # so the refresh always sees the real positions.
         if entry.static_metadata.multi_block_tables is not None:
             entry.static_metadata.dsa_positions = entry.static_positions
+        import time as _time
+
+        _t0 = _time.perf_counter()
         with forward_context(prepare_context):
             self.attention_backend.prepare(
                 entry.static_metadata, graph_mode=True
             )
-
+        _t1 = _time.perf_counter()
         if first_capture:
             self._capture(entry)
+        _t2 = _time.perf_counter()
+        self._step_timings = getattr(self, "_step_timings", [])
+        self._step_timings.append((_t1 - _t0, _t2 - _t1))
+        if len(self._step_timings) == 200:
+            import statistics as _st
+
+            from scripts.logger import logger
+
+            preps = [t[0] * 1000 for t in self._step_timings[10:]]
+            reps = [t[1] * 1000 for t in self._step_timings[10:]]
+            logger.info(
+                f"DIAG-step-timing over 200 steps: refresh(host) "
+                f"mean={_st.mean(preps):.2f}ms p50={_st.median(preps):.2f}ms "
+                f"max={max(preps):.2f}ms | replay+capture "
+                f"mean={_st.mean(reps):.2f}ms p50={_st.median(reps):.2f}ms"
+            )
+            self._step_timings = []
 
         self._stream.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(self._stream):
@@ -898,11 +918,10 @@ class DecodeAclGraphRunner(BaseRunner):
             self.layer_caches,
             execution_state=entry.execution_state,
         )
-        # DSA skips the eager warmup forwards: the first request's prefill
-        # (eager) already attached the model-owned rope tables the refresh
-        # needs, and repeated eager executions of the compressor/indexer
-        # carry per-step accumulated state on the decode path. The CANN ops
-        # capture cold (verified standalone, smoke/RESULTS.md X1).
+        # DSA skips the generic eager warmup forwards (the first request's
+        # eager prefill already attached the rope tables; writes during a
+        # warmup run would not be idempotent for the accumulative
+        # compressor states). CANN ops capture cold (X1).
         is_dsa = entry.static_metadata.multi_block_tables is not None
         if not is_dsa:
             with forward_context(context):

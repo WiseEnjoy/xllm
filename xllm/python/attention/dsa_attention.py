@@ -605,177 +605,29 @@ class DsaAttentionBackend(AttentionBackend):
             if use_prefill_attn
             else None
         )
-        # Decode fix for the CANN sparse_flash_mla operator: the kernel
-        # produces zero output when block_table contains non-zero block IDs
-        # at decode shapes (T=1). Copy the referenced cache blocks into a
-        # fresh 0-based compact buffer and set all block_table entries to 0.
-        # Graph mode passes the real block table directly instead: the copy
-        # depends on per-step host reads (.item()) that cannot be captured,
-        # and the standalone capture experiment (smoke/RESULTS.md X1) shows
-        # correct decode output with non-zero block IDs under replay.
         if not use_prefill_attn and not self._graph_mode:
-            def _compact_cache(kv, bt, total_tokens=None, newest_slot=None,
-                               linear_base=None, copy_slots=0):
-                """Copy referenced blocks into a 0-based buffer, return
-                (compact_kv, compact_bt) with all bt entries = 0.
-
-                The framework sliding-window block table can lag one block
-                behind the newest partially-written block (and reference
-                blocks already reclaimed by the SWA ring), which zeroes the
-                newest window tokens in the compact buffer and decays the
-                attention output.
-
-                With ``slot_base`` (the ring slot of token 0, derived from the
-                current step slot mapping) the compact buffer is laid out at
-                ABSOLUTE token positions: token t lives at pool slot
-                ``(slot_base + t) % ring_slots``. Only the newest
-                ``copy_slots`` tokens are gathered; older absolute slots stay
-                zero and are masked by the kernel Band mask.
-
-                With ``total_tokens`` but no ``slot_base`` (compressed caches)
-                the pool is sequential: block b holds entries
-                ``[b*block_size, ...)``.
-
-                Without ``total_tokens`` the caller-provided block table is
-                followed verbatim (allocator-agnostic fallback)."""
-                if kv is None or bt is None:
-                    return kv, bt
-                n_seqs = bt.size(0)
-                n_cols = bt.size(1)
-                block_size = kv.size(1)
-                if total_tokens is not None and newest_slot is not None:
-                    used = max(int(total_tokens), 1)
-                    # Round up to whole blocks: the kernel addresses the
-                    # compact buffer block-wise via the all-zero block table.
-                    total_slots = (
-                        (used - 1) // block_size + 1
-                    ) * block_size
-                    compact = torch.zeros(
-                        1, total_slots, kv.size(2), kv.size(3),
-                        dtype=kv.dtype, device=kv.device,
-                    )
-                    compact_flat = compact.reshape(-1, kv.size(3))
-                    kv_flat = kv.reshape(-1, kv.size(3))
-                    # SWA ring: the sliding-window manager recycles slots
-                    # with a 2*window_size cycle inside
-                    # [block_size, block_size + 2*window_size); token t lives
-                    # at slot newest_slot - (newest_index - t) wrapped into
-                    # that range. Only the newest copy_slots tokens are
-                    # recoverable; older absolute slots stay zero and are
-                    # masked by the kernel Band mask.
-                    cycle = 2 * self.window_size
-                    slot_lo = block_size
-                    start_t = max(0, used - copy_slots)
-                    offs = torch.arange(start_t, used, device=kv.device)
-                    s = newest_slot - (used - 1 - offs)
-                    s = (s - slot_lo) % cycle + slot_lo
-                    compact_flat[start_t:used] = kv_flat[s]
-                elif total_tokens is not None and linear_base is not None:
-                    # Sequential pool (compressed caches): entry e lives at
-                    # slot linear_base + e.
-                    used = max(int(total_tokens), 1)
-                    total_slots = (
-                        (used - 1) // block_size + 1
-                    ) * block_size
-                    compact = torch.zeros(
-                        1, total_slots, kv.size(2), kv.size(3),
-                        dtype=kv.dtype, device=kv.device,
-                    )
-                    compact_flat = compact.reshape(-1, kv.size(3))
-                    kv_flat = kv.reshape(-1, kv.size(3))
-                    n_slots = min(
-                        used, kv.size(0) * block_size - linear_base
-                    )
-                    idx = linear_base + torch.arange(
-                        n_slots, device=kv.device
-                    )
-                    compact_flat[:n_slots] = kv_flat[idx]
-                else:
-                    bt_cpu = bt.cpu()
-                    max_id = 0
-                    for b in range(n_seqs):
-                        for j in range(n_cols):
-                            v = int(bt_cpu[b, j])
-                            if v > max_id:
-                                max_id = v
-                    total_slots = (max_id + 1) * block_size
-                    compact = torch.zeros(
-                        1, total_slots, kv.size(2), kv.size(3),
-                        dtype=kv.dtype, device=kv.device,
-                    )
-                    compact_flat = compact.reshape(-1, kv.size(3))
-                    kv_flat = kv.reshape(-1, kv.size(3))
-                    for b in range(n_seqs):
-                        for j in range(n_cols):
-                            blk = int(bt_cpu[b, j])
-                            if blk < 0:
-                                continue
-                            src_start = blk * block_size
-                            dst_start = j * block_size
-                            n = min(block_size, total_slots - dst_start)
-                            if n > 0:
-                                compact_flat[dst_start:dst_start + n] = \
-                                    kv_flat[src_start:src_start + n]
-                new_bt = torch.zeros(
-                    n_seqs, n_cols, dtype=torch.int32, device=kv.device
-                )
-                return compact, new_bt
-
-            ori_total = None
-            if seq_kv is not None and seq_kv.numel() > 0:
-                ori_total = int(seq_kv.max().item())
-            # Slot of the newest token (index ori_total-1), read from the
-            # current step slot mapping.
-            ori_newest_slot = None
-            if (
-                ori_total is not None
-                and ori_slot is not None
-                and ori_slot.numel() > 0
-                and ori_kv_for_attn is not None
-            ):
-                ori_newest_slot = int(ori_slot.flatten()[0].item())
-            if os.environ.get("DSA_BYPASS_ORI", "1") == "1":
-                ori_kv_for_attn, ori_block_table_for_attn = _compact_cache(
-                    ori_kv_for_attn, ori_block_table_for_attn,
-                    total_tokens=ori_total,
-                    newest_slot=ori_newest_slot,
-                    copy_slots=(
-                        2 * self.window_size if ori_newest_slot is not None else 0
-                    ),
-                )
-            if cmp_kv is not None:
-                cmp_total = (
-                    ori_total // compress_ratio
-                    if ori_total is not None and compress_ratio > 1
-                    else None
-                )
-                # The compressed cache shares the reserved-block ring layout
-                # (entry e lives at slot base+e); derive the base from the
-                # newest committed entry slot, memoizing per layer for the
-                # non-commit steps where cmp_slot is absent.
-                cmp_base = None
-                if (
-                    cmp_total
-                    and cmp_slot is not None
-                    and cmp_slot.numel() > 0
-                ):
-                    cmp_base = (
-                        int(cmp_slot.flatten()[0].item()) - (cmp_total - 1)
-                    )
-                    if not hasattr(self, "_cmp_linear_bases"):
-                        self._cmp_linear_bases = {}
-                    self._cmp_linear_bases[layer_id] = cmp_base
-                if cmp_base is None:
-                    cmp_base = getattr(self, "_cmp_linear_bases", {}).get(
-                        layer_id
-                    )
-                if os.environ.get("DSA_BYPASS_CMP", "1") == "1":
-                    cmp_kv, cmp_block_table_for_kernel = _compact_cache(
-                        cmp_kv, cmp_block_table_for_kernel,
-                        total_tokens=cmp_total,
-                        linear_base=cmp_base,
-                    )
-        if self._graph_mode and not use_prefill_attn:
+            # Unified eager decode: B-broadcast window gather over the REAL
+            # block table (physical addressing, no ring-wrap assumptions)
+            # plus cmp passthrough. The legacy host-driven compact bypass
+            # assumed batch==1 (single-sequence window, first-sequence
+            # newest slot) and corrupts/crashes concurrent decode batches;
+            # the CANN kernel also mis-decodes the raw ring table, so the
+            # eager path now mirrors the verified graph path.
+            (
+                ori_kv_for_attn,
+                ori_block_table_for_attn,
+                seqused_ori_kernel,
+            ) = self._decode_window_compact_eager(
+                ori_kv_for_attn, ori_block_table_for_attn, seq_kv, layer_id
+            )
+            if compress_ratio > 1:
+                seqused_cmp_kernel = seq_kv // compress_ratio
+                cmp_residual_kernel = seq_kv % compress_ratio
+            else:
+                seqused_cmp_kernel = None
+                cmp_residual_kernel = None
+            seq_kv_for_kernel = None
+        elif self._graph_mode and not use_prefill_attn:
             # Static window compact for the ori (SWA-ring) side. CANN
             # sparse_flash_mla mis-decodes the real ring block table at
             # decode shapes (bisection: ori-direct garbles, cmp-direct is
@@ -1031,12 +883,12 @@ class DsaAttentionBackend(AttentionBackend):
                 cu_seqlens_cmp_kv=None,
                 seqused_q=None,
                 seqused_ori_kv=(
-                    # Graph decode runs the ori side over the clamped window
-                    # compact; the tiling metadata must describe the same
-                    # length the kernel receives, or the AICPU tiling reads
-                    # past the 2*window compact capacity.
-                    seq_kv.clamp(max=2 * self.window_size)
-                    if self._graph_mode
+                    # Decode runs the ori side over the clamped window
+                    # compact (eager and graph alike); the tiling metadata
+                    # must describe the same length the kernel receives, or
+                    # the AICPU tiling reads past the window capacity.
+                    seq_kv.clamp(max=self.window_size)
+                    if not is_prefill
                     else seq_kv
                 ),
                 seqused_cmp_kv=seqused_cmp_kv,
@@ -1137,6 +989,68 @@ class DsaAttentionBackend(AttentionBackend):
             },
             extra={"soc": current_platform.get_npu_chip(), "v2": use_v2},
         )
+
+    def _decode_window_compact_eager(
+        self,
+        ori_kv: torch.Tensor,
+        ori_bt: torch.Tensor,
+        seq_kv: torch.Tensor,
+        layer_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Eager decode window gather (batch-safe, mirrors the graph path).
+
+        Same semantics as the graph's ``_graph_window_compact``: the newest
+        ``window`` tokens per sequence are gathered through the REAL block
+        table (physical addressing) into a zero-based per-sequence block,
+        with the clamped window length as the kernel-side seqused. Works for
+        any batch size, unlike the legacy single-sequence compact bypass.
+        """
+        bs = 128
+        win = self.window_size
+        n_seqs = seq_kv.size(0)
+        head_dim = ori_kv.size(-1)
+        device = ori_kv.device
+
+        kv_cpu = seq_kv.detach().to("cpu", torch.int64)
+        k = kv_cpu.clamp(max=win)
+        token = kv_cpu.unsqueeze(1) - k.unsqueeze(1) + torch.arange(win).unsqueeze(0)
+        valid = torch.arange(win).unsqueeze(0) < k.unsqueeze(1)
+
+        bt_host = (
+            ori_bt.detach().cpu() if ori_bt.device.type != "cpu" else ori_bt.detach()
+        ).to(torch.int64)
+        eff_mask = bt_host >= 0
+        cols_eff = eff_mask.sum(dim=1).clamp(min=1)
+        rank = eff_mask.long().cumsum(dim=1) - 1
+        eff_vals = bt_host.clamp(min=0)
+        rows = bt_host.size(0)
+        seq_sel = torch.arange(n_seqs).clamp(max=rows - 1)
+        row_rank = rank[seq_sel]
+        row_vals = eff_vals[seq_sel]
+        row_cols_eff = cols_eff[seq_sel]
+        blk_pos = ((token // bs) % row_cols_eff.unsqueeze(1)).clamp(
+            max=eff_mask.size(1) - 1
+        )
+        match = row_rank.unsqueeze(1) == blk_pos.unsqueeze(-1)
+        blk = (row_vals.unsqueeze(1) * match).sum(dim=-1)
+        blk = torch.where(match.any(dim=-1), blk, torch.zeros_like(blk))
+        src = blk * bs + (token % bs)
+        src = torch.where(valid, src.clamp(min=0), torch.zeros_like(src))
+
+        src_idx = src.to(device)
+        valid_d = valid.to(device)
+        k_d = k.to(device)
+        kv_flat = ori_kv.reshape(-1, head_dim)
+        gathered = kv_flat[src_idx]
+        compact = torch.where(
+            valid_d.unsqueeze(-1),
+            gathered,
+            torch.zeros((), dtype=ori_kv.dtype, device=device),
+        )
+        compact_kv = compact.reshape(n_seqs, bs, 1, head_dim)
+        bt = torch.arange(n_seqs, device=device, dtype=torch.int32).unsqueeze(1)
+        seqused = k.to(torch.int32).to(device)
+        return compact_kv, bt, seqused
 
     def _window_src_for_group(
         self,
