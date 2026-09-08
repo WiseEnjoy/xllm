@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import math
+import os
+
 import torch
 
 from xllm.python.attention.backend import (
@@ -226,6 +228,9 @@ class DsaAttentionBackend(AttentionBackend):
         self._move_metadata_to_device(dsa_metadata, persistent=True)
         self._build_precomputed_metadata(dsa_metadata, metadata, persistent=True)
         self._graph_dsa = dsa_metadata
+        # Rebuild the per-layer window source indices (physical block-table
+        # addressing) into the execution buffers the graph gathers through.
+        self._build_window_src_indices(dsa_metadata, kv_seq_lens)
         metadata.dsa_metadata = dsa_metadata
         # Open a dump tick per refresh step: the captured forward's layer-level
         # snaps (kernel wrappers) then land under this tick, so capture-time
@@ -729,14 +734,15 @@ class DsaAttentionBackend(AttentionBackend):
                 and ori_kv_for_attn is not None
             ):
                 ori_newest_slot = int(ori_slot.flatten()[0].item())
-            ori_kv_for_attn, ori_block_table_for_attn = _compact_cache(
-                ori_kv_for_attn, ori_block_table_for_attn,
-                total_tokens=ori_total,
-                newest_slot=ori_newest_slot,
-                copy_slots=(
-                    2 * self.window_size if ori_newest_slot is not None else 0
-                ),
-            )
+            if os.environ.get("DSA_BYPASS_ORI", "1") == "1":
+                ori_kv_for_attn, ori_block_table_for_attn = _compact_cache(
+                    ori_kv_for_attn, ori_block_table_for_attn,
+                    total_tokens=ori_total,
+                    newest_slot=ori_newest_slot,
+                    copy_slots=(
+                        2 * self.window_size if ori_newest_slot is not None else 0
+                    ),
+                )
             if cmp_kv is not None:
                 cmp_total = (
                     ori_total // compress_ratio
@@ -763,11 +769,41 @@ class DsaAttentionBackend(AttentionBackend):
                     cmp_base = getattr(self, "_cmp_linear_bases", {}).get(
                         layer_id
                     )
-                cmp_kv, cmp_block_table_for_kernel = _compact_cache(
-                    cmp_kv, cmp_block_table_for_kernel,
-                    total_tokens=cmp_total,
-                    linear_base=cmp_base,
-                )
+                if os.environ.get("DSA_BYPASS_CMP", "1") == "1":
+                    cmp_kv, cmp_block_table_for_kernel = _compact_cache(
+                        cmp_kv, cmp_block_table_for_kernel,
+                        total_tokens=cmp_total,
+                        linear_base=cmp_base,
+                    )
+        if self._graph_mode and not use_prefill_attn:
+            # Static window compact for the ori (SWA-ring) side. CANN
+            # sparse_flash_mla mis-decodes the real ring block table at
+            # decode shapes (bisection: ori-direct garbles, cmp-direct is
+            # fine -- smoke/RESULTS.md X3), so the graph gathers the newest
+            # window into a 0-based in-graph buffer with fully device-side
+            # ring indexing: no host reads, no data-dependent allocations,
+            # bucket-static shapes. Head-aligned layout keeps the eager
+            # semantics (compact[j] = token used-k+j, seqused=k). The cmp
+            # side keeps the true paged layout and lengths.
+            (
+                ori_kv_for_attn,
+                ori_block_table_for_attn,
+                seqused_ori_kernel,
+            ) = self._graph_window_compact(
+                ori_kv_for_attn, seq_kv, layer_id
+            )
+            if compress_ratio > 1:
+                seqused_cmp_kernel = seq_kv // compress_ratio
+                cmp_residual_kernel = seq_kv % compress_ratio
+            else:
+                seqused_cmp_kernel = None
+                cmp_residual_kernel = None
+            seq_kv_for_kernel = None
+        else:
+            seqused_ori_kernel = None
+            seqused_cmp_kernel = None
+            cmp_residual_kernel = None
+            seq_kv_for_kernel = seq_kv
         out, _lse = _sparse_attn_sharedkv(
             _dump_layer=layer,
             q=q,
@@ -783,7 +819,10 @@ class DsaAttentionBackend(AttentionBackend):
             # and addressed through cmp_block_table/topk.
             cu_seqlens_cmp_kv=None,
             seqused_q=None,
-            seqused_kv=seq_kv,
+            seqused_kv=seq_kv_for_kernel,
+            seqused_ori_kv=seqused_ori_kernel,
+            seqused_cmp_kv=seqused_cmp_kernel,
+            cmp_residual_kv=cmp_residual_kernel,
             # sinks: the attention sink parameter (attn_sink) is required by the
             # sparse_attn_sharedkv kernel (C++ :949 passes attn_sink_ when loaded).
             sinks=layer.attn_sink if hasattr(layer, "attn_sink") else None,
@@ -991,7 +1030,15 @@ class DsaAttentionBackend(AttentionBackend):
                 cu_seqlens_ori_kv=None,
                 cu_seqlens_cmp_kv=None,
                 seqused_q=None,
-                seqused_ori_kv=seq_kv,
+                seqused_ori_kv=(
+                    # Graph decode runs the ori side over the clamped window
+                    # compact; the tiling metadata must describe the same
+                    # length the kernel receives, or the AICPU tiling reads
+                    # past the 2*window compact capacity.
+                    seq_kv.clamp(max=2 * self.window_size)
+                    if self._graph_mode
+                    else seq_kv
+                ),
                 seqused_cmp_kv=seqused_cmp_kv,
                 cmp_residual_kv=cmp_residual_kv,
                 ori_topk_length=None,
@@ -1090,6 +1137,132 @@ class DsaAttentionBackend(AttentionBackend):
             },
             extra={"soc": current_platform.get_npu_chip(), "v2": use_v2},
         )
+
+    def _build_window_src_indices(
+        self,
+        dsa_metadata: DsaMetadata,
+        kv_seq_lens: Sequence[int],
+    ) -> None:
+        """Refresh the per-layer window source-slot indices (host, per step).
+
+        For every layer's SWA manager the newest ``window`` tokens are
+        addressed through the REAL block table (physical addressing, no ring
+        wrap assumptions -- the eager wrap formula breaks once the manager
+        allocates blocks beyond the first, see smoke/RESULTS.md X3/ISS-7).
+        The indices land in execution buffers keyed by layer; the captured
+        graph gathers through them, so refreshing the content is enough.
+        """
+        bs = 128
+        win = self.window_size
+        n_layers = len(self.caches_info)
+        n_seqs = max(len(kv_seq_lens), 1)
+        for layer_id in range(n_layers):
+            mapping = self._resolve_cache_mapping(
+                layer_id, self._layer_compress_ratio(layer_id)
+            )
+            ori_idx = mapping.ori_cache_idx
+            if ori_idx < 0:
+                continue
+            bt = (
+                dsa_metadata.block_tables[layer_id][ori_idx]
+                if layer_id < len(dsa_metadata.block_tables)
+                and ori_idx < len(dsa_metadata.block_tables[layer_id])
+                else None
+            )
+            slots = (
+                dsa_metadata.slot_mappings[layer_id][ori_idx]
+                if layer_id < len(dsa_metadata.slot_mappings)
+                and ori_idx < len(dsa_metadata.slot_mappings[layer_id])
+                else None
+            )
+            if bt is None or slots is None or bt.numel() == 0:
+                continue
+            bt_host = bt.detach().cpu().tolist()
+            slot_host = (
+                slots.detach().cpu().tolist()
+                if slots.numel() >= n_seqs else [0] * n_seqs
+            )
+            rows = len(bt_host)
+            idx_rows: list[list[int]] = []
+            for seq in range(n_seqs):
+                used = int(kv_seq_lens[seq]) if seq < len(kv_seq_lens) else 0
+                k = min(used, win)
+                row = bt_host[seq] if seq < rows else []
+                # Effective (non -1) columns define the ring's block cycle.
+                eff = [b for b in row if b >= 0]
+                cols_eff = max(len(eff), 1)
+                src: list[int] = []
+                for j in range(win):
+                    if j < k:
+                        token = used - k + j
+                        blk_pos = (token // bs) % cols_eff
+                        blk = (
+                            eff[blk_pos]
+                            if eff
+                            else (slot_host[seq] // bs if slot_host[seq] >= 0 else 0)
+                        )
+                        src.append(blk * bs + (token % bs))
+                    else:
+                        src.append(0)
+                idx_rows.append(src)
+            idx_tensor = torch.tensor(
+                idx_rows, dtype=torch.int64, device=self.device
+            )
+            self._persist_tensor(
+                ("win_src", layer_id), idx_tensor.to(self.device)
+            )
+
+    def _graph_window_compact(
+        self,
+        ori_kv: torch.Tensor,
+        seq_kv: torch.Tensor,
+        layer_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather the newest SWA window into a 0-based buffer (in-graph).
+
+        The source slots come from the per-layer ``("win_src", layer_id)``
+        execution buffer that the refresh rebuilds every step (physical
+        block-table addressing). Everything here is device-side and
+        bucket-static: an in-graph gather, a validity mask from the clamped
+        window length, and a zero-based per-sequence block table. The
+        head-aligned layout keeps the eager semantics (compact position j
+        holds token ``used-k+j`` with ``k = min(used, window)``).
+        """
+        block_size = ori_kv.size(1)
+        head_dim = ori_kv.size(-1)
+        win = self.window_size
+        n_seqs = seq_kv.size(0)
+        device = ori_kv.device
+
+        src_idx = get_execution_buffer(
+            ("win_src", layer_id),
+            lambda: torch.zeros(
+                (n_seqs, win), dtype=torch.int64, device=device
+            ),
+        )
+        offs = torch.arange(win, device=device).unsqueeze(0)  # (1, W)
+        k = seq_kv.clamp(max=win).to(torch.int64)  # (B,)
+        valid = offs < k.unsqueeze(1)  # (B, W)
+
+        kv_flat = ori_kv.reshape(-1, head_dim)
+        gathered = kv_flat[src_idx]  # (B, W, D)
+        compact = torch.where(
+            valid.unsqueeze(-1),
+            gathered,
+            torch.zeros((), dtype=ori_kv.dtype, device=device),
+        )
+        # One window-sized block per sequence: (B, bs, 1, D) with bs == win.
+        compact_kv = compact.reshape(n_seqs, block_size, 1, head_dim) \
+            if win == block_size else compact.reshape(
+                n_seqs * ((win + block_size - 1) // block_size),
+                block_size, 1, head_dim,
+            )
+        n_blocks = compact_kv.size(0)
+        bt = torch.arange(
+            n_blocks, device=device, dtype=torch.int32
+        ).reshape(n_seqs, -1)
+        seqused = k.to(torch.int32)
+        return compact_kv, bt, seqused
 
     def _persist_tensor(self, key: tuple[object, ...], tensor: torch.Tensor) -> torch.Tensor:
         """Land ``tensor`` in an execution-state persistent buffer (copy_).
@@ -1371,11 +1544,19 @@ def _sparse_attn_sharedkv(**kwargs):
     # PA_BBND 下不允许传 cu_seqlens_ori_kv / cu_seqlens_cmp_kv
     kwargs["cu_seqlens_ori_kv"] = None
     kwargs["cu_seqlens_cmp_kv"] = None
-    # seqused_kv 拆成 seqused_ori_kv + seqused_cmp_kv；补算 cmp_residual_kv
-    kwargs["seqused_ori_kv"] = seqused_kv
-    if has_cmp and seqused_kv is not None:
-        kwargs["seqused_cmp_kv"] = seqused_kv // cmp_ratio
-        kwargs["cmp_residual_kv"] = seqused_kv % cmp_ratio
+    # seqused_kv 拆成 seqused_ori_kv + seqused_cmp_kv；补算 cmp_residual_kv。
+    # Callers may pass the three values directly (graph mode: the ori side
+    # runs a clamped window while cmp keeps the true length).
+    if kwargs.get("seqused_ori_kv") is None:
+        kwargs["seqused_ori_kv"] = seqused_kv
+    if has_cmp:
+        if kwargs.get("seqused_cmp_kv") is None:
+            if seqused_kv is not None:
+                kwargs["seqused_cmp_kv"] = seqused_kv // cmp_ratio
+                kwargs["cmp_residual_kv"] = seqused_kv % cmp_ratio
+            else:
+                kwargs["seqused_cmp_kv"] = None
+                kwargs["cmp_residual_kv"] = None
     else:
         kwargs["seqused_cmp_kv"] = None
         kwargs["cmp_residual_kv"] = None
