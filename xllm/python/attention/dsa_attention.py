@@ -413,10 +413,22 @@ class DsaAttentionBackend(AttentionBackend):
         if metadata is None or metadata.dsa_metadata is None:
             raise RuntimeError("DSA metadata must be prepared before selecting layer RoPE")
         dsa = metadata.dsa_metadata
-        chunks = cos_sin_cache.chunk(2, dim=-1)
         dsa.layer_id = layer_id
-        dsa.cos_table = chunks[0].contiguous()
-        dsa.sin_table = chunks[1].contiguous()
+        # Cache the chunk views per table identity: the cos_sin_cache is a
+        # persistent model buffer, and re-chunking 43 layers x 2 .contiguous()
+        # copies of (max_pos, dim/2) bf16 was pure bandwidth waste (5.4 GB/step
+        # measured). The consumers (compressor ratio=1 path, QLI partial RoPE)
+        # either index_select specific rows or apply their own .to()/.contiguous()
+        # on the gathered result, so the raw strided views suffice.
+        cache = getattr(self, "_rope_chunk_cache", None)
+        if cache is None or cache[0] is not cos_sin_cache:
+            chunks = cos_sin_cache.chunk(2, dim=-1)
+            self._rope_chunk_cache = (cos_sin_cache, chunks[0], chunks[1])
+            dsa.cos_table = chunks[0]
+            dsa.sin_table = chunks[1]
+        else:
+            dsa.cos_table = cache[1]
+            dsa.sin_table = cache[2]
 
     def _populate_dsa_rope(
         self,
@@ -1381,10 +1393,13 @@ class DsaAttentionBackend(AttentionBackend):
                         layer_tensors[index] = tensor.to(self.device)
         if persistent:
             # Rope gathers re-allocate every step; persist them so the
-            # captured forward reads address-stable tables.
+            # captured forward reads address-stable tables. The main
+            # cos/sin tables are chunk views of a persistent model buffer
+            # (address-stable by construction) and their consumers use
+            # index_select (no contiguity requirement), so skip persisting
+            # them to avoid the 2x64MB per-layer copy on every refresh.
             for name in (
-                "cos_table", "sin_table", "c4_cos", "c4_sin",
-                "c128_cos", "c128_sin",
+                "c4_cos", "c4_sin", "c128_cos", "c128_sin",
             ):
                 tensor = getattr(dsa, name, None)
                 if tensor is not None and tensor.numel() > 0:
