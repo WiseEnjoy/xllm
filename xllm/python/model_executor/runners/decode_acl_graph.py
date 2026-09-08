@@ -592,23 +592,26 @@ class DecodeAclGraphRunner(BaseRunner):
             )
             self._step_timings = []
 
-        self._stream.wait_stream(torch.npu.current_stream())
-        with torch.npu.stream(self._stream):
-            entry.graph.replay()
-            output = entry.static_output[:batch_size].clone()
+        # Replay on the CURRENT (compute) stream. The dedicated capture
+        # stream stays for capture only (NPUGraph requires non-default).
+        # Replaying on the compute stream serializes the graph's captured
+        # HCCL collectives with eagerly-enqueued HCCL (prefill all-reduces,
+        # H2D fills) on ONE stream -- two streams sharing one HCCL
+        # communicator under concurrency corrupts its state (507011, X6).
+        entry.graph.replay()
+        output = entry.static_output[:batch_size].clone()
 
         # A captured FIA task waits on its update event before execution.  This
         # lets replay run concurrently with the host-side updates for later
         # layers while preventing the graph from observing stale parameters.
-        with torch.npu.stream(self._update_stream):
-            self._update_stream.wait_event(self._replay_done_event)
-            self._update_graph_tasks(self._update_stream, entry.graph_tasks)
+        if entry.graph_tasks:
+            with torch.npu.stream(self._update_stream):
+                self._update_stream.wait_event(self._replay_done_event)
+                self._update_graph_tasks(self._update_stream, entry.graph_tasks)
 
-        # The next update must not overwrite task parameters until this replay
-        # has consumed them.
-        self._replay_done_event.record(self._stream)
-
-        torch.npu.current_stream().wait_stream(self._stream)
+            # The next update must not overwrite task parameters until this
+            # replay has consumed them.
+            self._replay_done_event.record(torch.npu.current_stream())
         return output
 
     @staticmethod
@@ -958,7 +961,14 @@ class DecodeAclGraphRunner(BaseRunner):
             execution_state=entry.execution_state,
         )
         with forward_context(context):
-            with torch.npu.graph(entry.graph, stream=self._stream):
+            with torch.npu.graph(
+                entry.graph,
+                stream=self._stream,
+                # Match the C++ AclGraph capture mode: THREAD_LOCAL allows
+                # other threads (eager prefill, prepare H2D) to keep
+                # executing synchronous operations during lazy capture.
+                capture_error_mode="thread_local",
+            ):
                 entry.static_output = self._forward_static(entry)
         entry.graph_tasks = capture_context.tasks
         self._captures = getattr(self, "_captures", 0) + 1

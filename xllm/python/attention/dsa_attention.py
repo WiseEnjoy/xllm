@@ -228,6 +228,17 @@ class DsaAttentionBackend(AttentionBackend):
         # Window indices first, while the builder output is still on CPU
         # (saves per-layer D2H reads of the block tables).
         self._build_window_src_indices(dsa_metadata, kv_seq_lens)
+        # Remap padding-lane -1 block-table entries to block 0 on the CPU
+        # tensors (before the device move). The CANN compressor/indexer
+        # kernels do not guard against -1 block IDs and compute invalid
+        # addresses -> device error 507011 under concurrent batches with
+        # padding. The window compact's valid mask already zeroes the
+        # attention contribution of padded lanes.
+        for lid in range(len(dsa_metadata.block_tables)):
+            for ci in range(len(dsa_metadata.block_tables[lid])):
+                bt = dsa_metadata.block_tables[lid][ci]
+                if bt is not None and bt.numel() > 0 and bt.device.type == "cpu":
+                    bt[bt < 0] = 0
         self._move_metadata_to_device(dsa_metadata, persistent=True)
         self._build_precomputed_metadata(dsa_metadata, metadata, persistent=True)
         self._graph_dsa = dsa_metadata
@@ -1169,6 +1180,18 @@ class DsaAttentionBackend(AttentionBackend):
                 state.persistent_buffers[("win_src_all",)] = merged_buf
         else:
             merged_buf.copy_(unique.to(self.device), non_blocking=True)
+        # Host-side OOB diagnostic: the SWA pool is the smallest cache;
+        # indices beyond it would read out of bounds in the graph gather.
+        pool_slots = 74 * 128  # swa_cache=[74, 128, 1, 512]
+        if int(unique.max().item()) >= pool_slots:
+            from scripts.logger import logger
+
+            logger.error(
+                "WINDOW-SRC OOB (host): max_idx=%s pool=%s sample=%s "
+                "kv_lens=%s",
+                int(unique.max().item()), pool_slots,
+                unique.flatten()[:8].tolist(), list(kv_seq_lens[:4]),
+            )
 
     def _graph_window_compact(
         self,
@@ -1206,6 +1229,9 @@ class DsaAttentionBackend(AttentionBackend):
         valid = offs < k.unsqueeze(1)  # (B, W)
 
         kv_flat = ori_kv.reshape(-1, head_dim)
+        # Safety clamp: out-of-bounds gather indices produce device error
+        # 507011 (no .item() here -- this runs inside the captured graph).
+        src_idx = src_idx.clamp(0, kv_flat.size(0) - 1)
         gathered = kv_flat[src_idx]  # (B, W, D)
         compact = torch.where(
             valid.unsqueeze(-1),
