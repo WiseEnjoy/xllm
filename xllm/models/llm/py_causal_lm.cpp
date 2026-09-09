@@ -25,8 +25,10 @@ limitations under the License.
 #include <utility>
 
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kernel_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_loader.h"
+#include "core/framework/parallel_state/mega_moe_comm_resource.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "models/py_model_helper.h"
@@ -209,6 +211,7 @@ py::dict PyCausalLM::build_config_dict(
   // a derived member function, so pass it explicitly for the Python executor.
   d["cp_rank"] = cp_rank_;
   d["enable_graph"] = ExecutionConfig::get_instance().enable_graph();
+  d["enable_mega_moe"] = ::xllm::KernelConfig::get_instance().enable_mega_moe();
   d["python_graph_backend"] =
       ExecutionConfig::get_instance().python_graph_backend();
   return d;
@@ -298,6 +301,38 @@ void PyCausalLM::moe_ep_all_reduce(torch::Tensor& tensor) {
   if (moe_ep_group_ != nullptr) {
     moe_ep_group_->allreduce(tensor);
   }
+}
+
+torch::Tensor PyCausalLM::mega_moe_context_tensor(
+    int64_t max_num_tokens_per_rank) {
+  if (moe_ep_group_ == nullptr) {
+    return torch::Tensor();
+  }
+  MegaMoeCommSpec spec;
+  spec.group_name = moe_ep_group_->hccl_comm_name(/*init_comm=*/true);
+  // hccl_comm() extracts the native HcclComm handle from the underlying
+  // c10d ProcessGroupHCCL (TORCH kernel backend) or the externally owned
+  // communicator; HcclCreateOpResCtx requires the native handle.
+  // Use a DEDICATED HCCL communicator: the c10d-managed communicator's
+  // op-resource-context conflicts with MegaMoe (HcclCreateOpResCtx returns
+  // HCCL_E_INTERNAL when the comm already has a c10d context bound).
+  spec.hccl_comm = moe_ep_group_->acquire_mega_moe_hccl_comm();
+  spec.ep_world_size = moe_ep_group_->world_size();
+  LOG(INFO) << "MEGAMOE-BRIDGE group='" << spec.group_name
+            << "' dedicated_hccl_comm=" << spec.hccl_comm
+            << "' ep_world_size=" << spec.ep_world_size
+            << "' rank=" << moe_ep_group_->rank();
+  spec.device_index = device_.index();
+  spec.max_num_tokens_per_rank = max_num_tokens_per_rank;
+  mega_moe_comm_ = moe_ep_group_->acquire_mega_moe_comm_resource(spec);
+  return mega_moe_comm_->context_tensor();
+}
+
+int64_t PyCausalLM::mega_moe_ccl_buffer_size() {
+  if (mega_moe_comm_ == nullptr) {
+    return 0;
+  }
+  return mega_moe_comm_->ccl_buffer_size();
 }
 
 bool PyCausalLM::share_weights_from(CausalLM& source) {

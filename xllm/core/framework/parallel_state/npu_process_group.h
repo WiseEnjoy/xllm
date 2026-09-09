@@ -57,9 +57,20 @@ class ProcessGroupImpl : public ProcessGroup {
 
   std::string hccl_comm_name(bool init_comm = true) override;
   HcclComm hccl_comm() override;
+  // Create a dedicated HCCL communicator for native HCCL consumers (MegaMoe)
+  // whose op-resource-context cannot coexist with the c10d context bound to
+  // the shared communicator. Uses the group's TCP store for root-info
+  // rendezvous and HcclCommInitRootInfo for initialization.
+  HcclComm acquire_mega_moe_hccl_comm();
 
  private:
   HcclComm comm_ = nullptr;
+  HcclComm mega_moe_comm_ = nullptr;
+  std::string store_host_;
+  int32_t store_port_ = 0;
+  int32_t group_rank_ = 0;
+  int32_t group_rank_size_ = 0;
+  std::string group_name_;
   c10_npu::NPUStream comm_stream_;
 };
 

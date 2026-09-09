@@ -730,57 +730,60 @@ torch.testing.assert_close(
 )PY");
 }
 
-if (!is_ascend950_device()) {
-  GTEST_SKIP() << "Ascend950 is required for the A5 attention path.";
-}
+TEST_F(NpuXllmOpsTest, Dsv4A5AttentionPartialRotary) {
+  if (!is_ascend950_device()) {
+    GTEST_SKIP() << "Ascend950 is required for the A5 attention path.";
+  }
+  constexpr int64_t kSequenceLength = 129;
+  constexpr int64_t kQueryHeads = 6;
+  constexpr int64_t kKvHeads = 1;
+  constexpr int64_t kHeadDim = 256;
+  constexpr double kScale = 1.0 / 16.0;
+  torch::manual_seed(20260729);
 
-constexpr int64_t kSequenceLength = 129;
-constexpr int64_t kQueryHeads = 6;
-constexpr int64_t kKvHeads = 1;
-constexpr int64_t kHeadDim = 256;
-constexpr double kScale = 1.0 / 16.0;
-torch::manual_seed(20260729);
+  const auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32);
+  const auto query_cpu =
+      (0.25 * torch::randn({kSequenceLength, kQueryHeads, kHeadDim}, cpu_float))
+          .to(torch::kBFloat16);
+  const auto key_cpu =
+      (0.25 * torch::randn({kSequenceLength, kKvHeads, kHeadDim}, cpu_float))
+          .to(torch::kBFloat16);
+  const auto value_cpu =
+      torch::randn({kSequenceLength, kKvHeads, kHeadDim}, cpu_float)
+          .to(torch::kBFloat16);
+  const auto query = query_cpu.to(torch::kPrivateUse1);
+  const auto key = key_cpu.to(torch::kPrivateUse1);
+  const auto value = value_cpu.to(torch::kPrivateUse1);
 
-const auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32);
-const auto query_cpu =
-    (0.25 * torch::randn({kSequenceLength, kQueryHeads, kHeadDim}, cpu_float))
-        .to(torch::kBFloat16);
-const auto key_cpu =
-    (0.25 * torch::randn({kSequenceLength, kKvHeads, kHeadDim}, cpu_float))
-        .to(torch::kBFloat16);
-const auto value_cpu =
-    torch::randn({kSequenceLength, kKvHeads, kHeadDim}, cpu_float)
-        .to(torch::kBFloat16);
-const auto query = query_cpu.to(torch::kPrivateUse1);
-const auto key = key_cpu.to(torch::kPrivateUse1);
-const auto value = value_cpu.to(torch::kPrivateUse1);
+  const auto [actual, softmax_lse] =
+      xllm::kernel::npu::npu_fused_infer_attention(query,
+                                                   key,
+                                                   value,
+                                                   std::nullopt,
+                                                   std::nullopt,
+                                                   {kSequenceLength},
+                                                   {kSequenceLength},
+                                                   kQueryHeads,
+                                                   kKvHeads,
+                                                   kScale,
+                                                   /*block_size=*/128,
+                                                   /*sparse_mode=*/0,
+                                                   /*input_layout=*/"TND",
+                                                   /*softmax_lse_flag=*/false);
+  const auto expected =
+      packed_causal_attention_reference(query_cpu, key_cpu, value_cpu, kScale);
 
-const auto [actual, softmax_lse] =
-    xllm::kernel::npu::npu_fused_infer_attention(query,
-                                                 key,
-                                                 value,
-                                                 std::nullopt,
-                                                 std::nullopt,
-                                                 {kSequenceLength},
-                                                 {kSequenceLength},
-                                                 kQueryHeads,
-                                                 kKvHeads,
-                                                 kScale,
-                                                 /*block_size=*/128,
-                                                 /*sparse_mode=*/0,
-                                                 /*input_layout=*/"TND",
-                                                 /*softmax_lse_flag=*/false);
-const auto expected =
-    packed_causal_attention_reference(query_cpu, key_cpu, value_cpu, kScale);
-
-EXPECT_EQ(actual.sizes(), query.sizes());
-EXPECT_EQ(softmax_lse.numel(), 0);
-EXPECT_TRUE(torch::allclose(actual.cpu().to(torch::kFloat32),
-                            expected,
-                            /*rtol=*/5e-2,
-                            /*atol=*/5e-2))
-    << "max abs diff = "
-    << (actual.cpu().to(torch::kFloat32) - expected).abs().max().item<float>();
+  EXPECT_EQ(actual.sizes(), query.sizes());
+  EXPECT_EQ(softmax_lse.numel(), 0);
+  EXPECT_TRUE(torch::allclose(actual.cpu().to(torch::kFloat32),
+                              expected,
+                              /*rtol=*/5e-2,
+                              /*atol=*/5e-2))
+      << "max abs diff = "
+      << (actual.cpu().to(torch::kFloat32) - expected)
+             .abs()
+             .max()
+             .item<float>();
 }
 
 TEST_F(NpuXllmOpsTest, Qwen35_27B_TP4_KvCacheCrosses128TokenBoundary) {

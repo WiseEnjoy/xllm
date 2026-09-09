@@ -136,6 +136,7 @@ class ProcessGroup {
       std::vector<int64_t> remote_ranks);
 
   virtual HcclComm hccl_comm();
+  virtual HcclComm acquire_mega_moe_hccl_comm() { return nullptr; }
   std::shared_ptr<MegaMoeCommResource> acquire_mega_moe_comm_resource(
       const MegaMoeCommSpec& spec);
 #endif

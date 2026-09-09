@@ -113,7 +113,12 @@ ProcessGroupImpl::ProcessGroupImpl(int32_t global_rank,
                                    const std::string& group_name,
                                    const torch::Device& device)
     : ProcessGroup(global_rank, world_size, device),
-      comm_stream_(c10_npu::getNPUStreamFromPool(device.index())) {
+      comm_stream_(c10_npu::getNPUStreamFromPool(device.index())),
+      store_port_(port),
+      group_rank_(global_rank % rank_size),
+      group_rank_size_(rank_size),
+      group_name_(group_name) {
+  store_host_ = host;
   parallel_state::sync_torch_npu_rank_table_file_env(
       ::xllm::EPLBConfig::get_instance().rank_tablefile());
   c10::intrusive_ptr<c10d_npu::ProcessGroupHCCL::Options> hccl_pg_options =
@@ -152,7 +157,12 @@ ProcessGroupImpl::ProcessGroupImpl(int32_t global_rank,
                                    const std::string& group_name,
                                    const torch::Device& device)
     : ProcessGroup(global_rank, world_size, device),
-      comm_stream_(c10_npu::getNPUStreamFromPool(device.index())) {
+      comm_stream_(c10_npu::getNPUStreamFromPool(device.index())),
+      store_port_(port),
+      group_rank_(global_rank % rank_size),
+      group_rank_size_(rank_size),
+      group_name_(group_name) {
+  store_host_ = host;
   parallel_state::sync_torch_npu_rank_table_file_env(
       ::xllm::EPLBConfig::get_instance().rank_tablefile());
   c10::intrusive_ptr<c10d_npu::ProcessGroupHCCL::Options> hccl_pg_options =
@@ -223,6 +233,53 @@ std::string ProcessGroupImpl::hccl_comm_name(bool init_comm) {
 #endif
 }
 
-HcclComm ProcessGroupImpl::hccl_comm() { return comm_; }
+HcclComm ProcessGroupImpl::hccl_comm() {
+  if (comm_ != nullptr) {
+    return comm_;
+  }
+  // TORCH kernel-backend groups own a c10d ProcessGroupHCCL; extract its
+  // native HcclComm handle so MegaMoe (HcclCreateOpResCtx) and other native
+  // HCCL consumers can operate on the same communicator.
+  if (pg_ != nullptr) {
+    auto* hccl_pg = dynamic_cast<c10d_npu::ProcessGroupHCCL*>(pg_.get());
+    if (hccl_pg != nullptr) {
+      auto devices = {device()};
+      auto hccl_comm = hccl_pg->getHcclCommByDevices(devices);
+      if (hccl_comm != nullptr) {
+        return hccl_comm->getHcclComm();
+      }
+    }
+  }
+  return nullptr;
+}
+
+HcclComm ProcessGroupImpl::acquire_mega_moe_hccl_comm() {
+  if (mega_moe_comm_ != nullptr) {
+    return mega_moe_comm_;
+  }
+  CHECK_GT(group_rank_size_, 0)
+      << "mega_moe comm requires an initialized group";
+  // Create a fresh TCP store on a distinct key so the MegaMoe rendezvous
+  // does not collide with the c10d group's store traffic.
+  const std::string key = "mega_moe_root_info_" + group_name_;
+  auto store = create_tcp_store(store_host_, store_port_, group_rank_);
+  constexpr int32_t root_info_size = 512;  // HcclRootInfo is 512 bytes
+  std::vector<uint8_t> root_info(root_info_size);
+  if (group_rank_ == 0) {
+    HcclGetRootInfo(reinterpret_cast<HcclRootInfo*>(root_info.data()));
+    store->set(key, root_info);
+  } else {
+    root_info = store->get(key);
+  }
+  HcclResult result = HcclCommInitRootInfo(
+      static_cast<uint32_t>(group_rank_size_),
+      reinterpret_cast<const HcclRootInfo*>(root_info.data()),
+      static_cast<uint32_t>(group_rank_),
+      &mega_moe_comm_);
+  CHECK_EQ(result, HCCL_SUCCESS)
+      << "HcclCommInitRootInfo failed for group '" << group_name_ << "'";
+  CHECK(mega_moe_comm_ != nullptr) << "HcclCommInitRootInfo returned null comm";
+  return mega_moe_comm_;
+}
 
 }  // namespace xllm

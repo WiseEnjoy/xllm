@@ -454,6 +454,19 @@ TORCH_LIBRARY(xllm_ops, m) {
       "int topk, int quant_mode, int batch_size, int max_seqlen_q, "
       "int max_seqlen_k, str layout_q, str layout_k, "
       "int mask_mode, int cmp_ratio, str device) -> Tensor");
+  // MegaMoe: fused dispatch + expert GEMM + activation + combine over HCCL.
+  // weight_scales1/2 are the int64-encoded W8A8 scales
+  // (fp32 -> view(int32) -> int64 bit-cast) per expert.
+  m.def(
+      "mega_moe(Tensor context, Tensor x, Tensor topk_ids, Tensor "
+      "topk_weights, Tensor[] weight1, Tensor[] weight2, int "
+      "moe_expert_num, int ep_world_size, int ccl_buffer_size, Tensor[]? "
+      "weight_scales1, Tensor[]? weight_scales2, Tensor[]? bias1, "
+      "Tensor[]? bias2, Tensor? x_active_mask, int max_recv_token_num, "
+      "int dispatch_quant_mode, int combine_quant_mode, str comm_alg, int "
+      "num_max_tokens_per_rank, str activation, float activation_clamp, "
+      "int dispatch_quant_out_dtype, int topo_type, int rank_num_per_server)"
+      " -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
@@ -477,6 +490,7 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("lightning_indexer_out",
          TORCH_FN(xllm::kernel::npu::lightning_indexer_out));
   m.impl("scatter_nd_update", TORCH_FN(xllm::kernel::npu::scatter_nd_update));
+  m.impl("mega_moe", TORCH_FN(xllm::kernel::npu::apply_npu_mega_moe));
   m.impl("sparse_flash_attention",
          TORCH_FN(xllm::kernel::npu::sparse_flash_attention));
   m.impl("sparse_flash_attention_out",

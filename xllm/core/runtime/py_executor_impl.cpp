@@ -101,6 +101,19 @@ PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
     }
     return tensor;
   });
+  m.def("mega_moe_context_tensor", [](int64_t max_num_tokens_per_rank) {
+    if (active_py_causal_lm != nullptr) {
+      return active_py_causal_lm->mega_moe_context_tensor(
+          max_num_tokens_per_rank);
+    }
+    return torch::Tensor();
+  });
+  m.def("mega_moe_ccl_buffer_size", []() {
+    if (active_py_causal_lm != nullptr) {
+      return active_py_causal_lm->mega_moe_ccl_buffer_size();
+    }
+    return static_cast<int64_t>(0);
+  });
 
 #if defined(USE_NPU)
   py::class_<NPULayerSynchronizerImpl,

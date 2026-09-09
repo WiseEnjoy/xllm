@@ -442,7 +442,8 @@ std::tuple<torch::Tensor, torch::Tensor> apply_npu_mega_moe(
     const std::string& comm_alg = "",
     int64_t num_max_tokens_per_rank = 0,
     const std::string& activation = "swiglu",
-    float activation_clamp = std::numeric_limits<float>::max(),
+    double activation_clamp =
+        static_cast<double>(std::numeric_limits<float>::max()),
     int64_t dispatch_quant_out_dtype = 0,
     int64_t topo_type = 0,
     int64_t rank_num_per_server = 2);

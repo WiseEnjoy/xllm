@@ -457,4 +457,106 @@ __all__ = [
     "moe_fused_topk",
     "cutlass_fused_moe",
     "fused_moe",
+    "mega_moe",
+    "encode_w8a8_scale_int64",
+    "has_mega_moe",
 ]
+
+
+def has_mega_moe() -> bool:
+    """Whether the aclnnMegaMoe operator is available in this build."""
+    try:
+        _ = torch.ops.xllm_ops.mega_moe
+        return True
+    except AttributeError:
+        return False
+
+
+def encode_w8a8_scale_int64(scale: torch.Tensor) -> torch.Tensor:
+    """Encode a fp32 W8A8 weight scale into int64 bit-cast storage.
+
+    Mirrors C++ ``convert_fp32_scale_to_int64`` (fused_moe.cpp:232):
+    ``fp32 -> view(int32) -> int64`` zero-extension. The MegaMoe operator
+    consumes the scale in this encoding (GLM5.2 atb mega_moe_operation.cpp
+    CHECKs dtype == INT64, reinterpret-casts to UINT64 for aclnn).
+    """
+    return (
+        scale.to(torch.float32)
+        .view(torch.int32)
+        .to(torch.int64)
+        .contiguous()
+    )
+
+
+def mega_moe(
+    context: torch.Tensor,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    weight1: list[torch.Tensor],
+    weight2: list[torch.Tensor],
+    moe_expert_num: int,
+    ep_world_size: int,
+    ccl_buffer_size: int,
+    weight_scales1: list[torch.Tensor] | None = None,
+    weight_scales2: list[torch.Tensor] | None = None,
+    bias1: list[torch.Tensor] | None = None,
+    bias2: list[torch.Tensor] | None = None,
+    x_active_mask: torch.Tensor | None = None,
+    max_recv_token_num: int = 0,
+    dispatch_quant_mode: int = 0,
+    combine_quant_mode: int = 0,
+    comm_alg: str = "",
+    num_max_tokens_per_rank: int = 0,
+    activation: str = "swiglu",
+    activation_clamp: float = 1.0e30,
+    dispatch_quant_out_dtype: int = 0,
+    topo_type: int = 0,
+    rank_num_per_server: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused dispatch + expert GEMM + activation + combine over HCCL.
+
+    Args:
+        context: 1D int32 tensor carrying the HCCL communicator handle.
+        x: 2D input hidden states, dtype bf16, shape [num_tokens, hidden].
+        topk_ids: 2D int32 global expert IDs, shape [num_tokens, topk].
+        topk_weights: 2D float32 router weights, shape [num_tokens, topk].
+        weight1: Per-expert gate/up weight tensors (int8 for W8A8).
+        weight2: Per-expert down weight tensors (int8 for W8A8).
+        moe_expert_num: Total experts across all EP ranks.
+        ep_world_size: Expert-parallel world size.
+        ccl_buffer_size: HCCL communication buffer size in bytes.
+        weight_scales1: Optional per-expert int64-encoded W8A8 scales for w1.
+        weight_scales2: Optional per-expert int64-encoded W8A8 scales for w2.
+        bias1: Optional per-expert bias added to the first GEMM output.
+        bias2: Optional per-expert bias added to the second GEMM output.
+        x_active_mask: Optional [num_tokens] int8/bool active mask.
+        max_recv_token_num: Max tokens receivable from remote ranks.
+        dispatch_quant_mode: 0=A16W16, 2=W8A8 (int8 weights + scales).
+        combine_quant_mode: 0=A16W16, 2=W8A8.
+        comm_alg: HCCL algorithm name.
+        num_max_tokens_per_rank: Max tokens per rank for all-to-all buffer.
+        activation: Activation function name (default "swiglu").
+        activation_clamp: Clamp limit on the activation output.
+        dispatch_quant_out_dtype: Output dtype for dispatch quantization.
+        topo_type: Topology type for EP communication.
+        rank_num_per_server: Number of ranks per server node.
+
+    Returns:
+        (output, expert_token_nums) where output has the same shape as x.
+    """
+    return torch.ops.xllm_ops.mega_moe(
+        context, x, topk_ids, topk_weights,
+        weight1, weight2,
+        moe_expert_num, ep_world_size, ccl_buffer_size,
+        weight_scales1, weight_scales2,
+        bias1, bias2,
+        x_active_mask,
+        max_recv_token_num,
+        dispatch_quant_mode, combine_quant_mode,
+        comm_alg,
+        num_max_tokens_per_rank,
+        activation, activation_clamp,
+        dispatch_quant_out_dtype,
+        topo_type, rank_num_per_server,
+    )

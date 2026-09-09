@@ -57,7 +57,7 @@ std::tuple<torch::Tensor, torch::Tensor> apply_npu_mega_moe(
     const std::string& comm_alg,
     int64_t num_max_tokens_per_rank,
     const std::string& activation,
-    float activation_clamp,
+    double activation_clamp,
     int64_t dispatch_quant_out_dtype,
     int64_t topo_type,
     int64_t rank_num_per_server) {

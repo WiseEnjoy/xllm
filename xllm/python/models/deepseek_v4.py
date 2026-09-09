@@ -37,6 +37,8 @@ from dataclasses import dataclass, field, replace
 import threading
 from typing import Any
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -145,6 +147,7 @@ class DeepseekV4Config:
     moe_tp_size: int = 1
     moe_tp_rank: int = 0
     ep_size: int = 1
+    enable_mega_moe: bool = False
     ep_rank: int = 0
     cp_size: int = 1
     cp_rank: int = 0
@@ -252,6 +255,7 @@ class DeepseekV4Config:
             moe_tp_size=int(d.get("moe_tp_size", 1)),
             moe_tp_rank=int(d.get("moe_tp_rank", 0)),
             ep_size=int(d.get("ep_size", d.get("tp_size", 1))),
+            enable_mega_moe=bool(d.get("enable_mega_moe", False)),
             ep_rank=int(d.get("ep_rank", d.get("tp_rank", 0))),
             cp_size=int(d.get("cp_size", 1)),
             cp_rank=int(d.get("cp_rank", 0)),
@@ -1243,6 +1247,14 @@ class DeepseekV4MoE(nn.Module):
         self.start_expert_id = ep_rank * self.num_experts_per_rank
         inter_local = cfg.moe_intermediate_size // self.moe_tp_size
         self.inter_local = inter_local
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
+        # MegaMoe: fused dispatch+GEMM+combine operator (replaces grouped MoE
+        # + EP all-reduce with a single kernel; set enable_mega_moe=true).
+        self.enable_mega_moe = bool(cfg.enable_mega_moe) and ep_size > 1
+        self._mega_moe_prepared = False
+        self._mega_moe_context = None
+        self._mega_moe_ccl_buffer_size = 0
 
         # Gate weight [n_total_experts, hidden] float32 (replicated, not sharded).
         self.gate = nn.Linear(cfg.hidden_size, cfg.n_routed_experts, bias=False, dtype=torch.float32, device=device)
@@ -1308,6 +1320,7 @@ class DeepseekV4MoE(nn.Module):
         self.shared_experts.gate_up_proj.process_weights_after_loading()
         self.shared_experts.down_proj.process_weights_after_loading()
 
+
     def forward(self, hidden: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
         from xllm.python import kernels
 
@@ -1322,6 +1335,9 @@ class DeepseekV4MoE(nn.Module):
             elif token_count > 0 and hidden_rows % token_count == 0:
                 repeat_factor = hidden_rows // token_count
                 gate_input_ids = flat_ids.unsqueeze(1).repeat(1, repeat_factor).reshape(hidden_rows)
+
+        if self.enable_mega_moe:
+            return self._forward_mega_moe(hidden, input_ids)
 
         # 1) Gate: compute logits + moe_gating_top_k_hash.
         gate_input = hidden.to(torch.float32)
@@ -1367,6 +1383,104 @@ class DeepseekV4MoE(nn.Module):
         result = self._reduce_moe_outputs(routed_out, shared_out)
         return result
 
+    def _prepare_mega_moe(self) -> None:
+        """One-time MegaMoe setup: comm context + weight/scale packing."""
+        if self._mega_moe_prepared:
+            return
+        try:
+            import xllm_runtime
+        except ImportError:
+            raise RuntimeError(
+                "enable_mega_moe requires the embedded xllm_runtime module"
+            )
+        # max_num_tokens_per_rank: decode batches stay small; use the
+        # per-layer token capacity (matches SchedulerConfig.max_tokens_per_batch
+        # semantics on the C++ side without reaching back into C++ config).
+        ctx = xllm_runtime.mega_moe_context_tensor(8192)
+        if not isinstance(ctx, torch.Tensor) or not ctx.is_defined() or ctx.numel() == 0:
+            raise RuntimeError(
+                "mega_moe context tensor unavailable "
+                "(EP group not ready — active_py_causal_lm not set during "
+                "weight loading; first forward will retry)"
+            )
+        self._mega_moe_context = ctx
+        self._mega_moe_ccl_buffer_size = xllm_runtime.mega_moe_ccl_buffer_size()
+        # Pre-split the per-expert weight views and encode the W8A8 scales
+        # (fp32 -> view(int32) -> int64) once; MegaMoe consumes TensorLists.
+        self._mega_w1_list = list(self.experts_w13.unbind(0))
+        self._mega_w2_list = list(self.experts_w2.unbind(0))
+        from xllm.python.kernels_npu.moe import encode_w8a8_scale_int64
+        self._mega_scale1_list = [
+            encode_w8a8_scale_int64(s) for s in self.experts_w13_scale.unbind(0)
+        ]
+        self._mega_scale2_list = [
+            encode_w8a8_scale_int64(s) for s in self.experts_w2_scale.unbind(0)
+        ]
+        self._mega_moe_prepared = True
+
+    def _forward_mega_moe(
+        self, hidden: torch.Tensor, input_ids: torch.Tensor | None
+    ) -> torch.Tensor:
+        """MegaMoe path: routing -> fused dispatch+GEMM+combine kernel.
+
+        Replaces grouped MoE + EP all-reduce. The operator receives GLOBAL
+        topk ids (no local masking) and handles the EP exchange internally.
+        """
+        self._prepare_mega_moe()
+        from xllm.python.kernels_npu.moe import mega_moe as mega_moe_kernel
+
+        # Gate: same hash/bias routing as the eager path, but ids stay GLOBAL.
+        gate_input = hidden.to(torch.float32)
+        logits = self.gate(gate_input)
+        norm_type = {"softmax": 0, "sigmoid": 1, "sqrtsoftplus": 2}.get(
+            self.scoring_func, 2
+        )
+        renorm = 0 if norm_type == 2 else 1
+        if self.hash_layer and hasattr(self, "tid2eid") and input_ids is not None:
+            topk_weights, topk_idx, _ = kernels.moe_gating_top_k_hash(
+                x=logits, k=self.topk, bias=None, input_ids=input_ids,
+                tid2eid=self.tid2eid, k_group=1, group_count=1,
+                routed_scaling_factor=self.routed_scaling, eps=1e-20,
+                group_select_mode=1, renorm=renorm, norm_type=norm_type,
+                out_flag=False,
+            )
+        else:
+            bias = getattr(self, "e_score_correction_bias", None)
+            topk_weights, topk_idx, _ = kernels.moe_gating_top_k_hash(
+                x=logits, k=self.topk, bias=bias, input_ids=None, tid2eid=None,
+                k_group=1, group_count=1, routed_scaling_factor=self.routed_scaling,
+                eps=1e-20, group_select_mode=1, renorm=renorm, norm_type=norm_type,
+                out_flag=False,
+            )
+        topk_ids = topk_idx.to(torch.int32).contiguous()
+        topk_weights = topk_weights.to(torch.float32).contiguous()
+
+        x_2d = hidden.reshape(-1, hidden.size(-1)).to(torch.bfloat16).contiguous()
+        output, _expert_token_nums = mega_moe_kernel(
+            context=self._mega_moe_context,
+            x=x_2d,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            weight1=self._mega_w1_list,
+            weight2=self._mega_w2_list,
+            moe_expert_num=self.num_total_experts,
+            ep_world_size=self.ep_size,
+            ccl_buffer_size=self._mega_moe_ccl_buffer_size,
+            weight_scales1=self._mega_scale1_list,
+            weight_scales2=self._mega_scale2_list,
+            dispatch_quant_mode=2,  # W8A8: int8 weights + int64-encoded scales
+            combine_quant_mode=0,
+            activation="swiglu",
+            activation_clamp=float(self.cfg.swiglu_limit),
+            num_max_tokens_per_rank=8192,
+        )
+        # Shared experts: MegaMoe only handles the routed experts. MoE TP is
+        # 1 in the current deployment, so shared needs no extra reduction.
+        shared_out = self.shared_experts(hidden)
+        if self.moe_tp_size > 1 and distributed is not None:
+            distributed.moe_tp_all_reduce(shared_out)
+        return output.to(hidden.dtype) + shared_out
+
     def _reduce_moe_outputs(
         self, routed_out: torch.Tensor, shared_out: torch.Tensor
     ) -> torch.Tensor:
@@ -1386,7 +1500,10 @@ class DeepseekV4MoE(nn.Module):
         if ep_size > 1:
             if self.moe_tp_size > 1:
                 distributed.moe_tp_all_reduce(routed_out)
-            distributed.moe_ep_all_reduce(routed_out)
+            # DIAGNOSTIC: skip EP allreduce entirely (wrong output, but
+            # isolates HCCL as the crash variable). Set DSA_SKIP_EP_REDUCE=1.
+            if os.environ.get("DSA_SKIP_EP_REDUCE", "0") != "1":
+                distributed.moe_ep_all_reduce(routed_out)
             if self.moe_tp_size > 1:
                 distributed.moe_tp_all_reduce(shared_out)
             return routed_out + shared_out

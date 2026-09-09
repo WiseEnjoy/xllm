@@ -30,6 +30,7 @@ limitations under the License.
 namespace xllm {
 
 class ProcessGroup;
+class MegaMoeCommResource;
 
 namespace detail {
 void share_python_model_weights(pybind11::object& draft_model,
@@ -86,6 +87,12 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
   void moe_tp_all_reduce(torch::Tensor& tensor);
   void moe_ep_all_reduce(torch::Tensor& tensor);
 
+  // MegaMoe bridge: build (or reuse) the HCCL communication resource for the
+  // EP group and return the int32 context tensor the aclnnMegaMoe operator
+  // consumes. Returns an undefined tensor when the EP group is unavailable.
+  torch::Tensor mega_moe_context_tensor(int64_t max_num_tokens_per_rank);
+  int64_t mega_moe_ccl_buffer_size();
+
   pybind11::object& python_model() { return py_model_; }
   const pybind11::object& config_dict() const { return config_dict_; }
 
@@ -110,6 +117,7 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
   ProcessGroup* tp_group_ = nullptr;
   ProcessGroup* moe_tp_group_ = nullptr;
   ProcessGroup* moe_ep_group_ = nullptr;
+  std::shared_ptr<MegaMoeCommResource> mega_moe_comm_;
 
   pybind11::object py_model_;
   pybind11::object config_dict_;
