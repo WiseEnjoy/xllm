@@ -271,13 +271,25 @@ HcclComm ProcessGroupImpl::acquire_mega_moe_hccl_comm() {
   } else {
     root_info = store->get(key);
   }
-  HcclResult result = HcclCommInitRootInfo(
+  // KFC (HcclCreateOpResCtx) requires the comm to be created with AIV
+  // expansion mode (hcclOpExpansionMode=3); the default mode=0 comm
+  // returns HCCL_E_INTERNAL from HcclCreateOpResCtx.
+  HcclCommConfig comm_config;
+  HcclCommConfigInit(&comm_config);
+  comm_config.hcclOpExpansionMode = 3;  // 3 = AIV expansion
+  // Cap the per-pair communication buffer (MB). The default AIV allocation
+  // reserves an oversized symmetric-memory region that starves the model's
+  // weight loading (observed: ~106GB reserved before OOM at 16.4GB).
+  comm_config.hcclBufferSize = 200;
+  HcclResult result = HcclCommInitRootInfoConfig(
       static_cast<uint32_t>(group_rank_size_),
       reinterpret_cast<const HcclRootInfo*>(root_info.data()),
       static_cast<uint32_t>(group_rank_),
+      &comm_config,
       &mega_moe_comm_);
   CHECK_EQ(result, HCCL_SUCCESS)
-      << "HcclCommInitRootInfo failed for group '" << group_name_ << "'";
+      << "HcclCommInitRootInfoConfig(AIV) failed for group '" << group_name_
+      << "'";
   CHECK(mega_moe_comm_ != nullptr) << "HcclCommInitRootInfo returned null comm";
   return mega_moe_comm_;
 }

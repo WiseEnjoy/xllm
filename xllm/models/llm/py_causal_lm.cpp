@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
+#include "core/framework/config/scheduler_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_loader.h"
 #include "core/framework/parallel_state/mega_moe_comm_resource.h"
@@ -98,6 +99,31 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
   if (ep_size_ > 1) {
     CHECK(parallel_args.moe_ep_group_ != nullptr);
     moe_ep_group_ = parallel_args.moe_ep_group_;
+    // Initialize MegaMoe during construction (before any c10d communication
+    // runs on the EP group): HcclCreateOpResCtx fails with
+    // HCCL_E_INTERNAL once the c10d HCCL comm has been used for an
+    // allreduce, matching the Qwen C++ FusedMoEImpl timing. The context
+    // is created via the name-based lookup (HcclCommGetHandleWithName)
+    // which resolves the same underlying c10d communicator.
+    if (::xllm::KernelConfig::get_instance().enable_mega_moe()) {
+      MegaMoeCommSpec spec;
+      spec.group_name = moe_ep_group_->hccl_comm_name(/*init_comm=*/true);
+      // Extract the native HcclComm from the c10d ProcessGroupHCCL. The
+      // name-based fallback (nullptr) fails in the TORCH backend because
+      // Use the DEDICATED AIV-mode HCCL comm (acquire_mega_moe_hccl_comm
+      // creates it with hcclOpExpansionMode=3 + capped buffer). The c10d
+      // comm's standard mode does not support HcclCreateOpResCtx(AIV).
+      spec.hccl_comm = moe_ep_group_->acquire_mega_moe_hccl_comm();
+      LOG(INFO) << "MEGAMOE-CTOR group='" << spec.group_name
+                << "' dedicated_hccl_comm=" << spec.hccl_comm;
+      spec.ep_world_size = moe_ep_group_->world_size();
+      spec.device_index = device_.index();
+      spec.max_num_tokens_per_rank =
+          ::xllm::SchedulerConfig::get_instance().max_tokens_per_batch();
+      mega_moe_comm_ = moe_ep_group_->acquire_mega_moe_comm_resource(spec);
+      LOG(INFO) << "MegaMoe context initialized at PyCausalLM construction: "
+                << "comm=" << (mega_moe_comm_ != nullptr ? "OK" : "FAILED");
+    }
   }
   moe_tp_size_ = (moe_tp_group_ != nullptr) ? moe_tp_group_->world_size() : 1;
   moe_tp_rank_ = (moe_tp_group_ != nullptr) ? moe_tp_group_->rank() : 0;
@@ -305,26 +331,12 @@ void PyCausalLM::moe_ep_all_reduce(torch::Tensor& tensor) {
 
 torch::Tensor PyCausalLM::mega_moe_context_tensor(
     int64_t max_num_tokens_per_rank) {
-  if (moe_ep_group_ == nullptr) {
+  // Context was initialized during construction (before any c10d
+  // communication ran on the EP group); this method only exposes the
+  // pre-built context tensor to the Python model.
+  if (mega_moe_comm_ == nullptr) {
     return torch::Tensor();
   }
-  MegaMoeCommSpec spec;
-  spec.group_name = moe_ep_group_->hccl_comm_name(/*init_comm=*/true);
-  // hccl_comm() extracts the native HcclComm handle from the underlying
-  // c10d ProcessGroupHCCL (TORCH kernel backend) or the externally owned
-  // communicator; HcclCreateOpResCtx requires the native handle.
-  // Use a DEDICATED HCCL communicator: the c10d-managed communicator's
-  // op-resource-context conflicts with MegaMoe (HcclCreateOpResCtx returns
-  // HCCL_E_INTERNAL when the comm already has a c10d context bound).
-  spec.hccl_comm = moe_ep_group_->acquire_mega_moe_hccl_comm();
-  spec.ep_world_size = moe_ep_group_->world_size();
-  LOG(INFO) << "MEGAMOE-BRIDGE group='" << spec.group_name
-            << "' dedicated_hccl_comm=" << spec.hccl_comm
-            << "' ep_world_size=" << spec.ep_world_size
-            << "' rank=" << moe_ep_group_->rank();
-  spec.device_index = device_.index();
-  spec.max_num_tokens_per_rank = max_num_tokens_per_rank;
-  mega_moe_comm_ = moe_ep_group_->acquire_mega_moe_comm_resource(spec);
   return mega_moe_comm_->context_tensor();
 }
 
