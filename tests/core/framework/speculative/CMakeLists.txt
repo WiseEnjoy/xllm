@@ -12,4 +12,5 @@ cc_test(
     torch
     glog::glog
     proto::xllm_proto
+    GTest::gtest_main
 )
