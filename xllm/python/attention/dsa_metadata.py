@@ -347,39 +347,31 @@ class DsaMetadataBuilder:
         the compressed RoPE needs the position ``next_pos - ratio``.
         """
         total_tokens = int(dsa.input_positions.numel())
-        c4_positions: list[int] = []
-        c128_positions: list[int] = []
-        for seq, kv_len in enumerate(kv_seq_lens):
-            q_len = min(q_lens[seq], kv_len)
-            start_pos = kv_len - q_len
-            for i in range(q_len):
-                pos = start_pos + i
-                next_pos = pos + 1
-                if next_pos % 4 == 0:
-                    c4_positions.append(next_pos - 4)
-                if next_pos % 128 == 0:
-                    c128_positions.append(next_pos - 128)
+        # Vectorized: per-sequence position ranges concatenated into one tensor
+        # (seq-major order, identical to the reference nested loop), then mask
+        # the positions whose successor crosses a ratio boundary.
+        ranges = [
+            torch.arange(kv_len - min(q_lens[seq], kv_len), kv_len, dtype=torch.int64)
+            for seq, kv_len in enumerate(kv_seq_lens)
+        ]
+        positions = torch.cat(ranges) if ranges else torch.empty(0, dtype=torch.int64)
+        next_pos = positions + 1
+        c4_positions = next_pos[(next_pos % 4) == 0] - 4
+        c128_positions = next_pos[(next_pos % 128) == 0] - 128
 
-        def _pad(positions: list[int], ratio: int) -> torch.Tensor:
+        def _pad(values: torch.Tensor, ratio: int) -> torch.Tensor:
             if enable_graph:
                 # Graph mode pads to total_tokens so the tensor address is stable
                 # across bucket sizes. C++ vector::resize() zero-fills the tail.
-                out = torch.zeros(
-                    total_tokens, dtype=dsa.input_positions.dtype
-                )
-                for idx, p in enumerate(positions):
-                    out[idx] = p
-                return out
-            # Non-graph: resize to min(total_tokens, total_tokens//ratio + batch_size)
-            # with 0 padding, matching C++ dsa_metadata_builder.cpp:717
-            # (c4_target = min(num_tokens, num_tokens/4 + batch_size)).
-            batch_size = len(kv_seq_lens)
-            target = min(total_tokens, total_tokens // ratio + batch_size)
+                target = total_tokens
+            else:
+                # Non-graph: resize to min(total_tokens, total_tokens//ratio +
+                # batch_size) with 0 padding, matching C++ dsa_metadata_builder.cpp:717.
+                target = min(total_tokens, total_tokens // ratio + len(kv_seq_lens))
             out = torch.zeros(target, dtype=dsa.input_positions.dtype)
-            for idx, p in enumerate(positions):
-                if idx >= target:
-                    break
-                out[idx] = p
+            n = min(int(values.numel()), target)
+            if n > 0:
+                out[:n] = values[:n].to(dsa.input_positions.dtype)
             return out
 
         dsa.c4_pad_positions = _pad(c4_positions, 4)
