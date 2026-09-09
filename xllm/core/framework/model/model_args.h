@@ -76,6 +76,13 @@ struct ModelArgs {
   // False selects the CANN 9.0-compatible q_len=1 row fallback.
   PROPERTY(bool, dspark_use_native_sas) = false;
 
+  // DSpark confidence head (block-diffusion drafts): when enabled the draft
+  // carries a trained confidence head consulted during sequential sampling;
+  // confidence_head_with_markov selects whether the head input concatenates
+  // the Markov embedding of the previous token.
+  PROPERTY(bool, enable_confidence_head) = false;
+  PROPERTY(bool, confidence_head_with_markov) = false;
+
   PROPERTY(bool, use_qk_norm) = false;
   PROPERTY(float, rms_norm_eps) = 0.0f;
 

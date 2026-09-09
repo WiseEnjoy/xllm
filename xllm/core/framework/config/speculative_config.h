@@ -47,6 +47,12 @@ class SpeculativeConfig final {
            algorithm == "DSpark";
   }
 
+  // Block-diffusion drafts (DFlash/DSpark): one block forward proposes the
+  // whole draft; classified separately from MTP (autoregressive drafts).
+  static bool is_block_diffusion_algorithm(std::string_view algorithm) {
+    return algorithm == "DFlash" || algorithm == "DSpark";
+  }
+
   static bool is_mtp_algorithm(std::string_view algorithm) {
     return algorithm.size() == 3 &&
            (algorithm[0] == 'M' || algorithm[0] == 'm') &&
