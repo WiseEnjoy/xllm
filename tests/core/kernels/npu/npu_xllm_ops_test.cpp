@@ -31,8 +31,10 @@ limitations under the License.
 #include <optional>
 #include <string>
 
+#include "core/framework/parallel_state/mega_moe_comm_resource.h"
 #include "core/kernels/npu/npu_ops_api.h"
 #include "core/kernels/xllm_torch_ops.h"
+#include "hccl/hccl.h"
 
 namespace py = pybind11;
 
@@ -1100,6 +1102,181 @@ torch.npu.synchronize()
 assert graph_result.data_ptr() == output_address
 assert output.data_ptr() == output_address
 )PY");
+}
+
+// ---------------------------------------------------------------------------
+// MegaMoe kernel unit tests (single-rank, ep=1, W8A8 quantization path)
+// ---------------------------------------------------------------------------
+
+TEST_F(NpuXllmOpsTest, MegaMoeSingleRankW8A8MatchesReference) {
+  if (!is_ascend950_device()) {
+    GTEST_SKIP() << "Ascend950 is required for the MegaMoe kernel path.";
+  }
+  if (!xllm::kernel::npu::has_mega_moe()) {
+    GTEST_SKIP() << "aclnnMegaMoe symbol not available in this build.";
+  }
+
+  // 1) Build a single-rank HCCL communicator + MegaMoe context.
+  constexpr int32_t kRank = 0;
+  constexpr int32_t kRankSize = 1;
+  constexpr int32_t kDeviceIndex = 0;
+  // HcclGetRootInfo requires an initialized ACL/HCCL runtime: bind the
+  // device and init ACL first (the fixture may not have initialized it).
+  ASSERT_EQ(aclrtSetDevice(kDeviceIndex), ACL_SUCCESS);
+  HcclRootInfo root_info;
+  HcclResult root_result = HcclGetRootInfo(&root_info);
+  ASSERT_EQ(root_result, HCCL_SUCCESS) << "HcclGetRootInfo failed";
+  HcclComm hccl_comm = nullptr;
+  HcclResult comm_result = HcclCommInitRootInfo(
+      /*nRanks=*/kRankSize, &root_info, /*rank=*/kRank, &hccl_comm);
+  ASSERT_EQ(comm_result, HCCL_SUCCESS)
+      << "HcclCommInitRootInfo single-rank failed";
+  ASSERT_NE(hccl_comm, nullptr);
+
+  xllm::MegaMoeCommSpec spec;
+  spec.group_name = "mega_moe_test_single";
+  spec.hccl_comm = hccl_comm;
+  spec.ep_world_size = kRankSize;
+  spec.device_index = kDeviceIndex;
+  spec.max_num_tokens_per_rank = 8;
+  auto resource = std::unique_ptr<xllm::MegaMoeCommResource>(
+      xllm::MegaMoeCommResource::create(spec));
+  ASSERT_NE(resource, nullptr);
+  const auto& context = resource->context_tensor();
+  ASSERT_TRUE(context.defined()) << "MegaMoe context tensor undefined";
+  ASSERT_EQ(context.scalar_type(), torch::kInt) << "context must be int32";
+  ASSERT_GT(context.numel(), 0);
+
+  // 2) Prepare tiny W8A8 inputs: 3 tokens, 4 experts (all local at ep=1),
+  //    hidden=32, intermediate=16, topk=2.
+  constexpr int64_t kNumTokens = 3;
+  constexpr int64_t kNumExperts = 4;
+  constexpr int64_t kHidden = 32;
+  constexpr int64_t kIntermediate = 16;
+  constexpr int64_t kTopk = 2;
+  const auto device = torch::Device(torch::kPrivateUse1, kDeviceIndex);
+  torch::manual_seed(42);
+
+  // Hidden states (bf16 kernel input).
+  auto x = torch::randn(
+               {kNumTokens, kHidden},
+               torch::TensorOptions().dtype(torch::kBFloat16).device(device))
+               .contiguous();
+  // Global topk_ids (int32) and fp32 weights.
+  auto topk_ids =
+      torch::tensor({{0, 2}, {1, 3}, {2, 0}},
+                    torch::TensorOptions().dtype(torch::kInt32).device(device))
+          .contiguous();
+  auto topk_weights =
+      torch::tensor(
+          {{0.6f, 0.4f}, {0.7f, 0.3f}, {0.5f, 0.5f}},
+          torch::TensorOptions().dtype(torch::kFloat32).device(device))
+          .contiguous();
+
+  // W8A8 weights: per-expert [in, out] int8 + fp32 scale.
+  std::vector<torch::Tensor> w1_list;
+  std::vector<torch::Tensor> w2_list;
+  std::vector<torch::Tensor> scale1_list;
+  std::vector<torch::Tensor> scale2_list;
+  torch::Tensor w1_fp32, w2_fp32;
+  for (int64_t e = 0; e < kNumExperts; ++e) {
+    // Gate+Up: [hidden, 2*intermediate]
+    w1_fp32 = torch::randn({kHidden, 2 * kIntermediate}) * 0.05;
+    // Down: [intermediate, hidden]
+    w2_fp32 = torch::randn({kIntermediate, kHidden}) * 0.05;
+    auto scale1 = w1_fp32.abs().max().clamp_min(1e-6).to(torch::kFloat32);
+    auto scale2 = w2_fp32.abs().max().clamp_min(1e-6).to(torch::kFloat32);
+    auto w1_i8 = (w1_fp32 / scale1)
+                     .clamp(-127, 127)
+                     .to(torch::kInt8)
+                     .to(device)
+                     .contiguous();
+    auto w2_i8 = (w2_fp32 / scale2)
+                     .clamp(-127, 127)
+                     .to(torch::kInt8)
+                     .to(device)
+                     .contiguous();
+    // Encode scale as int64 bit-cast (C++ convert_fp32_scale_to_int64).
+    auto scale1_i64 =
+        scale1.view(torch::kInt32).to(torch::kInt64).to(device).contiguous();
+    auto scale2_i64 =
+        scale2.view(torch::kInt32).to(torch::kInt64).to(device).contiguous();
+    w1_list.push_back(w1_i8);
+    w2_list.push_back(w2_i8);
+    scale1_list.push_back(scale1_i64);
+    scale2_list.push_back(scale2_i64);
+  }
+
+  // 3) Call the kernel via the torch dispatcher (dispatch_quant_mode=2 W8A8).
+  auto result_tuple = xllm::kernel::npu::apply_npu_mega_moe(
+      context,
+      x,
+      topk_ids,
+      topk_weights,
+      torch::TensorList(w1_list),
+      torch::TensorList(w2_list),
+      /*moe_expert_num=*/kNumExperts,
+      /*ep_world_size=*/kRankSize,
+      /*ccl_buffer_size=*/resource->ccl_buffer_size(),
+      torch::TensorList(scale1_list),
+      torch::TensorList(scale2_list),
+      /*bias1=*/{},
+      /*bias2=*/{},
+      /*x_active_mask=*/{},
+      /*max_recv_token_num=*/kNumTokens,
+      /*dispatch_quant_mode=*/2,
+      /*combine_quant_mode=*/0,
+      /*comm_alg=*/"",
+      /*num_max_tokens_per_rank=*/8,
+      /*activation=*/"swiglu",
+      /*activation_clamp=*/1.0e30,
+      /*dispatch_quant_out_dtype=*/0,
+      /*topo_type=*/0,
+      /*rank_num_per_server=*/1);
+
+  auto output = std::get<0>(result_tuple);
+  ASSERT_TRUE(output.defined());
+  ASSERT_EQ(output.sizes(), x.sizes());
+
+  // 4) Reference: dequant -> gate_up -> swiglu -> down -> weighted sum.
+  auto expected = torch::zeros({kNumTokens, kHidden}, torch::kFloat32);
+  auto x_cpu = x.cpu().to(torch::kFloat32);
+  auto ids_cpu = topk_ids.cpu();
+  auto weights_cpu = topk_weights.cpu();
+  for (int64_t t = 0; t < kNumTokens; ++t) {
+    for (int64_t k = 0; k < kTopk; ++k) {
+      auto eid = ids_cpu[t][k].item<int32_t>();
+      auto weight = weights_cpu[t][k].item<float>();
+      // Dequant w1/w2 back to fp32 (best case for reference).
+      auto w1_ref =
+          w1_list[eid].cpu().to(torch::kFloat32) *
+          scale1_list[eid].cpu().to(torch::kInt32).view(torch::kFloat32);
+      auto w2_ref =
+          w2_list[eid].cpu().to(torch::kFloat32) *
+          scale2_list[eid].cpu().to(torch::kInt32).view(torch::kFloat32);
+      auto gate_up = x_cpu[t].matmul(w1_ref);
+      auto half = kIntermediate;
+      auto gate = gate_up.slice(0, 0, half);
+      auto up = gate_up.slice(0, half, 2 * half);
+      auto silu = gate * torch::sigmoid(gate);
+      auto inter = silu * up;
+      auto out = inter.matmul(w2_ref);
+      expected[t] += weight * out;
+    }
+  }
+
+  auto output_cpu = output.cpu().to(torch::kFloat32);
+  EXPECT_TRUE(
+      torch::allclose(output_cpu, expected, /*rtol=*/1e-2, /*atol=*/1e-2))
+      << "max abs diff = "
+      << (output_cpu - expected).abs().max().to(torch::kFloat32).item<double>()
+      << ", output[0] = " << output_cpu[0].slice(0, 0, 4)
+      << ", expected[0] = " << expected[0].slice(0, 0, 4);
+
+  // Cleanup comm.
+  if (hccl_comm != nullptr) {
+    HcclCommDestroy(hccl_comm);
+  }
 }
 
 }  // namespace

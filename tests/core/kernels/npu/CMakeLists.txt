@@ -11,6 +11,7 @@ cc_test(
     torch_npu
     kernels
     npu_kernels
+    parallel_state
     unified_dlog
     GTest::gtest_main
     glog::glog
