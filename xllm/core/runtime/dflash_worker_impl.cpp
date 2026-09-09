@@ -53,6 +53,34 @@ namespace {
 // Broadcasting the sampled draft/accepted tokens to the group's rank 0 keeps
 // every rank's cached draft probs and accepted prefixes identical. No-op for a
 // single rank (world_size <= 1).
+
+// Draft KV geometry for block-diffusion drafts (DSV4 DSpark, from main's
+// build_speculative_draft_kv_cache_shape): reuse the grouped target pool
+// layout when present (the DSV4 draft shares the target's SWA/compressed
+// cache managers), otherwise rebuild from the draft's own ModelArgs so the
+// draft never inherits the target's MLA-shaped slot geometry.
+KVCacheShape dflash_draft_kv_cache_shape(
+    const KVCacheShape& target_kv_cache_shape,
+    const ModelArgs& draft_model_args,
+    int64_t block_size,
+    const ParallelArgs& draft_parallel_args) {
+  CHECK(!target_kv_cache_shape.key_cache_shape().empty())
+      << "target KV cache shape must contain key cache shape";
+  if (target_kv_cache_shape.has_grouped_cache_layout()) {
+    return target_kv_cache_shape;
+  }
+  const int64_t dp_size =
+      std::max<int64_t>(draft_parallel_args.dp_size(), 1);
+  const int64_t cp_size =
+      std::max<int64_t>(draft_parallel_args.cp_size(), 1);
+  const int64_t draft_world_size = std::max<int64_t>(
+      draft_parallel_args.world_size() / dp_size / cp_size, 1);
+  KVCacheCapacity draft_capacity;
+  draft_capacity.n_blocks(target_kv_cache_shape.key_cache_shape()[0])
+      .block_size(block_size);
+  return KVCacheShape(draft_capacity, draft_model_args, draft_world_size);
+}
+
 ProcessGroup* spec_broadcast_group(const ParallelArgs& parallel_args) {
   return parallel_args.tp_group_ != nullptr ? parallel_args.tp_group_
                                             : parallel_args.process_group_;
@@ -465,7 +493,11 @@ bool DFlashWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   bool draft_allocated = true;
   const WorkerImpl::Status draft_status = draft_impl_->get_status();
   if (draft_status == WorkerImpl::Status::LOADED) {
-    draft_allocated = draft_impl_->allocate_kv_cache(kv_cache_shape);
+    draft_allocated = draft_impl_->allocate_kv_cache(
+        dflash_draft_kv_cache_shape(kv_cache_shape,
+                                    draft_impl_->context_.get_model_args(),
+                                    options_.block_size(),
+                                    draft_impl_->context_.get_parallel_args()));
   } else {
     CHECK_EQ(draft_status, WorkerImpl::Status::READY);
   }
@@ -524,7 +556,11 @@ bool DFlashWorkerImpl::allocate_kv_cache_with_transfer(
   const WorkerImpl::Status draft_status = draft_impl_->get_status();
   if (draft_status == WorkerImpl::Status::LOADED) {
     draft_allocated = draft_impl_->allocate_kv_cache_with_transfer(
-        kv_cache_transfer_, kv_cache_shape);
+        kv_cache_transfer_,
+        dflash_draft_kv_cache_shape(kv_cache_shape,
+                                    draft_impl_->context_.get_model_args(),
+                                    options_.block_size(),
+                                    draft_impl_->context_.get_parallel_args()));
   } else {
     CHECK_EQ(draft_status, WorkerImpl::Status::READY);
   }
