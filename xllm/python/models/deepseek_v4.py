@@ -37,8 +37,6 @@ from dataclasses import dataclass, field, replace
 import threading
 from typing import Any
 
-import os
-
 import torch
 import torch.nn as nn
 
@@ -617,6 +615,8 @@ class DeepseekV4Attention(Attention):
         hidden: torch.Tensor,
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden.shape[0]
         backend = get_forward_context().attention_backend
@@ -641,10 +641,11 @@ class DeepseekV4Attention(Attention):
         )
         q = _k.rms_norm(q, self.q_rms_gamma, self.cfg.rms_norm_eps)
 
-        cos_sin = cos_sin_cache.index_select(0, positions.long())
-        half = cos_sin.size(-1) // 2
-        cos = cos_sin[..., :half].repeat_interleave(2, dim=-1).contiguous()
-        sin = cos_sin[..., half:].repeat_interleave(2, dim=-1).contiguous()
+        if cos is None or sin is None:
+            cos_sin = cos_sin_cache.index_select(0, positions.long())
+            half = cos_sin.size(-1) // 2
+            cos = cos_sin[..., :half].repeat_interleave(2, dim=-1).contiguous()
+            sin = cos_sin[..., half:].repeat_interleave(2, dim=-1).contiguous()
         _k.npu_inplace_partial_rotary_mul(
             q, cos, sin, self.nope_head_dim, self.rope_head_dim
         )
@@ -1500,10 +1501,7 @@ class DeepseekV4MoE(nn.Module):
         if ep_size > 1:
             if self.moe_tp_size > 1:
                 distributed.moe_tp_all_reduce(routed_out)
-            # DIAGNOSTIC: skip EP allreduce entirely (wrong output, but
-            # isolates HCCL as the crash variable). Set DSA_SKIP_EP_REDUCE=1.
-            if os.environ.get("DSA_SKIP_EP_REDUCE", "0") != "1":
-                distributed.moe_ep_all_reduce(routed_out)
+            distributed.moe_ep_all_reduce(routed_out)
             if self.moe_tp_size > 1:
                 distributed.moe_tp_all_reduce(shared_out)
             return routed_out + shared_out
@@ -1561,6 +1559,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Match DeepseekV4DecoderLayerImpl::forward exactly: HyperConnection
         # selects the 2D sub-input first, then RMSNorm is applied to that input.
@@ -1585,7 +1585,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             "input_layernorm_out", {"attn_input": attn_input}, layer=self.layer_id,
             kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",
         )
-        attn_output = self.self_attn(attn_input, positions, cos_sin_cache)
+        attn_output = self.self_attn(attn_input, positions, cos_sin_cache, cos=cos, sin=sin)
         dsa_dump.snap(
             "attn_output", {"attn_output": attn_output}, layer=self.layer_id,
             kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",
@@ -1768,6 +1768,24 @@ class DeepseekV4Model(nn.Module):
         # HyperConnection decoder layers (C++ flat_hc does this reshape).
         hidden = hidden.unsqueeze(1).expand(-1, self.cfg.hc_mult, -1).contiguous()
         residual: torch.Tensor | None = None
+        # Gathered + split cos/sin depend only on (rope table, positions); every
+        # layer in a ratio group shares the same table and the same positions, so
+        # precompute once per distinct table instead of per layer (removes
+        # n_layers index_select + split + repeat_interleave + contiguous passes).
+        rope_cos_sin: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        def _rope_cos_sin(table: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            entry = rope_cos_sin.get(id(table))
+            if entry is None:
+                cs = table.index_select(0, positions)
+                half = cs.size(-1) // 2
+                entry = (
+                    cs[..., :half].repeat_interleave(2, dim=-1).contiguous(),
+                    cs[..., half:].repeat_interleave(2, dim=-1).contiguous(),
+                )
+                rope_cos_sin[id(table)] = entry
+            return entry
+
         for layer_id, layer in enumerate(self.layers):
             compress_ratio = (
                 self.cfg.compress_ratios[layer_id]
@@ -1783,12 +1801,15 @@ class DeepseekV4Model(nn.Module):
             select_layer_rope = getattr(backend, "select_dsa_layer_rope", None)
             if select_layer_rope is not None:
                 select_layer_rope(layer_id, layer_cos_sin_cache, metadata)
+            layer_cos, layer_sin = _rope_cos_sin(layer_cos_sin_cache)
             hidden, residual = layer(
                 hidden,
                 residual,
                 positions,
                 layer_cos_sin_cache,
                 input_ids,
+                cos=layer_cos,
+                sin=layer_sin,
             )
             dsa_dump.snap(
                 "layer_output",
