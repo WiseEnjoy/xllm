@@ -247,7 +247,9 @@ class DsaAttentionBackend(AttentionBackend):
                     _seen_bts.add(bt_id)
                     bt[bt < 0] = 0
         self._move_metadata_to_device(dsa_metadata, persistent=True)
-        self._build_precomputed_metadata(dsa_metadata, metadata, persistent=True)
+        # AICPU tiling metadata is built IN the captured graph (see
+        # prepare_dsa_metadata_for_forward), not off-graph here, so the
+        # kernels' launch + persist copy move into the replay.
         self._graph_dsa = dsa_metadata
         metadata.dsa_metadata = dsa_metadata
         # Open a dump tick per refresh step: the captured forward's layer-level
@@ -349,6 +351,11 @@ class DsaAttentionBackend(AttentionBackend):
         # address-stable tensors; the eager path below stays untouched.
         if self._graph_mode and self._graph_dsa is not None:
             metadata.dsa_metadata = self._graph_dsa
+            # Build the AICPU tiling metadata (c1/c4/c128/qli) inside the
+            # captured graph, reading the packed persistent views. Matches C++
+            # build_precomputed_metadata in-graph; removes the per-step
+            # off-graph launch + persist copy from the refresh.
+            self._build_precomputed_metadata(self._graph_dsa, metadata, persistent=True)
             return
         multi_block_tables = list(metadata.multi_block_tables)
         kv_seq_lens_host = metadata.kv_seq_lens_host
@@ -1297,11 +1304,20 @@ class DsaAttentionBackend(AttentionBackend):
             buf.copy_(tensor)
         return buf
 
-    def _move_metadata_to_device(
-        self, dsa: DsaMetadata, persistent: bool = False
-    ) -> None:
-        """Mirror ``deepseek_v4_move_dsa_metadata_to_device`` for eager mode."""
-        tensor_fields = (
+    def _pack_metadata_to_device(self, dsa: DsaMetadata) -> None:
+        """Pack CPU metadata into one pinned H2D + view-bind (C++ deepseek_v4.h).
+
+        Replaces the per-field ``tensor.to(device)`` (one H2D + one persist
+        copy_ per field) with a single byte-packed copy, mirroring
+        ``deepseek_v4_pack_dsa_metadata_to_device``: collect CPU tensors
+        (content-dedup), 64B-align them into a pinned host byte buffer, one
+        async H2D into a persistent device byte buffer, then bind typed views
+        into that buffer at each tensor's offset. ``view(dtype)`` reinterpret
+        on the NPU device buffer shares storage, so the captured graph reads
+        stable addresses refreshed by a single copy_ per step.
+        """
+        device = self.device
+        scalar_names = (
             "seq_lens",
             "seq_lens_q",
             "actual_seq_lengths_query",
@@ -1315,57 +1331,118 @@ class DsaAttentionBackend(AttentionBackend):
             "start_pos",
             "hadamard",
         )
-        for name in tensor_fields:
-            tensor = getattr(dsa, name, None)
+        specs: list[dict] = []
+        seen: dict[tuple, int] = {}
+
+        def add(tensor: torch.Tensor, setter) -> None:
             if tensor is None:
-                continue
-            if persistent:
-                setattr(
-                    dsa, name,
-                    self._persist_tensor(("dsa_dev", name), tensor.to(self.device)),
-                )
+                return
+            if tensor.device.type != "cpu":
+                # Already on device: leave the address stable.
+                return
+            if tensor.numel() == 0:
+                # Empty tensors (unused manager slots) move to device like the
+                # original path but carry no bytes to pack.
+                setter(tensor.to(device))
+                return
+            t = tensor.contiguous()
+            nbytes = t.numel() * t.element_size()
+            key = (t.data_ptr(), nbytes, t.dtype, tuple(t.shape))
+            idx = seen.get(key)
+            if idx is not None:
+                specs[idx]["targets"].append(setter)
             else:
-                setattr(dsa, name, tensor.to(self.device))
+                seen[key] = len(specs)
+                specs.append({
+                    "cpu": t, "nbytes": nbytes, "dtype": t.dtype,
+                    "sizes": list(t.shape), "targets": [setter],
+                })
+
+        for name in scalar_names:
+            add(getattr(dsa, name, None), lambda v, n=name: setattr(dsa, n, v))
+        # block_tables / slot_mappings: the builder shares one CPU tensor per
+        # manager across every layer referencing it; data_ptr dedup collapses
+        # them so all layers rebind the same packed view.
+        for layer_tensors in dsa.block_tables:
+            for index, tensor in enumerate(layer_tensors):
+                add(tensor, lambda v, lt=layer_tensors, i=index: lt.__setitem__(i, v))
+        for layer_tensors in dsa.slot_mappings:
+            for index, tensor in enumerate(layer_tensors):
+                add(tensor, lambda v, lt=layer_tensors, i=index: lt.__setitem__(i, v))
+
+        if not specs:
+            return
+
+        # 64-byte-aligned layout (view(dtype) requires offset alignment).
+        alignment = 64
+        total_bytes = 0
+        for spec in specs:
+            total_bytes = (total_bytes + alignment - 1) // alignment * alignment
+            spec["offset"] = total_bytes
+            total_bytes += spec["nbytes"]
+
+        # Pinned host staging (allocated once, reused across steps).
+        host = getattr(self, "_packed_host", None)
+        if host is None or host.numel() < total_bytes:
+            host = torch.empty(total_bytes, dtype=torch.uint8).pin_memory()
+            self._packed_host = host
+        host_view = host.narrow(0, 0, total_bytes)
+        for spec in specs:
+            host_view.narrow(0, spec["offset"], spec["nbytes"]).copy_(
+                spec["cpu"].reshape(-1).view(torch.uint8)
+            )
+
+        # Single async H2D into the persistent device byte buffer.
+        state = get_forward_context().execution_state
+        dev_buf = get_execution_buffer(
+            ("dsa_packed",),
+            lambda: torch.empty(total_bytes, dtype=torch.uint8, device=device),
+        )
+        if dev_buf.numel() < total_bytes:
+            dev_buf = torch.empty(total_bytes, dtype=torch.uint8, device=device)
+            if state is not None:
+                state.persistent_buffers[("dsa_packed",)] = dev_buf
+        dev_buf.narrow(0, 0, total_bytes).copy_(host_view, non_blocking=True)
+
+        # Bind typed views into the device buffer.
+        for spec in specs:
+            view = (
+                dev_buf.narrow(0, spec["offset"], spec["nbytes"])
+                .view(spec["dtype"])
+                .reshape(spec["sizes"])
+            )
+            for setter in spec["targets"]:
+                setter(view)
+
+    def _move_metadata_to_device(
+        self, dsa: DsaMetadata, persistent: bool = False
+    ) -> None:
+        """Mirror ``deepseek_v4_move_dsa_metadata_to_device`` for eager mode."""
         if persistent:
-            # Manager-level dedup: builder output shares one tensor per
-            # manager across every layer that references the group, so all
-            # layers must share ONE persist buffer (258 per-layer copies
-            # dominated the per-step refresh otherwise).
-            mgr_cache: dict[tuple[str, int], torch.Tensor] = {}
-            for lid, layer_tensors in enumerate(dsa.block_tables):
-                for index, tensor in enumerate(layer_tensors):
-                    if tensor is None:
-                        continue
-                    gid = (
-                        self.caches_info[lid][index].group_id
-                        if lid < len(self.caches_info)
-                        and index < len(self.caches_info[lid])
-                        else -1
-                    )
-                    key = ("dsa_bt_mgr", gid)
-                    if key not in mgr_cache:
-                        mgr_cache[key] = self._persist_tensor(
-                            key, tensor.to(self.device)
-                        )
-                    layer_tensors[index] = mgr_cache[key]
-            mgr_cache = {}
-            for lid, layer_tensors in enumerate(dsa.slot_mappings):
-                for index, tensor in enumerate(layer_tensors):
-                    if tensor is None:
-                        continue
-                    gid = (
-                        self.caches_info[lid][index].group_id
-                        if lid < len(self.caches_info)
-                        and index < len(self.caches_info[lid])
-                        else -1
-                    )
-                    key = ("dsa_slot_mgr", gid)
-                    if key not in mgr_cache:
-                        mgr_cache[key] = self._persist_tensor(
-                            key, tensor.to(self.device)
-                        )
-                    layer_tensors[index] = mgr_cache[key]
+            # Packed single-copy path: scalar fields + manager block tables +
+            # slot mappings all ride one pinned H2D and rebind as views into
+            # the persistent device byte buffer (see _pack_metadata_to_device).
+            self._pack_metadata_to_device(dsa)
         else:
+            tensor_fields = (
+                "seq_lens",
+                "seq_lens_q",
+                "actual_seq_lengths_query",
+                "actual_seq_lengths_kv",
+                "kv_cu_seq_lens",
+                "max_seqlen_q",
+                "max_seqlen_kv",
+                "input_positions",
+                "c4_pad_positions",
+                "c128_pad_positions",
+                "start_pos",
+                "hadamard",
+            )
+            for name in tensor_fields:
+                tensor = getattr(dsa, name, None)
+                if tensor is None:
+                    continue
+                setattr(dsa, name, tensor.to(self.device))
             # Keep CPU originals of the manager block tables so the eager
             # decode window gather reads them without per-layer D2H syncs
             # (the builder dedups per manager; ~6 unique tensors).
