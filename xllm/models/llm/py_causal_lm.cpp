@@ -236,10 +236,22 @@ py::dict PyCausalLM::build_config_dict(
   // cp_size is a reflected ParallelArgs PROPERTY (already in d), but cp_rank is
   // a derived member function, so pass it explicitly for the Python executor.
   d["cp_rank"] = cp_rank_;
-  d["enable_graph"] = ExecutionConfig::get_instance().enable_graph();
+  // Aux-hidden capture (DSpark/DFlash/Eagle3 Python targets) reads per-layer
+  // residual streams that the captured decode graph cannot refresh, so force
+  // the Python executor to eager while capture is enabled. Non-spec runs keep
+  // the graph path untouched.
+  const bool requires_eager_execution =
+      !model_args_.layers_to_capture().empty() ||
+      model_args_.model_type() == "DFlashDraftModel" ||
+      model_args_.model_type() == "DSparkDraftModel";
+  d["enable_graph"] = requires_eager_execution
+                          ? false
+                          : ExecutionConfig::get_instance().enable_graph();
   d["enable_mega_moe"] = ::xllm::KernelConfig::get_instance().enable_mega_moe();
   d["python_graph_backend"] =
-      ExecutionConfig::get_instance().python_graph_backend();
+      requires_eager_execution
+          ? std::string("off")
+          : ExecutionConfig::get_instance().python_graph_backend();
   return d;
 }
 

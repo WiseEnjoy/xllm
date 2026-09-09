@@ -140,6 +140,10 @@ class DeepseekV4Config:
     n_group: int = 0
     topk_group: int = 0
     tie_word_embeddings: bool = False
+    # Spec-draft aux-hidden capture (DSpark/DFlash/Eagle3): outputs of the
+    # listed layer ids (1-indexed, matching C++ AuxHiddenCapture) are packed
+    # into a [tokens, hidden * len] tensor the draft consumes as context.
+    layers_to_capture: tuple[int, ...] = ()
     tp_size: int = 1
     tp_rank: int = 0
     moe_tp_size: int = 1
@@ -257,6 +261,9 @@ class DeepseekV4Config:
             ep_rank=int(d.get("ep_rank", d.get("tp_rank", 0))),
             cp_size=int(d.get("cp_size", 1)),
             cp_rank=int(d.get("cp_rank", 0)),
+            layers_to_capture=tuple(
+                int(x) for x in (d.get("layers_to_capture") or [])
+            ),
         )
 
     def head_split(self) -> tuple[int, int]:
@@ -1705,6 +1712,16 @@ class DeepseekV4Model(nn.Module):
             dtype=dtype,
             device=device,
         )
+        # Spec-draft aux-hidden capture (mirrors C++ AuxHiddenCapture): slot
+        # order follows the config list; layer i's output is captured under the
+        # 1-indexed id i+1, so layers_to_capture=[40,41,42] grabs the outputs
+        # of 0-based layers 39..41.
+        self._aux_capture_slots = {
+            layer_id: slot
+            for slot, layer_id in enumerate(cfg.layers_to_capture)
+        }
+        self._aux_capture_enabled = bool(cfg.layers_to_capture)
+
     def attach_rope_tables_to_backend(
         self,
         backend,
@@ -1768,6 +1785,17 @@ class DeepseekV4Model(nn.Module):
         # HyperConnection decoder layers (C++ flat_hc does this reshape).
         hidden = hidden.unsqueeze(1).expand(-1, self.cfg.hc_mult, -1).contiguous()
         residual: torch.Tensor | None = None
+        # Aux capture buffer: [num_tokens, hidden * num_captured], filled from
+        # each captured layer's mean-over-hc-streams output (C++ captures
+        # h.mean(dim=1) for the 3-D hyper-connection residual stream).
+        aux_buffer = (
+            hidden.new_empty(
+                (hidden.shape[0],
+                 self.cfg.hidden_size * len(self._aux_capture_slots))
+            )
+            if self._aux_capture_enabled
+            else None
+        )
         # Gathered + split cos/sin depend only on (rope table, positions); every
         # layer in a ratio group shares the same table and the same positions, so
         # precompute once per distinct table instead of per layer (removes
@@ -1811,6 +1839,19 @@ class DeepseekV4Model(nn.Module):
                 cos=layer_cos,
                 sin=layer_sin,
             )
+            if aux_buffer is not None:
+                slot = self._aux_capture_slots.get(layer_id + 1)
+                if slot is not None:
+                    captured = (
+                        hidden.mean(dim=1)
+                        if hidden.dim() == 3
+                        else hidden
+                    )
+                    aux_buffer[
+                        :,
+                        slot * self.cfg.hidden_size:
+                        (slot + 1) * self.cfg.hidden_size,
+                    ].copy_(captured)
             dsa_dump.snap(
                 "layer_output",
                 {"hidden": hidden, "residual": residual},
@@ -1824,6 +1865,10 @@ class DeepseekV4Model(nn.Module):
         hidden = self.norm(merged, None)
         dsa_dump.snap("final_hidden", {"hidden": hidden}, kind="dense")
         dsa_dump.end_fwd()
+        if aux_buffer is not None:
+            # Spec-draft capture path: PyExecutorImpl unpacks the tuple into
+            # ModelOutput(hidden, _, aux_hidden_states).
+            return hidden, aux_buffer
         return hidden
 
 
