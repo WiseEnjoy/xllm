@@ -42,7 +42,6 @@ cc_library(
     eagle3_worker_impl.h
     dflash_worker_impl.h
     dspark_worker_impl.h
-    spec_input_builder.h
     forward_shared_memory_manager.h
     worker_rendezvous.h
   SRCS
@@ -80,7 +79,6 @@ cc_library(
     eagle3_worker_impl.cpp
     dflash_worker_impl.cpp
     dspark_worker_impl.cpp
-    spec_input_builder.cpp
     forward_shared_memory_manager.cpp
   DEPS
     torch

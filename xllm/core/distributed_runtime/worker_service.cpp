@@ -25,6 +25,7 @@ limitations under the License.
 #include <vector>
 
 #include "common/device_monitor.h"
+#include "core/framework/config/speculative_config.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
 #include "common/types.h"

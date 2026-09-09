@@ -49,7 +49,7 @@ limitations under the License.
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/runtime/mtp_async_input_builder.h"
 #include "core/runtime/mtp_async_state.h"
-#include "spec_input_builder.h"
+#include "core/framework/speculative/spec_input_builder.h"
 #include "util/pretty_print.h"
 #include "util/slice.h"
 #include "util/timer.h"
