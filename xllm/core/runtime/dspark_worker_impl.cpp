@@ -63,8 +63,7 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft(
 
   ForwardInput processed_input;
   LOG(INFO) << "[DSPARK-DBG] dspark draft forward begin (prepare)";
-  draft_impl_->prepare_work_before_execute(
-      logits_input, processed_input);
+  draft_impl_->prepare_work_before_execute(logits_input, processed_input);
   // Python PyExecutorImpl manages its own stream; execute_no_sync_on_stream
   // conflicts with the Python default stream and triggers HcclAllGather
   // errors. Use the synchronous step path for the Python draft model.
@@ -111,8 +110,7 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft(
     torch::Tensor anchor_cpu = anchor_token_ids.to(torch::kCPU);
     std::stringstream ss;
     ss << "[DSPARK-DBG] step=" << dbg_step_count
-       << " anchor=" << anchor_cpu[0].item<int64_t>()
-       << " draft=[";
+       << " anchor=" << anchor_cpu[0].item<int64_t>() << " draft=[";
     for (int64_t j = 0; j < draft_cpu.size(1) && j < 5; ++j) {
       ss << draft_cpu[0][j].item<int64_t>() << " ";
     }
