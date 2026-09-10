@@ -29,6 +29,15 @@ auto get_valid_tensor = [](const c10::optional<at::Tensor>& tensor_opt,
              : torch::empty({0}, torch::dtype(torch::kInt32).device(device));
 };
 
+bool quant_lightning_indexer_v1_metadata_available() {
+  static const bool available =
+      aclnn::detail::get_op_api_func_addr(
+          "aclnnQuantLightningIndexerMetadataGetWorkspaceSize") != nullptr &&
+      aclnn::detail::get_op_api_func_addr(
+          "aclnnQuantLightningIndexerMetadata") != nullptr;
+  return available;
+}
+
 }  // namespace
 
 at::Tensor quant_lightning_indexer_metadata(
@@ -55,6 +64,57 @@ at::Tensor quant_lightning_indexer_metadata(
     output_device = actual_seq_lengths_query.value().device();
   } else if (actual_seq_lengths_key.has_value()) {
     output_device = actual_seq_lengths_key.value().device();
+  }
+
+  // Ascend 950 does not ship aclnnQuantLightningIndexerMetadata (V1); the
+  // DSpark draft's C++ DSAttention still calls this entry. Fall back to the
+  // V2 metadata operator, converting per-seq lengths to the V2 contract:
+  //   cu_seqlens_q = [0, cumsum(query_lens)]               (int32 [B+1])
+  //   seqused_k    = key_lens / cmp_ratio                  (int32 [B])
+  //   cmp_residual_k = key_lens % cmp_ratio                (int32 [B])
+  //   quant_mode   = 2 (both sides quantized)
+  //   mask_mode    = sparse_mode (3 = rightDownCausal)
+  //   layout_k     = PA_BBND (V2 rejects PA_BSND)
+  if (!quant_lightning_indexer_v1_metadata_available()) {
+    at::Tensor query_lens =
+        get_valid_tensor(actual_seq_lengths_query, output_device)
+            .value()
+            .to(torch::kInt32);
+    at::Tensor key_lens =
+        get_valid_tensor(actual_seq_lengths_key, output_device)
+            .value()
+            .to(torch::kInt32);
+    const int64_t num_seqs = std::max<int64_t>(query_lens.size(0), 1);
+
+    at::Tensor cu_seqlens_q =
+        torch::zeros({num_seqs + 1},
+                     torch::dtype(torch::kInt32).device(output_device));
+    if (query_lens.size(0) > 0) {
+      cu_seqlens_q.slice(0, 1).copy_(
+          torch::cumsum(query_lens, 0).to(torch::kInt32));
+    }
+    at::Tensor seqused_k = (key_lens / cmp_ratio).to(torch::kInt32);
+    at::Tensor cmp_residual_k = (key_lens % cmp_ratio).to(torch::kInt32);
+
+    return quant_lightning_indexer_v2_metadata(
+        cu_seqlens_q,
+        std::nullopt,        // cu_seqlens_k
+        std::nullopt,        // seqused_q
+        seqused_k,           // seqused_k (committed compressed count)
+        cmp_residual_k,      // cmp_residual_k
+        num_heads_q,
+        num_heads_k,
+        head_dim,
+        sparse_count,        // topk
+        /*quant_mode=*/2,
+        num_seqs,
+        max_seqlen_q,
+        max_seqlen_k,
+        "TND",
+        "PA_BBND",
+        sparse_mode,         // mask_mode
+        cmp_ratio,
+        output_device.str());
   }
 
   at::Tensor output =
