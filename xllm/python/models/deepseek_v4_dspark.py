@@ -196,6 +196,10 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
                 dim = (shard_dims or {}).get(suffix)
                 if dim is not None:
                     t = loader.shard(t, dim=dim)
+                import sys
+                p = self.get_parameter(f"{param_prefix}.{suffix}") if f"{param_prefix}.{suffix}" in dict(self.named_parameters()) else self.get_buffer(f"{param_prefix}.{suffix}")
+                if t.shape != p.shape:
+                    print(f"[DSPARK-LOAD] MISMATCH {ckpt_key}: ckpt {list(t.shape)} vs param {list(p.shape)}", file=sys.stderr, flush=True)
                 loader.copy_in(f"{param_prefix}.{suffix}", t)
 
         # Draft layers from mtp.<i>.*
@@ -208,8 +212,15 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
             _w8a8(ck + "attn.wq_b", pm + "self_attn.q_b_proj",
                   {"weight": 0, "weight_scale": 0, "weight_offset": 0})
             _w8a8(ck + "attn.wkv", pm + "self_attn.kv_proj")
-            _w8a8(ck + "attn.wo_a", pm + "self_attn.o_a_proj")
-            _w8a8(ck + "attn.wo_b", pm + "self_attn.o_b_proj")
+            # o_a/o_b are bf16 (unquantized) column/row-parallel weights.
+            if _has(ck + "attn.wo_a.weight"):
+                loader.copy_in(
+                    pm + "self_attn.o_a_proj.weight",
+                    loader.shard(loader.load_tensor(ck + "attn.wo_a.weight"), dim=0))
+            if _has(ck + "attn.wo_b.weight"):
+                loader.copy_in(
+                    pm + "self_attn.o_b_proj.weight",
+                    loader.shard(loader.load_tensor(ck + "attn.wo_b.weight"), dim=1))
             _cp(ck + "attn.q_norm.weight", pm + "self_attn.q_a_layernorm.weight")
             _cp(ck + "attn.q_norm_gamma.weight", pm + "self_attn.q_rms_gamma.weight")
             _cp(ck + "attn.kv_norm.weight", pm + "self_attn.kv_a_layernorm.weight")
