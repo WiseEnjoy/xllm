@@ -18,7 +18,6 @@ limitations under the License.
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
 #include "executor_impl_factory.h"
-#include "models/llm/py_causal_lm.h"
 #include "platform/device.h"
 #include "platform/platform.h"
 
@@ -30,15 +29,7 @@ Executor::Executor(CausalLM* model,
                    const runtime::Options& options) {
   const auto& model_config = ModelConfig::get_instance();
   std::string backend;
-  if (ModelConfig::is_python_model_impl(model_config.model_impl()) &&
-      dynamic_cast<PyCausalLM*>(model) == nullptr) {
-    // A C++ model (DSpark/DFlash draft body) created under
-    // --model_impl=python cannot run on the Python executor; route it to the
-    // native graph backend instead.
-    backend = (options.backend() != "vlm" && options.enable_graph())
-                  ? Platform::type_str()
-                  : options.backend();
-  } else if (ModelConfig::is_python_model_impl(model_config.model_impl())) {
+  if (ModelConfig::is_python_model_impl(model_config.model_impl())) {
     backend = "python";
   } else if (options.backend() != "vlm" && options.enable_graph()) {
     backend = Platform::type_str();
