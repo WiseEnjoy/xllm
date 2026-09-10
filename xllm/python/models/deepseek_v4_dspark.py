@@ -222,14 +222,8 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
             _cp(ck + "hc_ffn_fn", pm + "hc.hc_ffn_fn")
             _cp(ck + "hc_ffn_base", pm + "hc.hc_ffn_base")
             _cp(ck + "hc_ffn_scale", pm + "hc.hc_ffn_scale")
-            mlp = layer.mlp
-            _cp(ck + "ffn.gate.weight", pm + "mlp.gate.weight")
-            _cp(ck + "ffn.gate.bias", pm + "mlp.gate.bias")
-            _w8a8(ck + "ffn.shared_experts.w1", pm + "mlp.shared_experts.w1")
-            _w8a8(ck + "ffn.shared_experts.w2", pm + "mlp.shared_experts.w2")
-            _w8a8(ck + "ffn.shared_experts.w3", pm + "mlp.shared_experts.w3")
-            _w8a8(ck + "ffn.experts_w13", pm + "mlp.experts_w13")
-            _w8a8(ck + "ffn.experts_w2", pm + "mlp.experts_w2")
+            # MoE: reuse the main model's per-expert loading (w1+w3→w13, EP shard).
+            self._load_dspark_moe(loader, ck, pm, layer)
 
         # main_proj / main_norm from mtp.0
         _cp("mtp.0.main_proj.weight", "model.main_proj.weight")
@@ -256,6 +250,75 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
             _cp(f"mtp.{last}.head.weight", "lm_head.weight")
         else:
             _cp("head.weight", "lm_head.weight")
+
+    def _load_dspark_moe(self, loader, ck: str, pm: str, layer) -> None:
+        """Load the draft layer's MoE (per-expert w1+w3->w13, EP sharding)."""
+        def _has(name: str) -> bool:
+            return loader.find(name) is not None
+
+        mlp = layer.mlp
+        if _has(ck + "ffn.gate.weight"):
+            loader.copy_in(pm + "mlp.gate.weight",
+                          loader.load_tensor(ck + "ffn.gate.weight"))
+        if getattr(mlp, "hash_layer", False):
+            tid2eid_key = ck + "ffn.gate.tid2eid"
+            if not _has(tid2eid_key):
+                tid2eid_key += ".weight"
+            if _has(tid2eid_key):
+                loader.copy_in(pm + "mlp.tid2eid", loader.load_tensor(tid2eid_key))
+        else:
+            bias_key = ck + "ffn.gate.bias"
+            if not _has(bias_key):
+                bias_key = ck + "ffn.gate.e_score_correction_bias"
+            if _has(bias_key):
+                loader.copy_in(pm + "mlp.e_score_correction_bias",
+                              loader.load_tensor(bias_key))
+        tp = mlp.moe_tp_size
+        tp_rank = mlp.moe_tp_rank
+        start = mlp.start_expert_id
+        nepr = mlp.num_experts_per_rank
+        w13 = self.get_parameter(pm + "mlp.experts_w13")
+        w2 = self.get_parameter(pm + "mlp.experts_w2")
+        w13_scale = self.get_buffer(pm + "mlp.experts_w13_scale")
+        w2_scale = self.get_buffer(pm + "mlp.experts_w2_scale")
+        for local_idx in range(nepr):
+            global_id = start + local_idx
+            e = ck + f"ffn.experts.{global_id}."
+            w1 = loader.load_tensor(e + "w1.weight")
+            w3 = loader.load_tensor(e + "w3.weight")
+            w13_j = torch.cat([w1, w3], dim=0)
+            w2_j = loader.load_tensor(e + "w2.weight")
+            if tp > 1:
+                w13_j = loader.shard(w13_j, dim=0, world=tp, rank=tp_rank)
+                w2_j = loader.shard(w2_j, dim=1, world=tp, rank=tp_rank)
+            w13[local_idx].copy_(w13_j.to(w13.dtype))
+            w2[local_idx].copy_(w2_j.to(w2.dtype))
+            if _has(e + "w1.weight_scale"):
+                s1 = loader.load_tensor(e + "w1.weight_scale")
+                s3 = (loader.load_tensor(e + "w3.weight_scale")
+                      if _has(e + "w3.weight_scale") else s1)
+                s13 = torch.cat([s1, s3], dim=0)
+                if tp > 1:
+                    s13 = loader.shard(s13, dim=0, world=tp, rank=tp_rank)
+                w13_scale[local_idx].copy_(s13[:w13_j.size(0)])
+            if _has(e + "w2.weight_scale"):
+                w2_scale[local_idx].copy_(loader.load_tensor(e + "w2.weight_scale"))
+        se = ck + "ffn.shared_experts."
+        if _has(se + "w1.weight"):
+            se_w1 = loader.load_tensor(se + "w1.weight")
+            se_w3 = loader.load_tensor(se + "w3.weight")
+            se_w13 = torch.cat([se_w1, se_w3], dim=0)
+            if tp > 1:
+                se_w13 = loader.shard(se_w13, dim=0, world=tp, rank=tp_rank)
+            loader.copy_in(pm + "mlp.shared_experts.gate_up_proj.weight", se_w13)
+            if _has(se + "w1.weight_scale"):
+                s1 = loader.load_tensor(se + "w1.weight_scale")
+                s3 = loader.load_tensor(se + "w3.weight_scale")
+                se_s13 = torch.cat([s1, s3], dim=0)
+                if tp > 1:
+                    se_s13 = loader.shard(se_s13, dim=0, world=tp, rank=tp_rank)
+                loader.copy_in(pm + "mlp.shared_experts.gate_up_proj.weight_scale",
+                               se_s13)
 
     def forward(self, input_ids: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
