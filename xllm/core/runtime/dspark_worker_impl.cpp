@@ -62,12 +62,14 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft(
   logits_input.skip_sampling_for_logits_only = true;
 
   ForwardInput processed_input;
+  LOG(INFO) << "[DSPARK-DBG] dspark draft forward begin (prepare)";
   draft_impl_->prepare_work_before_execute_on_stream(
       logits_input, processed_input, *prepare_stream_);
   std::optional<ForwardOutput> draft_output =
       draft_impl_->execute_no_sync_on_stream(processed_input,
                                              *compute_stream_,
                                              /*record_ready_event=*/false);
+  LOG(INFO) << "[DSPARK-DBG] dspark draft forward launched, logits check";
   CHECK(draft_output.has_value())
       << "DSpark draft forward must return an output.";
   CHECK(draft_output->logits.defined())
@@ -86,6 +88,7 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft(
   torch::Tensor base_logits = draft_output->logits.view(
       {batch_size, num_speculative_tokens, draft_output->logits.size(-1)});
 
+  LOG(INFO) << "[DSPARK-DBG] markov sample_block begin";
   BlockSampleOutput sample_output;
   {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
@@ -99,6 +102,33 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft(
   draft_block.token_ids = std::move(sample_output.token_ids);
   draft_block.probs = std::move(sample_output.probs);
   draft_block.draft_retained_input = std::move(draft_output->retained_input);
+
+  // Debug: log draft tokens vs anchor for first N steps
+  static int32_t dbg_step_count = 0;
+  if (dbg_step_count < 5) {
+    torch::Tensor draft_cpu = draft_block.token_ids.to(torch::kCPU);
+    torch::Tensor anchor_cpu = anchor_token_ids.to(torch::kCPU);
+    std::stringstream ss;
+    ss << "[DSPARK-DBG] step=" << dbg_step_count
+       << " anchor=" << anchor_cpu[0].item<int64_t>()
+       << " draft=[";
+    for (int64_t j = 0; j < draft_cpu.size(1) && j < 5; ++j) {
+      ss << draft_cpu[0][j].item<int64_t>() << " ";
+    }
+    ss << "] logits_row0_sample=[";
+    // Access via base_logits which is already [batch, spec, vocab]
+    auto row = base_logits.select(0, 0).select(0, 0).to(torch::kCPU);
+    if (row.numel() > 100) {
+      ss << row[0].item<float>() << "," << row[1].item<float>() << ","
+         << row[100].item<float>() << "]"
+         << " max=" << row.max().item<float>()
+         << " min=" << row.min().item<float>();
+    } else {
+      ss << " numel=" << row.numel() << "]";
+    }
+    LOG(INFO) << ss.str();
+    ++dbg_step_count;
+  }
 
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());

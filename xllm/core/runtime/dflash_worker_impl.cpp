@@ -557,21 +557,26 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   }
   scale_speculative_parallel_token_counts(query_input.input_params,
                                           draft_width);
+  LOG(INFO) << "[DSPARK-DBG] step_empty warmup: draft forward begin, width="
+            << draft_width << " block_parallel=" << use_block_parallel_rows;
   // Warmup only: prime the draft; its output is unused. Keep it alive until the
   // sync below so the no-sync draft input is not freed while the target forward
   // launched next can reuse the buffer.
   std::optional<ForwardOutput> draft_output = run_llm_no_sync_impl(
       *draft_impl_, query_input, *prepare_stream_, *compute_stream_);
+  LOG(INFO) << "[DSPARK-DBG] step_empty warmup: draft forward launched";
 
   ForwardInput validate_input = input;
   // DSpark's N-wide draft geometry must be rescaled to (N+1) for the target's
   // anchor + drafts forward.
   scale_speculative_parallel_token_counts(
       validate_input.input_params, options_.num_speculative_tokens() + 1);
+  LOG(INFO) << "[DSPARK-DBG] step_empty: target validate begin";
   ForwardOutput output =
       run_llm_no_sync_impl(
           *impl_, validate_input, *prepare_stream_, *compute_stream_)
           .value();
+  LOG(INFO) << "[DSPARK-DBG] step_empty: target validate done";
   // See above: sync the no-sync draft and target forwards before returning.
   compute_stream_->synchronize();
   clear_all_output_embeddings(output);
@@ -615,10 +620,13 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
         << "DFlash prefill hidden/cache slot count mismatch.";
 
     timer.reset();
+    LOG(INFO) << "[DSPARK-DBG] step_prefill: write_context_kv begin, tokens="
+              << embeddings.size(0);
     write_context_kv(processed_target_input,
                      embeddings,
                      processed_target_input.positions,
                      context_cache_slots);
+    LOG(INFO) << "[DSPARK-DBG] step_prefill: write_context_kv done";
     COUNTER_ADD(speculative_execution_latency_seconds_draft,
                 timer.elapsed_seconds());
   }
@@ -711,7 +719,9 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_decode(
       << "DFlash decode target state count mismatch";
 
   update_decode_step_input(input, last_states);
+  LOG(INFO) << "[DSPARK-DBG] step_decode: run_decode_draft begin";
   DraftBlock draft_block = run_decode_draft(input, validate_input);
+  LOG(INFO) << "[DSPARK-DBG] step_decode: run_decode_draft done, validate begin";
   return run_validate(input, draft_block, validate_input);
 }
 
@@ -835,6 +845,21 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   maybe_broadcast_spec_tokens(val_output.next_tokens);
   compute_stream_->synchronize();
   val_output.next_tokens = val_output.next_tokens.to(torch::kCPU);
+
+  // Debug: log validated tokens alongside draft tokens for comparison
+  static int32_t dbg_val_count = 0;
+  if (dbg_val_count < 5 && val_output.next_tokens.defined()
+      && val_output.next_tokens.dim() == 2 && val_output.next_tokens.size(0) > 0) {
+    std::stringstream ss;
+    ss << "[DSPARK-DBG] validate step=" << dbg_val_count << " accepted=[";
+    for (int64_t j = 0; j < val_output.next_tokens.size(1) && j < 7; ++j) {
+      ss << val_output.next_tokens[0][j].item<int64_t>() << " ";
+    }
+    ss << "] width=" << val_output.next_tokens.size(1);
+    LOG(INFO) << ss.str();
+    ++dbg_val_count;
+  }
+
   write_target_context_to_cache(input, val_output);
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
