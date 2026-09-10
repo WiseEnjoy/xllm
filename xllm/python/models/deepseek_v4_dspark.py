@@ -259,15 +259,29 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
 
         # Vocabulary: dedicated mtp.0.embed wins over shared top-level embed.
         if _has("mtp.0.embed.weight"):
-            _cp("mtp.0.embed.weight", "model.embed_tokens.weight")
+            embed_t = loader.load_tensor("mtp.0.embed.weight")
+            if embed_t.size(1) != self.cfg.hidden_size and embed_t.size(0) == self.cfg.hidden_size:
+                embed_t = embed_t.t().contiguous()
+            if embed_t.size(1) == self.cfg.hidden_size and embed_t.size(1) != self.get_parameter("model.embed_tokens.weight").size(1):
+                # checkpoint stores full width; shard dim=1
+                embed_t = loader.shard(embed_t, dim=1)
+            loader.copy_in("model.embed_tokens.weight", embed_t)
         else:
-            _cp("embed.weight", "model.embed_tokens.weight")
+            loader.copy_in(
+                "model.embed_tokens.weight",
+                loader.shard(loader.load_tensor("embed.weight"), dim=1),
+            )
 
         # LM head: dedicated mtp.<last>.head wins over shared top-level head.
+        head_t = None
         if _has(f"mtp.{last}.head.weight"):
-            _cp(f"mtp.{last}.head.weight", "lm_head.weight")
-        else:
-            _cp("head.weight", "lm_head.weight")
+            head_t = loader.load_tensor(f"mtp.{last}.head.weight")
+        elif _has("head.weight"):
+            head_t = loader.load_tensor("head.weight")
+        if head_t is not None:
+            if head_t.size(0) == self.cfg.vocab_size:
+                head_t = loader.shard(head_t, dim=0)
+            loader.copy_in("lm_head.weight", head_t)
 
     def _load_dspark_moe(self, loader, ck: str, pm: str, layer) -> None:
         """Load the draft layer's MoE (per-expert w1+w3->w13, EP sharding)."""
