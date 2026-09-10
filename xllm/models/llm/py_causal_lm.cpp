@@ -66,6 +66,23 @@ void clear_python_object(py::object& object) {
   object = py::object();
 }
 
+py::object optional_tensor(const torch::Tensor& tensor) {
+  return tensor.defined() ? py::cast(tensor) : py::none();
+}
+
+py::list build_python_kv_caches(std::vector<KVCache>& kv_caches) {
+  py::list python_caches;
+  for (KVCache& kv_cache : kv_caches) {
+    python_caches.append(
+        py::make_tuple(optional_tensor(kv_cache.get_k_cache()),
+                       optional_tensor(kv_cache.get_v_cache()),
+                       optional_tensor(kv_cache.get_index_cache()),
+                       optional_tensor(kv_cache.get_conv_cache()),
+                       optional_tensor(kv_cache.get_ssm_cache())));
+  }
+  return python_caches;
+}
+
 }  // namespace
 
 PyCausalLM::PyCausalLM(const ModelContext& context)
@@ -289,6 +306,64 @@ torch::Tensor PyCausalLM::logits(const torch::Tensor& hidden_states,
                             : py::object(py::none());
   py::object out = py_model_.attr("compute_logits")(hidden_states, selected);
   return out.cast<torch::Tensor>();
+}
+
+const py::object& PyCausalLM::get_or_build_python_kv_caches(
+    std::vector<KVCache>& kv_caches) {
+  if (!python_kv_caches_) {
+    python_kv_caches_ = build_python_kv_caches(kv_caches);
+  }
+  return python_kv_caches_;
+}
+
+ModelOutput PyCausalLM::write_context_kv(
+    const torch::Tensor& target_hidden,
+    const torch::Tensor& positions,
+    const torch::Tensor& device_cache_slots,
+    std::vector<KVCache>& kv_caches,
+    const ModelInputParams& input_params) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  py::object layer_synchronizer = py::none();
+#if defined(USE_NPU)
+  if (input_params.parallel.layer_synchronizer != nullptr) {
+    layer_synchronizer = py::cast(input_params.parallel.layer_synchronizer);
+  }
+#endif
+  const py::object& python_kv_caches = get_or_build_python_kv_caches(kv_caches);
+  py::object output = py_model_.attr("write_context_kv")(target_hidden,
+                                                         positions,
+                                                         device_cache_slots,
+                                                         python_kv_caches,
+                                                         layer_synchronizer);
+  if (output.is_none()) {
+    return ModelOutput();
+  }
+  return ModelOutput(output.cast<torch::Tensor>());
+}
+
+torch::Tensor PyCausalLM::dspark_markov_bias(
+    const torch::Tensor& previous_token_ids) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  return py_model_.attr("dspark_markov_bias")(previous_token_ids)
+      .cast<torch::Tensor>();
+}
+
+torch::Tensor PyCausalLM::dspark_confidence_probs(
+    const torch::Tensor& hidden_all,
+    const torch::Tensor& prev_matrix) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  py::object previous = prev_matrix.defined() ? py::cast(prev_matrix)
+                                              : py::object(py::none());
+  return py_model_.attr("dspark_confidence_probs")(hidden_all, previous)
+      .cast<torch::Tensor>();
+}
+
+bool PyCausalLM::has_dspark_confidence_head() const {
+  py::gil_scoped_acquire gil;
+  return py_model_.attr("has_dspark_confidence_head")().cast<bool>();
 }
 
 void PyCausalLM::tp_all_reduce(torch::Tensor& tensor) {

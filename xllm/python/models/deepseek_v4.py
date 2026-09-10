@@ -144,6 +144,9 @@ class DeepseekV4Config:
     # listed layer ids (1-indexed, matching C++ AuxHiddenCapture) are packed
     # into a [tokens, hidden * len] tensor the draft consumes as context.
     layers_to_capture: tuple[int, ...] = ()
+    # DSpark draft config: number of draft stages + Markov head rank.
+    dspark_num_layers: int = 0
+    markov_rank: int = 0
     tp_size: int = 1
     tp_rank: int = 0
     moe_tp_size: int = 1
@@ -264,6 +267,8 @@ class DeepseekV4Config:
             layers_to_capture=tuple(
                 int(x) for x in (d.get("layers_to_capture") or [])
             ),
+            dspark_num_layers=int(d.get("dspark_num_layers", 0)),
+            markov_rank=int(d.get("markov_rank", d.get("dspark_markov_rank", 0))),
         )
 
     def head_split(self) -> tuple[int, int]:
