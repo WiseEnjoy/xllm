@@ -284,6 +284,12 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
                 head_t = loader.shard(head_t, dim=0)
             loader.copy_in("lm_head.weight", head_t)
 
+        # Post-load weight processing (transpose + scale flatten), matching
+        # the main model's process_weights_after_loading call site.
+        for module in self.modules():
+            if hasattr(module, "process_weights_after_loading"):
+                module.process_weights_after_loading()
+
     def _load_dspark_moe(self, loader, ck: str, pm: str, layer) -> None:
         """Load the draft layer's MoE (per-expert w1+w3->w13, EP sharding)."""
         def _has(name: str) -> bool:
