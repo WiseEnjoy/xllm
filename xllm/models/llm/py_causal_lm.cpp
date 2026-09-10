@@ -70,15 +70,30 @@ py::object optional_tensor(const torch::Tensor& tensor) {
   return tensor.defined() ? py::cast(tensor) : py::none();
 }
 
+py::object optional_tensor(const std::optional<torch::Tensor>& tensor) {
+  if (!tensor.has_value() || !tensor->defined()) {
+    return py::none();
+  }
+  return py::cast(*tensor);
+}
+
 py::list build_python_kv_caches(std::vector<KVCache>& kv_caches) {
   py::list python_caches;
   for (KVCache& kv_cache : kv_caches) {
-    python_caches.append(
-        py::make_tuple(optional_tensor(kv_cache.get_k_cache()),
-                       optional_tensor(kv_cache.get_v_cache()),
-                       optional_tensor(kv_cache.get_index_cache()),
-                       optional_tensor(kv_cache.get_conv_cache()),
-                       optional_tensor(kv_cache.get_ssm_cache())));
+    python_caches.append(py::make_tuple(
+        optional_tensor(kv_cache.get_k_cache()),
+        optional_tensor(kv_cache.get_v_cache()),
+        optional_tensor(kv_cache.get_index_cache()),
+        optional_tensor(kv_cache.get_conv_cache()),
+        optional_tensor(kv_cache.get_ssm_cache()),
+        // DSV4 trailing caches (matches PyExecutorImpl::run
+        // kv_caches_py slot order / _LAYER_CACHE_SLOTS)
+        optional_tensor(kv_cache.get_swa_cache()),
+        optional_tensor(kv_cache.get_compress_kv_state()),
+        optional_tensor(kv_cache.get_compress_score_state()),
+        optional_tensor(kv_cache.get_compress_index_kv_state()),
+        optional_tensor(kv_cache.get_compress_index_score_state()),
+        optional_tensor(kv_cache.get_indexer_cache_scale())));
   }
   return python_caches;
 }
@@ -355,8 +370,8 @@ torch::Tensor PyCausalLM::dspark_confidence_probs(
     const torch::Tensor& prev_matrix) {
   torch::NoGradGuard no_grad;
   py::gil_scoped_acquire gil;
-  py::object previous = prev_matrix.defined() ? py::cast(prev_matrix)
-                                              : py::object(py::none());
+  py::object previous =
+      prev_matrix.defined() ? py::cast(prev_matrix) : py::object(py::none());
   return py_model_.attr("dspark_confidence_probs")(hidden_all, previous)
       .cast<torch::Tensor>();
 }

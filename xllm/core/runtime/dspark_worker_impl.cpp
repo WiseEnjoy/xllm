@@ -63,12 +63,13 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft(
 
   ForwardInput processed_input;
   LOG(INFO) << "[DSPARK-DBG] dspark draft forward begin (prepare)";
-  draft_impl_->prepare_work_before_execute_on_stream(
-      logits_input, processed_input, *prepare_stream_);
+  draft_impl_->prepare_work_before_execute(
+      logits_input, processed_input);
+  // Python PyExecutorImpl manages its own stream; execute_no_sync_on_stream
+  // conflicts with the Python default stream and triggers HcclAllGather
+  // errors. Use the synchronous step path for the Python draft model.
   std::optional<ForwardOutput> draft_output =
-      draft_impl_->execute_no_sync_on_stream(processed_input,
-                                             *compute_stream_,
-                                             /*record_ready_event=*/false);
+      draft_impl_->step(processed_input);
   LOG(INFO) << "[DSPARK-DBG] dspark draft forward launched, logits check";
   CHECK(draft_output.has_value())
       << "DSpark draft forward must return an output.";

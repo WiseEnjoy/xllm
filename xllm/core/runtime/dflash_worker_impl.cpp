@@ -846,7 +846,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   compute_stream_->synchronize();
   val_output.next_tokens = val_output.next_tokens.to(torch::kCPU);
 
-  // Debug: log validated tokens alongside draft tokens for comparison
+   // Debug: log validated tokens alongside draft tokens for comparison
   static int32_t dbg_val_count = 0;
   if (dbg_val_count < 5 && val_output.next_tokens.defined()
       && val_output.next_tokens.dim() == 2 && val_output.next_tokens.size(0) > 0) {
@@ -858,6 +858,50 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
     ss << "] width=" << val_output.next_tokens.size(1);
     LOG(INFO) << ss.str();
     ++dbg_val_count;
+  }
+
+  // Record DSpark/DFlash acceptance metrics (matching the MTP path's
+  // COUNTER_ADD calls in mtp_worker_impl.cpp:2240-2246).
+  // next_tokens layout: [batch, num_spec+1], column 0 = target's own token,
+  // columns 1..num_spec = accepted draft tokens (>=0 = accepted, -1 = stop).
+  if (val_output.next_tokens.defined()
+      && val_output.next_tokens.dim() == 2
+      && val_output.next_tokens.size(1) >= 2) {
+    const int64_t batch = val_output.next_tokens.size(0);
+    const int64_t width = val_output.next_tokens.size(1);
+    const int64_t n_spec = width - 1;
+    const int64_t n_draft_tokens = batch * n_spec;
+    int64_t n_accepted = 0;
+    for (int64_t b = 0; b < batch; ++b) {
+      for (int64_t p = 1; p < width; ++p) {  // skip col 0 (target's own)
+        if (val_output.next_tokens[b][p].item<int64_t>() >= 0) {
+          ++n_accepted;
+        } else {
+          break;
+        }
+      }
+    }
+    int64_t n_committed = 0;
+    for (int64_t b = 0; b < batch; ++b) {
+      for (int64_t p = 0; p < width; ++p) {  // all committed = target + accepted
+        if (val_output.next_tokens[b][p].item<int64_t>() >= 0) {
+          ++n_committed;
+        } else {
+          break;
+        }
+      }
+    }
+    COUNTER_ADD(speculative_num_drafts_total, batch);
+    COUNTER_ADD(speculative_num_draft_tokens_total, n_draft_tokens);
+    COUNTER_ADD(speculative_num_accepted_tokens_total, n_accepted);
+    COUNTER_ADD(speculative_num_committed_tokens_total, n_committed);
+    const double total_drafts =
+        COUNTER_VALUE(speculative_num_drafts_total);
+    if (total_drafts > 0) {
+      GAUGE_SET(speculative_mean_tokens_per_decode_step,
+                COUNTER_VALUE(speculative_num_committed_tokens_total) /
+                    total_drafts);
+    }
   }
 
   write_target_context_to_cache(input, val_output);
