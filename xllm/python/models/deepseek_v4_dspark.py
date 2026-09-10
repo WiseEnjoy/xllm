@@ -364,6 +364,41 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
     def dspark_markov_bias(self, previous_token_ids):
         return self.markov_head.bias(previous_token_ids)
 
+    def write_context_kv(self, target_hidden, positions, cache_slots,
+                         kv_caches, layer_synchronizer=None):
+        """Project captured target hidden and write as shared context KV.
+
+        Mirrors C++ DeepseekV4DSparkModelImpl::write_context_kv:
+        main_proj(target_hidden) -> main_norm -> RoPE -> scatter into SWA cache.
+        """
+        from xllm.python import kernels as _k
+
+        projected = self.model.main_proj(target_hidden)
+        projected = self.model.main_norm(projected, None)[0]
+
+        # Build RoPE cos/sin for the given positions.
+        cos_sin = self.model.rotary.cos_sin_cache.index_select(
+            0, positions.to(torch.int64))
+        half = cos_sin.size(-1) // 2
+        cos = cos_sin[..., :half].repeat_interleave(2, dim=-1).contiguous()
+        sin = cos_sin[..., half:].repeat_interleave(2, dim=-1).contiguous()
+
+        # Write KV to each layer's SWA cache via the shared slot mapping.
+        for i, layer in enumerate(self.model.layers):
+            attn = layer.self_attn
+            kv = attn.kv_proj(projected)
+            kv = attn.kv_a_layernorm(kv)
+            kv = kv.view(-1, 1, attn.head_dim)
+            _k.npu_inplace_partial_rotary_mul(
+                kv, cos, sin, attn.nope_head_dim, attn.rope_head_dim)
+            if i < len(kv_caches):
+                cache_tuple = kv_caches[i]
+                swa_cache = cache_tuple[5] if len(cache_tuple) > 5 else None
+                if swa_cache is not None and swa_cache.numel() > 0:
+                    from xllm.python.attention.dsa_attention import _scatter_by_slot
+                    _scatter_by_slot(swa_cache, cache_slots, kv)
+        return projected
+
     def dspark_confidence_probs(self, hidden_all, prev_matrix=None):
         markov_embedding = None
         if prev_matrix is not None:
