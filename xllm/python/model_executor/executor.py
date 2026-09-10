@@ -46,7 +46,8 @@ def _create_attention_backend(
 ) -> AttentionBackend:
     config = config or {}
     model_type = config.get("model_type", "")
-    if model_type == "deepseek_v4" and current_platform.is_npu():
+    if (model_type in ("deepseek_v4", "deepseek_v4_dspark")
+            and current_platform.is_npu()):
         from xllm.python.attention.dsa_attention import DsaAttentionBackend
 
         return DsaAttentionBackend(
