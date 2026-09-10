@@ -224,7 +224,14 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
             _cp(ck + "attn.q_norm.weight", pm + "self_attn.q_a_layernorm.weight")
             _cp(ck + "attn.q_norm_gamma.weight", pm + "self_attn.q_rms_gamma.weight")
             _cp(ck + "attn.kv_norm.weight", pm + "self_attn.kv_a_layernorm.weight")
-            _cp(ck + "attn.attn_sink", pm + "self_attn.attn_sink")
+            if _has(ck + "attn.attn_sink"):
+                sink = loader.load_tensor(ck + "attn.attn_sink")
+                if (sink.dim() == 1 and sink.size(0) == self.cfg.n_heads
+                        and self.cfg.tp_size > 1):
+                    shard_size = self.cfg.n_heads // self.cfg.tp_size
+                    sink = sink.narrow(
+                        0, self.cfg.tp_rank * shard_size, shard_size)
+                loader.copy_in(pm + "self_attn.attn_sink", sink)
             _cp(ck + "attn_norm.weight", pm + "input_layernorm.weight")
             _cp(ck + "ffn_norm.weight", pm + "post_attention_layernorm.weight")
             _cp(ck + "hc_attn_fn", pm + "hc.hc_attn_fn")
