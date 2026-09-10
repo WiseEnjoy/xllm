@@ -476,19 +476,11 @@ std::string ModelRegistry::get_model_backend(const std::string& name) {
 }
 
 std::unique_ptr<CausalLM> create_llm_model(const ModelContext& context) {
-  const auto& model_impl = context.get_model_impl();
   // Python model executor: build the graph via the embedded interpreter instead
-  // of resolving a C++ model class from the registry. Draft bodies registered
-  // only in the C++ factory (DSpark/DFlash draft models) still resolve here
-  // even when the target runs --model_impl=python.
-  std::string resolved_name;
-  std::string error_message;
-  const bool resolved = resolve_model_registration_name(
-      context.get_model_args().model_type(), &resolved_name, &error_message);
-  auto factory =
-      resolved ? ModelRegistry::get_causallm_factory(resolved_name) : nullptr;
+  // of resolving a C++ model class from the registry.
+  const auto& model_impl = context.get_model_impl();
 #if defined(USE_CUDA) || defined(USE_NPU)
-  if (ModelConfig::is_python_model_impl(model_impl) && factory == nullptr) {
+  if (ModelConfig::is_python_model_impl(model_impl)) {
     return std::make_unique<PyCausalLM>(context);
   }
 #else
@@ -498,6 +490,16 @@ std::unique_ptr<CausalLM> create_llm_model(const ModelContext& context) {
   }
 #endif
 
+  std::string resolved_name;
+  std::string error_message;
+  if (!resolve_model_registration_name(context.get_model_args().model_type(),
+                                       &resolved_name,
+                                       &error_message)) {
+    LOG(ERROR) << error_message;
+    return nullptr;
+  }
+
+  auto factory = ModelRegistry::get_causallm_factory(resolved_name);
   if (factory) {
     return factory(context);
   }
