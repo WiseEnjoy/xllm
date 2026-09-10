@@ -170,7 +170,7 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
             self.cfg.tp_size, gather_output=True, dtype=dtype, device=device)
 
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
-        loader = W8A8WeightLoader(self, state_dicts, tp_rank, tp_size)
+        loader = W8A8WeightLoader(self, state_dicts, tp_size, tp_rank)
         n_layers = self.cfg.dspark_num_layers
         last = n_layers - 1
 
