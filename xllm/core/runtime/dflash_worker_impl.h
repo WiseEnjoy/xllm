@@ -42,12 +42,10 @@ inline void invalidate_draft_model_geometry(ModelInputParams& input_params) {
   // Attention metadata is model-owned: DeepSeek-V4 bakes DSA group layout and
   // sparse tiling values such as ori_win_left into opaque tensors. A draft
   // input copied from the target must rebuild those tensors for draft geometry.
+  // The multi_block_tables reference the shared framework cache pool (target
+  // and draft share the allocation), so they stay valid for the draft. The
+  // SWA-only filter in dsa_metadata.py handles the 3-manager → 1-group trim.
   input_params.attn_metadata.reset();
-  // The target's multi_block_tables reference the TARGET's KV cache managers.
-  // The Python DSA backend rebuilds metadata from these; the draft must not
-  // attend over the target's cache, so drop them and let the draft model's
-  // own executor rebuild them from the draft's cache layout.
-  input_params.multi_block_tables.clear();
 }
 
 enum class DSparkSasMode : uint8_t {
