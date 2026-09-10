@@ -407,11 +407,23 @@ class DsaMetadataBuilder:
             active = [packed[m].unsqueeze(0).contiguous() for m in range(packed.size(0))]
             manager_num = len(active)
 
+        # A DSpark draft model has SWA-only groups (compress_ratios all 1), but
+        # the framework may hand down the target's full multi_block_tables
+        # (SWA + c4 + c128). Only consume the managers the model's group
+        # infos declare; extras are the target's and are ignored.
         if manager_num > len(self.group_infos):
-            raise ValueError(
-                f"manager count {manager_num} exceeds group count "
-                f"{len(self.group_infos)}"
-            )
+            if len(self.group_infos) == 1 and all(
+                gi.cache_type == DSA_CACHE_SLIDING_WINDOW
+                for gi in self.group_infos
+            ):
+                # SWA-only model: take manager 0 (the SWA ring cache).
+                active = active[:len(self.group_infos)]
+                manager_num = len(active)
+            else:
+                raise ValueError(
+                    f"manager count {manager_num} exceeds group count "
+                    f"{len(self.group_infos)}"
+                )
         if enable_graph and graph_block_table_capacity_cols > 0:
             for manager_id, block_table in enumerate(active):
                 if block_table.dim() != 2:
