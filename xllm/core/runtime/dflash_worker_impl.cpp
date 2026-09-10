@@ -86,11 +86,6 @@ runtime::Options draft_options(const runtime::Options& options) {
       .num_decoding_tokens(1)
       .num_speculative_tokens(draft_num_speculative_tokens)
       .enable_graph_aux_hidden_states(false);
-  // The DSpark draft body is a C++ model (deepseek_v4_dspark /
-  // DSparkDraftModel). Force the native executor for the draft regardless of
-  // the target's --model_impl so a Python target does not route the draft
-  // through the Python model registry (which has no dspark entry).
-  opts.model_impl("llm");
   return opts;
 }
 
