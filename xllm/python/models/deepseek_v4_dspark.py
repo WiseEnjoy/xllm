@@ -146,7 +146,8 @@ class DSV4DSparkModel(nn.Module):
                 layer=layer_id, kind="dense")
             record_layer_event(layer_id)
         merged = self.hc_head(residual if residual is not None else hidden)
-        return self.norm(merged, None)[0]
+        normed = self.norm(merged, None)
+        return normed[0] if isinstance(normed, tuple) else normed
 
 
 class DeepseekV4DSparkForCausalLM(PyModelBase):
@@ -374,7 +375,10 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
         from xllm.python import kernels as _k
 
         projected = self.model.main_proj(target_hidden)
-        projected = self.model.main_norm(projected, None)[0]
+        normed = self.model.main_norm(projected, None)
+        if isinstance(normed, tuple):
+            normed = normed[0]
+        projected = normed
 
         # Build RoPE cos/sin for the given positions.
         cos_sin = self.model.rotary.cos_sin_cache.index_select(
