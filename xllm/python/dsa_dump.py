@@ -307,7 +307,11 @@ def snap(
                 "quant_lightning_indexer_v2_out", "quant_lightning_indexer_out",
                 "quant_lightning_indexer_v2", "quant_lightning_indexer",
                 "graph_bt_0", "graph_bt_1", "graph_bt_2", "graph_bt_3",
-                "graph_slots_0", "graph_meta", "layer_output"}
+                "graph_slots_0", "graph_meta", "layer_output",
+                "ctx_kv", "draft_final", "aux_capture",
+                "decoder_input", "hc_pre_attn", "input_layernorm_out",
+                "attn_output", "hc_post_attn", "hc_pre_ffn",
+                "post_attention_layernorm_out", "mlp_output", "hc_post_ffn"}
     if task not in _allowed:
         return
     if not _env_filter_ok(layer, ctx_get()):
