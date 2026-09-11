@@ -107,6 +107,7 @@ class AttentionMetadata(Protocol):
     max_query_len: int
     max_seq_len: int
     multi_block_tables: Sequence[torch.Tensor | None]
+    new_cache_slots: torch.Tensor | None
     dsa_metadata: object | None
     dsa_positions: torch.Tensor | None
     dsa_cos_sin: torch.Tensor | None

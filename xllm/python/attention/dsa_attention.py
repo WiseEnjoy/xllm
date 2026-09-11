@@ -223,6 +223,7 @@ class DsaAttentionBackend(AttentionBackend):
             is_chunked_prefill=metadata.is_chunked_prefill,
             enable_graph=True,
             graph_block_table_capacity_cols=self._graph_bt_capacity_cols,
+            new_cache_slots=getattr(metadata, "new_cache_slots", None),
         )
         self._populate_dsa_rope(dsa_metadata, metadata)
         # Window indices first, while the builder output is still on CPU
@@ -385,6 +386,7 @@ class DsaAttentionBackend(AttentionBackend):
             is_prefill=metadata.is_prefill,
             is_chunked_prefill=metadata.is_chunked_prefill,
             enable_graph=False,
+            new_cache_slots=getattr(metadata, "new_cache_slots", None),
         )
         self._populate_dsa_rope(dsa_metadata, metadata)
         self._move_metadata_to_device(dsa_metadata)

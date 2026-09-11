@@ -72,6 +72,7 @@ class PyAttentionMetadataView final {
   const std::vector<int32_t>& kv_seq_lens_host_values() const;
   pybind11::object q_seq_lens_host() const;
   pybind11::list multi_block_tables() const;
+  pybind11::object new_cache_slots() const;
   pybind11::object block_table() const;
   pybind11::object kv_seq_lens() const;
   pybind11::object linear_state_indices() const;
@@ -108,6 +109,7 @@ class PyAttentionMetadataView final {
   torch::Tensor kv_seq_lens_host_;
   torch::Tensor q_seq_lens_host_;
   std::vector<torch::Tensor> multi_block_tables_;
+  torch::Tensor new_cache_slots_;
   torch::Tensor linear_state_indices_;
   std::vector<int32_t> dp_token_counts_;
   std::shared_ptr<void> dsa_metadata_holder_;

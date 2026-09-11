@@ -30,10 +30,13 @@ backend builds it here from the same inputs.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Sequence
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Cache-type enum (mirrors ``DSACacheType`` in dsa_metadata.h).
@@ -240,6 +243,7 @@ class DsaMetadataBuilder:
         graph_block_table_capacity_cols: int = 0,
         max_query_len: int = 0,
         max_seq_len: int = 0,
+        new_cache_slots: torch.Tensor | Sequence[int] | None = None,
     ) -> DsaMetadata:
         batch_size = len(kv_seq_lens)
         if q_seq_lens is None or len(q_seq_lens) != batch_size:
@@ -277,6 +281,7 @@ class DsaMetadataBuilder:
             enable_graph,
             graph_block_table_capacity_cols,
             dsa,
+            new_cache_slots,
         )
         return dsa
 
@@ -389,6 +394,7 @@ class DsaMetadataBuilder:
         enable_graph: bool,
         graph_block_table_capacity_cols: int,
         dsa: DsaMetadata,
+        new_cache_slots: torch.Tensor | Sequence[int] | None = None,
     ) -> None:
         if not multi_block_tables or not self.caches_info:
             return
@@ -442,6 +448,15 @@ class DsaMetadataBuilder:
             int(positions.numel()) if enable_graph and positions.numel() > 0 else 0
         )
         total_tokens = sum(int(x) for x in ctx_lens)
+        new_cache_slots_list = (
+            new_cache_slots.tolist()
+            if new_cache_slots is not None and hasattr(new_cache_slots, "tolist")
+            else (
+                list(new_cache_slots)
+                if new_cache_slots is not None and len(new_cache_slots) > 0
+                else None
+            )
+        )
 
         proc_bt: list[torch.Tensor] = [torch.empty(0)] * manager_num
         proc_slots: list[torch.Tensor] = [torch.empty(0)] * manager_num
@@ -456,6 +471,7 @@ class DsaMetadataBuilder:
                 total_tokens,
                 graph_slot_capacity,
                 graph_block_table_capacity_cols,
+                new_cache_slots_list,
             )
 
         n_layers = len(self.caches_info)
@@ -483,6 +499,7 @@ class DsaMetadataBuilder:
         total_tokens: int,
         graph_slot_capacity: int,
         graph_block_table_capacity_cols: int,
+        new_cache_slots: Sequence[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if gi.cache_type == DSA_CACHE_TOKEN:
             return self._process_token_group(
@@ -504,6 +521,7 @@ class DsaMetadataBuilder:
                 batch_size,
                 graph_slot_capacity,
                 graph_block_table_capacity_cols,
+                new_cache_slots,
             )
         # SEQUENCE: expand the whole context.
         return self._expand_blocks_to_slots(
@@ -587,6 +605,7 @@ class DsaMetadataBuilder:
         batch_size: int,
         graph_slot_capacity: int,
         graph_block_table_capacity_cols: int,
+        new_cache_slots: Sequence[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         query_total_tokens = 0
         for seq in range(batch_size):
@@ -616,16 +635,41 @@ class DsaMetadataBuilder:
 
         write_idx = 0
         slots_list = out_slots.tolist()
-        for seq in range(batch_size):
-            ctx_len = int(ctx_lens[seq])
-            q_len = max(0, min(int(q_lens[seq]), ctx_len))
-            if seq >= raw_bt.size(0):
-                write_idx += q_len
-                continue
-            q_start = ctx_len - q_len
-            for i in range(q_len):
-                slots_list[write_idx] = slot_for_position(seq, q_start + i)
-                write_idx += 1
+        if new_cache_slots is not None and len(new_cache_slots) == query_total_tokens:
+            # Expanded block-parallel rows all report q_len=1 and the same
+            # kv_len, so q_start cannot recover their distinct positions. The
+            # row builder already resolved those positions through the SWA
+            # ring; preserve those slots (mirrors the C++ memcpy fast path).
+            slots_list[:query_total_tokens] = [
+                int(v) for v in new_cache_slots[:query_total_tokens]
+            ]
+            write_idx = query_total_tokens
+        else:
+            if new_cache_slots is not None:
+                # Mirrors the C++ CHECK_EQ(write_idx, query_total_tokens)
+                # safety net: a length mismatch silently corrupts SWA slots
+                # (symptoms identical to the pre-X25 truncation bug).
+                logger.warning(
+                    "DSA SWA new_cache_slots length mismatch: "
+                    "len=%s, query_total_tokens=%s; falling back to "
+                    "slot_for_position (graph padding can cause this).",
+                    len(new_cache_slots),
+                    query_total_tokens,
+                )
+            for seq in range(batch_size):
+                ctx_len = int(ctx_lens[seq])
+                q_len = max(0, min(int(q_lens[seq]), ctx_len))
+                if seq >= raw_bt.size(0):
+                    write_idx += q_len
+                    continue
+                q_start = ctx_len - q_len
+                for i in range(q_len):
+                    slots_list[write_idx] = slot_for_position(seq, q_start + i)
+                    write_idx += 1
+        assert write_idx == query_total_tokens, (
+            f"SWA slot write_idx={write_idx} != "
+            f"query_total_tokens={query_total_tokens}"
+        )
         out_slots = torch.tensor(slots_list, dtype=torch.int32, device=raw_bt.device)
 
         # Rebuild the read-side block table: keep only the SWA window columns,

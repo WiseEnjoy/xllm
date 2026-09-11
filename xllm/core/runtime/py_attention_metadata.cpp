@@ -90,6 +90,8 @@ void register_attention_metadata_views(py::module_& module) {
                              &PyAttentionMetadataView::q_seq_lens_host)
       .def_property_readonly("multi_block_tables",
                              &PyAttentionMetadataView::multi_block_tables)
+      .def_property_readonly("new_cache_slots",
+                             &PyAttentionMetadataView::new_cache_slots)
       .def_property_readonly("block_table",
                              &PyAttentionMetadataView::block_table)
       .def_property_readonly("kv_seq_lens",
@@ -204,6 +206,11 @@ PyAttentionMetadataView::PyAttentionMetadataView(
     const ModelInputParams& params)
     : PyAttentionMetadataView(std::move(metadata)) {
   multi_block_tables_ = params.multi_block_tables;
+  if (!params.attention.host.new_cache_slots.empty()) {
+    new_cache_slots_ = torch::tensor(
+        params.attention.host.new_cache_slots,
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
+  }
   linear_state_indices_ = params.embedding.linear_state_indices;
   dp_token_counts_ = params.parallel.raw_dp_global_token_nums.empty()
                          ? params.parallel.dp_global_token_nums
@@ -284,6 +291,10 @@ py::list PyAttentionMetadataView::multi_block_tables() const {
     tables.append(optional_tensor(table));
   }
   return tables;
+}
+
+py::object PyAttentionMetadataView::new_cache_slots() const {
+  return optional_tensor(new_cache_slots_);
 }
 
 PyExpandedDecodeMetadataView PyAttentionMetadataView::expanded_decode_metadata()
