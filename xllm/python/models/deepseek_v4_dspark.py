@@ -136,6 +136,9 @@ class DSV4DSparkModel(nn.Module):
             prepare_dsa(metadata)
 
         hidden = self.embed_tokens(input_ids)
+        dsa_dump.snap(
+            "draft_final", {"embed_out": hidden}, layer=0, kind="dense",
+        )
         hidden = hidden.unsqueeze(1).expand(
             -1, self.cfg.hc_mult, -1).contiguous()
         residual: torch.Tensor | None = None
@@ -147,7 +150,12 @@ class DSV4DSparkModel(nn.Module):
             record_layer_event(layer_id)
         merged = self.hc_head(residual if residual is not None else hidden)
         normed = self.norm(merged, None)
-        return normed[0] if isinstance(normed, tuple) else normed
+        final_hidden = normed[0] if isinstance(normed, tuple) else normed
+        dsa_dump.snap(
+            "draft_final", {"final_hidden": final_hidden, "merged": merged},
+            layer=-1, kind="dense",
+        )
+        return final_hidden
 
 
 class DeepseekV4DSparkForCausalLM(PyModelBase):
@@ -357,7 +365,22 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
                 if tp > 1:
                     se_s13 = loader.shard(se_s13, dim=0, world=tp, rank=tp_rank)
                 loader.copy_in(pm + "mlp.shared_experts.gate_up_proj.weight_scale",
-                               se_s13)
+                               se_s13[:se_w13.size(0)])
+            if _has(se + "w1.weight_offset"):
+                o1 = loader.load_tensor(se + "w1.weight_offset")
+                o3 = loader.load_tensor(se + "w3.weight_offset")
+                loader.copy_in(pm + "mlp.shared_experts.gate_up_proj.weight_offset",
+                               torch.cat([o1, o3], dim=0)[:se_w13.size(0)])
+            se_w2 = loader.load_tensor(se + "w2.weight")
+            if tp > 1:
+                se_w2 = loader.shard(se_w2, dim=1, world=tp, rank=tp_rank)
+            loader.copy_in(pm + "mlp.shared_experts.down_proj.weight", se_w2)
+            if _has(se + "w2.weight_scale"):
+                loader.copy_in(pm + "mlp.shared_experts.down_proj.weight_scale",
+                               loader.load_tensor(se + "w2.weight_scale"))
+            if _has(se + "w2.weight_offset"):
+                loader.copy_in(pm + "mlp.shared_experts.down_proj.weight_offset",
+                               loader.load_tensor(se + "w2.weight_offset"))
 
     def forward(self, input_ids: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
@@ -379,12 +402,18 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
         main_proj(target_hidden) -> main_norm -> RoPE -> scatter into SWA cache.
         """
         from xllm.python import kernels as _k
+        from xllm.python import dsa_dump
 
         projected = self.model.main_proj(target_hidden)
         normed = self.model.main_norm(projected, None)
         if isinstance(normed, tuple):
             normed = normed[0]
         projected = normed
+        dsa_dump.snap(
+            "ctx_kv", {"projected": projected, "positions": positions,
+                       "cache_slots": cache_slots},
+            layer=0, kind="dense",
+        )
 
         # Build RoPE cos/sin for the given positions.
         cos_sin = self.model.rotary.cos_sin_cache.index_select(
@@ -401,6 +430,11 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
             kv = kv.view(-1, 1, attn.head_dim)
             _k.npu_inplace_partial_rotary_mul(
                 kv, cos, sin, attn.nope_head_dim, attn.rope_head_dim)
+            if i == 0:
+                dsa_dump.snap(
+                    "ctx_kv", {"kv_layer0": kv, "cos": cos, "sin": sin},
+                    layer=0, kind="dense",
+                )
             if i < len(kv_caches):
                 cache_tuple = kv_caches[i]
                 swa_cache = cache_tuple[5] if len(cache_tuple) > 5 else None
