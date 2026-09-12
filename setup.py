@@ -1032,7 +1032,6 @@ if __name__ == "__main__":
         f"enable_ha: {enable_ha}"
     )
     if device == "npu":
-        _ensure_torch_npu_ready()
         _ensure_tilelang_ascend_ready(target_platform, arch)
     pre_build(device, enable_ha)
 
