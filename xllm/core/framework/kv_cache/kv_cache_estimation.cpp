@@ -238,6 +238,16 @@ int64_t calculate_linear_state_blocks(int64_t cache_size_in_bytes,
   return std::min<int64_t>(auto_blocks, max_blocks);
 }
 
+namespace {
+
+// The compressed-cache pool floors use the same max_seqs basis as the SWA
+// constant sizing (never below 1).
+int64_t max_seqs_floor(const KVCacheEstimateOptions& options) {
+  return std::max(options.max_seqs_per_batch, static_cast<int64_t>(1));
+}
+
+}  // namespace
+
 Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
     const ModelArgs& model_args,
     const KVCacheEstimateOptions& options) {
@@ -391,6 +401,30 @@ void init_dsv4_counts(const ModelArgs& model_args,
   } else if (cache_cost.n_c128_layers > 0) {
     if (cache_cost.token_unit_bytes > 0 && token_mem > 0) {
       kv_cache_cap->c128_count(token_mem / cache_cost.token_unit_bytes);
+    }
+  }
+
+  // Functional floors: every running sequence holds at least one block in
+  // each compressed-cache manager (plus a small growth margin), so the
+  // pools must scale with max_seqs or the scheduler cannot even assemble a
+  // full batch -- the memory-derived counts above shrink as the constant
+  // SWA pool grows with max_seqs, which starves the C128 pool exactly when
+  // more sequences need it. The floors cost only a few MB.
+  {
+    const int64_t floor_c128 = 2 * max_seqs_floor(options) + 2;
+    if (cache_cost.n_c128_layers > 0) {
+      kv_cache_cap->c128_count(
+          std::max(kv_cache_cap->c128_count(), floor_c128));
+      // Keep the C4:C128 = 32:1 unit accounting consistent when the floor
+      // raised C128; C4 also needs its own per-sequence floor (a decode
+      // step writes ceil((1 + num_spec + window_margin)/4) blocks).
+      const int64_t floor_c4 = 8 * max_seqs_floor(options) + 8;
+      kv_cache_cap->c4_count(std::max(
+          kv_cache_cap->c4_count(),
+          std::max<int64_t>(32 * kv_cache_cap->c128_count(), floor_c4)));
+    } else if (cache_cost.n_c4_layers > 0) {
+      kv_cache_cap->c4_count(
+          std::max(kv_cache_cap->c4_count(), 8 * max_seqs_floor(options) + 8));
     }
   }
 

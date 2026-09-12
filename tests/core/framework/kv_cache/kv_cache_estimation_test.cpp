@@ -322,9 +322,12 @@ TEST(KVCacheEstimationTest, EstimatesDeepSeekV4Pools) {
   EXPECT_EQ(capacity.c128_count(), 2);
   EXPECT_EQ(capacity.n_blocks(), 256);
 #else
-  EXPECT_EQ(capacity.c4_count(), 96);
-  EXPECT_EQ(capacity.c128_count(), 3);
-  EXPECT_EQ(capacity.n_blocks(), 384);
+  // The memory-derived C128 pool (3 units) sits below the per-sequence
+  // functional floor (2 * max_seqs + 2 = 10 for max_seqs=4), so the floor
+  // wins and C4 follows the 32:1 unit accounting (32 * 10 = 320).
+  EXPECT_EQ(capacity.c4_count(), 320);
+  EXPECT_EQ(capacity.c128_count(), 10);
+  EXPECT_EQ(capacity.n_blocks(), 1280);
 #endif
 }
 
@@ -390,8 +393,10 @@ TEST(KVCacheEstimationTest,
   EXPECT_LE(capacity.cache_size_in_bytes() + kDraftSwaBytes,
             target_options.cache_size_in_bytes);
   EXPECT_EQ(capacity.swa_count(), 19);
-  EXPECT_EQ(capacity.c4_count(), 64);
-  EXPECT_EQ(capacity.c128_count(), 2);
+  // Memory-derived C128 (2 units) is lifted to the per-sequence floor
+  // (2 * max_seqs + 2 = 10); C4 keeps the 32:1 unit accounting.
+  EXPECT_EQ(capacity.c4_count(), 320);
+  EXPECT_EQ(capacity.c128_count(), 10);
 }
 
 TEST(KVCacheEstimationTest,
