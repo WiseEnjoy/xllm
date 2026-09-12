@@ -44,6 +44,13 @@ class DSV4DSparkMarkovHead(nn.Module):
                  device: torch.device) -> None:
         super().__init__()
         self.markov_w1 = nn.Embedding(vocab_size, markov_rank, dtype=dtype, device=device)
+        # w2 intentionally stays in the model dtype (bf16) even though the
+        # 0731 checkpoint stores it in fp32: the target's logits live on the
+        # bf16 grid and break near-ties toward the first index, so keeping the
+        # draft's base_logits + markov_bias sum on the same grid preserves
+        # tie-breaking compatibility. Promoting w2 to fp32 measurably REDUCED
+        # acceptance on near-margin workloads (verbatim repeat 99.8% -> 92-96%,
+        # see smoke/x35_precision) and was reverted.
         self.markov_w2 = nn.Linear(markov_rank, vocab_size, bias=False, dtype=dtype, device=device)
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
