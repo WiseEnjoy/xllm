@@ -1068,26 +1068,27 @@ class DsaAttentionBackend(AttentionBackend):
                 ori_bt.detach().cpu() if ori_bt.device.type != "cpu"
                 else ori_bt.detach()
             ).to(torch.int64)
-        eff_mask = bt_host >= 0
-        cols_eff = eff_mask.sum(dim=1).clamp(min=1)
-        rank = eff_mask.long().cumsum(dim=1) - 1
-        eff_vals = bt_host.clamp(min=0)
+        # Placeholder-stable ring addressing. The SWA manager releases
+        # slid-out leading blocks but keeps them in the table as invalid
+        # (-1) placeholders exactly so (pos // block_size) % width keeps
+        # resolving each position to its owning column. Mapping through
+        # the count of valid columns instead shifts the mapping by the
+        # number of released blocks once the first one slides out
+        # (cached_tokens >= window + num_spec_tokens + block_size), and
+        # the window reads the wrong physical blocks.
         rows = bt_host.size(0)
+        width = bt_host.size(1)
         seq_sel = torch.arange(n_seqs).clamp(max=rows - 1)
-        row_rank = rank[seq_sel]
-        row_vals = eff_vals[seq_sel]
-        row_cols_eff = cols_eff[seq_sel]
-        blk_pos = ((token // bs) % row_cols_eff.unsqueeze(1)).clamp(
-            max=eff_mask.size(1) - 1
-        )
-        match = row_rank.unsqueeze(1) == blk_pos.unsqueeze(-1)
-        blk = (row_vals.unsqueeze(1) * match).sum(dim=-1)
-        blk = torch.where(match.any(dim=-1), blk, torch.zeros_like(blk))
-        src = blk * bs + (token % bs)
-        src = torch.where(valid, src.clamp(min=0), torch.zeros_like(src))
+        row_bt = bt_host[seq_sel]
+        blk_pos = (token // bs) % width
+        blk_id = torch.gather(row_bt, 1, blk_pos)
+        blk_ok = blk_id >= 0
+        src = blk_id.clamp(min=0) * bs + (token % bs)
+        slot_valid = valid & blk_ok
+        src = torch.where(slot_valid, src, torch.zeros_like(src))
 
         src_idx = src.to(device)
-        valid_d = valid.to(device)
+        valid_d = slot_valid.to(device)
         k_d = k.to(device)
         kv_flat = ori_kv.reshape(-1, head_dim)
         gathered = kv_flat[src_idx]
@@ -1127,23 +1128,19 @@ class DsaAttentionBackend(AttentionBackend):
             if bt.device.type != "cpu"
             else bt.detach()
         ).to(torch.int64)
+        # Placeholder-stable ring addressing (see
+        # _decode_window_compact_eager): modulo the FULL table width so
+        # released leading blocks kept as -1 placeholders do not shift the
+        # position -> column mapping.
         rows = bt_host.size(0)
-        eff_mask = bt_host >= 0  # (R, C)
-        cols_eff = eff_mask.sum(dim=1).clamp(min=1)  # (R,)
-        rank = eff_mask.long().cumsum(dim=1) - 1  # (R, C)
-        eff_vals = bt_host.clamp(min=0)
+        width = bt_host.size(1)
         seq_sel = torch.arange(n_seqs).clamp(max=rows - 1)
-        row_rank = rank[seq_sel]
-        row_vals = eff_vals[seq_sel]
-        row_cols_eff = cols_eff[seq_sel]  # (B,)
-        blk_pos = (
-            (token // bs) % row_cols_eff.unsqueeze(1)
-        ).clamp(max=eff_mask.size(1) - 1)  # (B, W)
-        match = row_rank.unsqueeze(1) == blk_pos.unsqueeze(-1)  # (B, W, C)
-        blk = (row_vals.unsqueeze(1) * match).sum(dim=-1)
-        blk = torch.where(match.any(dim=-1), blk, torch.zeros_like(blk))
-        src = blk * bs + (token % bs)
-        return torch.where(valid, src.clamp(min=0), torch.zeros_like(src))
+        row_bt = bt_host[seq_sel]
+        blk_pos = (token // bs) % width
+        blk_id = torch.gather(row_bt, 1, blk_pos)
+        blk_ok = blk_id >= 0
+        src = blk_id.clamp(min=0) * bs + (token % bs)
+        return torch.where(valid & blk_ok, src, torch.zeros_like(src))
 
     def _build_window_src_indices(
         self,
