@@ -578,7 +578,16 @@ class DecodeAclGraphRunner(BaseRunner):
         # H2D fills) on ONE stream -- two streams sharing one HCCL
         # communicator under concurrency corrupts its state (507011, X6).
         entry.graph.replay()
-        output = entry.static_output[:batch_size].clone()
+        raw_output = entry.static_output
+        if isinstance(raw_output, tuple):
+            # Aux-hidden-capture targets (DSpark/DFlash/Eagle3) return
+            # (hidden_states, aux_hidden_states); slice both on replay and
+            # let the C++ side unpack the tuple.
+            output = tuple(
+                t[:batch_size].clone() for t in raw_output if torch.is_tensor(t)
+            )
+        else:
+            output = raw_output[:batch_size].clone()
 
         # A captured FIA task waits on its update event before execution.  This
         # lets replay run concurrently with the host-side updates for later

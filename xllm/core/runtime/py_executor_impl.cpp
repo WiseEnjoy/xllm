@@ -145,7 +145,9 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   py_executor_ =
       executor_module.attr("ModelExecutor")(py_causal_lm_->python_model(),
                                             py_causal_lm_->config_dict(),
-                                            options_.max_seqs_per_batch());
+                                            options_.max_seqs_per_batch(),
+                                            /*max_speculative_tokens=*/
+                                            options_.num_speculative_tokens());
 }
 
 PyExecutorImpl::~PyExecutorImpl() {

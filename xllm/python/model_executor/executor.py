@@ -60,6 +60,7 @@ def _create_attention_backend(
             index_n_heads=int(config.get("index_n_heads", 64)),
             index_head_dim=int(config.get("index_head_dim", 128)),
             rope_head_dim=int(config.get("qk_rope_head_dim", 64)),
+            dspark_block_size=int(config.get("dspark_block_size", 0)),
             device=device,
             dtype=dtype,
         )
@@ -92,12 +93,31 @@ def _create_attention_backend(
     )
 
 
+def _graph_max_batch(max_seqs_per_batch: int, max_speculative_tokens: int) -> int:
+    """Decode-graph bucket capacity, including speculative verify rows.
+
+    A plain decode graph buckets by concurrent sequences, but a speculative
+    verify forward expands each sequence to (1 + num_speculative_tokens)
+    block-parallel q_len=1 rows; the runner must accept those buckets too.
+    Round up to the runner's bucket grid so _decode_bucket(batch) <= max.
+    """
+    raw = max_seqs_per_batch * (1 + max_speculative_tokens)
+    if raw <= max_seqs_per_batch:
+        return max_seqs_per_batch
+    if raw <= 8:
+        for bucket in (1, 2, 4, 8):
+            if raw <= bucket:
+                return max(max_seqs_per_batch, bucket)
+    return max(max_seqs_per_batch, ((raw + 15) // 16) * 16)
+
+
 class ModelExecutor:
     def __init__(
         self,
         model: nn.Module,
         config: dict,
         max_seqs_per_batch: int,
+        max_speculative_tokens: int = 0,
     ) -> None:
         self.model = model
         self._kv_bound = False
@@ -158,7 +178,7 @@ class ModelExecutor:
                 execution_model,
                 self.attention_backend,
                 device,
-                max_seqs_per_batch,
+                _graph_max_batch(max_seqs_per_batch, max_speculative_tokens),
                 int(config["max_position_embeddings"]),
                 dp_size,
                 dp_rank,
@@ -171,7 +191,7 @@ class ModelExecutor:
                 execution_model,
                 self.attention_backend,
                 device,
-                max_seqs_per_batch,
+                _graph_max_batch(max_seqs_per_batch, max_speculative_tokens),
                 int(config["max_position_embeddings"]),
                 dp_size,
                 dp_rank,

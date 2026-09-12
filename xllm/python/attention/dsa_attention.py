@@ -110,6 +110,7 @@ class DsaAttentionBackend(AttentionBackend):
         rope_head_dim: int,
         device: torch.device,
         dtype: torch.dtype,
+        dspark_block_size: int = 0,
     ) -> None:
         self.caches_info, self.group_infos = build_cache_specs(
             compress_ratios, window_size, n_layers
@@ -125,6 +126,25 @@ class DsaAttentionBackend(AttentionBackend):
         self.device = device
         self.dtype = dtype
         self.scale = attn_head_dim ** -0.5
+        # DSpark draft block attention: every row of the N-wide query block
+        # attends the trailing window_size prefix tokens plus the whole
+        # block (non-causal), i.e. [q - (window + block - 1), q] — matching
+        # the reference DSpark SAS window (window_size + block_size - 1).
+        # Non-draft backends keep the plain [q - (window - 1), q] SWA.
+        self._dspark_block_size = dspark_block_size
+        self.attn_win_left = (
+            window_size + dspark_block_size - 1
+            if dspark_block_size > 0
+            else max(window_size - 1, 0)
+        )
+        # Attended ori-side length cap for the metadata tiling (decode rows):
+        # the draft block reads window + block tokens through the ring table
+        # while a plain decode row reads window tokens through the compact.
+        self.attn_win_capacity = (
+            window_size + dspark_block_size
+            if dspark_block_size > 0
+            else window_size
+        )
 
         self._kv_caches: list[LayerCache] = []
         self._metadata: AttentionMetadata | None = None
@@ -722,7 +742,7 @@ class DsaAttentionBackend(AttentionBackend):
             cmp_ratio=compress_ratio,
             ori_mask_mode=_MASK_MODE_COMPRESS,
             cmp_mask_mode=_MASK_MODE_RIGHT_DOWN_CAUSAL,
-            ori_win_left=self.window_size - 1,
+            ori_win_left=self.attn_win_left,
             ori_win_right=0,
             layout_q="TND",
             layout_kv="PA_ND",
@@ -925,8 +945,10 @@ class DsaAttentionBackend(AttentionBackend):
                     # Decode runs the ori side over the clamped window
                     # compact (eager and graph alike); the tiling metadata
                     # must describe the same length the kernel receives, or
-                    # the AICPU tiling reads past the window capacity.
-                    seq_kv.clamp(max=self.window_size)
+                    # the AICPU tiling reads past the window capacity. The
+                    # DSpark draft block reads window + block tokens through
+                    # the ring table instead of the window compact.
+                    seq_kv.clamp(max=self.attn_win_capacity)
                     if not is_prefill
                     else seq_kv
                 ),
@@ -943,7 +965,7 @@ class DsaAttentionBackend(AttentionBackend):
                 cmp_ratio=ratio,
                 ori_mask_mode=_MASK_MODE_COMPRESS,
                 cmp_mask_mode=(0 if not has_cmp else _MASK_MODE_RIGHT_DOWN_CAUSAL),
-                ori_win_left=max(self.window_size - 1, 0),
+                ori_win_left=self.attn_win_left,
                 ori_win_right=0,
                 layout_q="TND",
                 layout_kv="PA_BBND",

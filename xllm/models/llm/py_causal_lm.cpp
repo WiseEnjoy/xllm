@@ -268,12 +268,12 @@ py::dict PyCausalLM::build_config_dict(
   // cp_size is a reflected ParallelArgs PROPERTY (already in d), but cp_rank is
   // a derived member function, so pass it explicitly for the Python executor.
   d["cp_rank"] = cp_rank_;
-  // Aux-hidden capture (DSpark/DFlash/Eagle3 Python targets) reads per-layer
-  // residual streams that the captured decode graph cannot refresh, so force
-  // the Python executor to eager while capture is enabled. Non-spec runs keep
-  // the graph path untouched.
+  // Aux-hidden-capture targets (DSpark/DFlash/Eagle3) return a
+  // (hidden_states, aux_hidden_states) tuple from forward; the decode graph
+  // runner slices both outputs on replay, so they may capture normally.
+  // Qwen-style draft bodies still run eager: their forwards are not decode
+  // buckets and the draft worker owns their scheduling.
   const bool requires_eager_execution =
-      !model_args_.layers_to_capture().empty() ||
       model_args_.model_type() == "DFlashDraftModel" ||
       model_args_.model_type() == "DSparkDraftModel";
   d["enable_graph"] = requires_eager_execution
