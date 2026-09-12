@@ -48,9 +48,9 @@ class DSV4DSparkMarkovHead(nn.Module):
         # 0731 checkpoint stores it in fp32: the target's logits live on the
         # bf16 grid and break near-ties toward the first index, so keeping the
         # draft's base_logits + markov_bias sum on the same grid preserves
-        # tie-breaking compatibility. Promoting w2 to fp32 measurably REDUCED
-        # acceptance on near-margin workloads (verbatim repeat 99.8% -> 92-96%,
-        # see smoke/x35_precision) and was reverted.
+        # tie-breaking compatibility. Promoting w2 to fp32 compute was
+        # measured to REDUCE acceptance on near-margin workloads (verbatim
+        # repeat dropped from 99.8% to 92-96%) and was reverted.
         self.markov_w2 = nn.Linear(markov_rank, vocab_size, bias=False, dtype=dtype, device=device)
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:

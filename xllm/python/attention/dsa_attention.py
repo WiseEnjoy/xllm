@@ -687,10 +687,11 @@ class DsaAttentionBackend(AttentionBackend):
                 cmp_residual_kernel = None
             seq_kv_for_kernel = None
         elif self._graph_mode and not use_prefill_attn:
-            # Static window compact for the ori (SWA-ring) side. CANN
-            # sparse_flash_mla mis-decodes the real ring block table at
-            # decode shapes (bisection: ori-direct garbles, cmp-direct is
-            # fine -- smoke/RESULTS.md X3), so the graph gathers the newest
+            # Static window compact for the ori (SWA-ring) side. The CANN
+            # sparse_flash_mla kernel mis-decodes the real ring block table at
+            # decode shapes (verified by bisection: feeding the ring table to
+            # the ori side garbles output while the cmp side is fine), so the
+            # graph gathers the newest
             # window into a 0-based in-graph buffer with fully device-side
             # ring indexing: no host reads, no data-dependent allocations,
             # bucket-static shapes. Head-aligned layout keeps the eager
@@ -1174,8 +1175,9 @@ class DsaAttentionBackend(AttentionBackend):
         Vectorized rebuild per SWA manager (all layers sharing a group read
         the same block table), landing in ONE merged persist buffer
         (win_src_all: [n_layers, B, window]) so the per-step refresh pays a
-        single H2D copy. Physical block-table addressing -- no ring wrap
-        assumptions (smoke/RESULTS.md X3/ISS-7).
+        single H2D copy. Physical block-table addressing -- released leading
+        blocks keep -1 placeholders in the table, so never assume a dense
+        ring wrap; resolve every position through the table instead.
         """
         bs = 128
         win = self.window_size

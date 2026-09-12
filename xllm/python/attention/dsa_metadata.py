@@ -648,7 +648,8 @@ class DsaMetadataBuilder:
             if new_cache_slots is not None:
                 # Mirrors the C++ CHECK_EQ(write_idx, query_total_tokens)
                 # safety net: a length mismatch silently corrupts SWA slots
-                # (symptoms identical to the pre-X25 truncation bug).
+                # (block-parallel draft rows whose distinct positions cannot
+                # be recovered from q_start all collapse onto one slot).
                 logger.warning(
                     "DSA SWA new_cache_slots length mismatch: "
                     "len=%s, query_total_tokens=%s; falling back to "
