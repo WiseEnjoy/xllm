@@ -24,6 +24,7 @@ from xllm.python.attention.backend import (
     normalize_layer_caches,
 )
 from xllm.python.layers.attention import Attention
+from xllm.python.model_executor import step_timer
 from xllm.python.model_executor.forward_context import LayerSynchronizer
 from xllm.python.model_executor.runners.eager import EagerRunner
 from xllm.python.platform import current_platform
@@ -121,6 +122,13 @@ class ModelExecutor:
     ) -> None:
         self.model = model
         self._kv_bound = False
+        # Speculative-decoding draft executors (DSpark/DFlash) run their own
+        # eager forwards; the step timer labels their events separately from
+        # target-side prefill/eager-fallback forwards.
+        model_type = str(config.get("model_type", "")).lower()
+        self._timer_is_draft = (
+            "dspark" in model_type or "dflash" in model_type
+        )
 
         attention_layers = [
             module for module in model.modules() if isinstance(module, Attention)
@@ -270,9 +278,13 @@ class ModelExecutor:
             graph_runner.warmup(
                 input_ids.device, input_ids.dtype, input_embedding
             )
-            return graph_runner.execute(
+            step_timer.mark_event(step_timer.EVENT_VERIFY_FILL)
+            result = graph_runner.execute(
                 input_ids, positions, metadata, input_embedding
             )
+            step_timer.mark_event(step_timer.EVENT_REPLAY)
+            step_timer.finish_step()
+            return result
         if self.inductor_runner is not None:
             return self.inductor_runner.execute(
                 input_ids,
@@ -281,10 +293,17 @@ class ModelExecutor:
                 input_embedding,
                 layer_synchronizer,
             )
-        return self.eager_runner.execute(
-            input_ids,
-            positions,
-            metadata,
-            input_embedding,
-            layer_synchronizer,
-        )
+        phase = (step_timer.PHASE_DRAFT_HOST if self._timer_is_draft
+                 else step_timer.PHASE_TARGET_EAGER_HOST)
+        with step_timer.host_phase(phase):
+            result = self.eager_runner.execute(
+                input_ids,
+                positions,
+                metadata,
+                input_embedding,
+                layer_synchronizer,
+            )
+        step_timer.mark_event(
+            step_timer.EVENT_DRAFT if self._timer_is_draft
+            else step_timer.EVENT_TARGET_EAGER)
+        return result

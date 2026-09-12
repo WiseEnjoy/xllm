@@ -41,6 +41,7 @@ from xllm.python.attention.expanded_decode_metadata import (
     ExpandedDecodeMetadata,
     resolve_expanded_decode_metadata,
 )
+from xllm.python.model_executor import step_timer
 from xllm.python.model_executor.forward_context import (
     AclGraphCaptureContext,
     AclGraphExecutionState,
@@ -547,9 +548,10 @@ class DecodeAclGraphRunner(BaseRunner):
         assert self._update_stream is not None
         assert self._replay_done_event is not None
 
-        self._fill_entry(
-            entry, input_ids, positions, metadata, batch_size, input_embedding
-        )
+        with step_timer.host_phase(step_timer.PHASE_FILL_HOST):
+            self._fill_entry(
+                entry, input_ids, positions, metadata, batch_size, input_embedding
+            )
 
         prepare_context = ForwardContext(
             self.attention_backend,
@@ -564,11 +566,13 @@ class DecodeAclGraphRunner(BaseRunner):
         # so the refresh always sees the real positions.
         if entry.static_metadata.multi_block_tables is not None:
             entry.static_metadata.dsa_positions = entry.static_positions
-        with forward_context(prepare_context):
-            self.attention_backend.prepare(
-                entry.static_metadata, graph_mode=True
-            )
+        with step_timer.host_phase(step_timer.PHASE_REFRESH_HOST):
+            with forward_context(prepare_context):
+                self.attention_backend.prepare(
+                    entry.static_metadata, graph_mode=True
+                )
         if first_capture:
+            step_timer.note_capture()
             self._capture(entry)
 
         # Replay on the CURRENT (compute) stream. The dedicated capture
@@ -577,17 +581,18 @@ class DecodeAclGraphRunner(BaseRunner):
         # HCCL collectives with eagerly-enqueued HCCL (prefill all-reduces,
         # H2D fills) on ONE stream -- two streams sharing one HCCL
         # communicator under concurrency corrupts its state (507011, X6).
-        entry.graph.replay()
-        raw_output = entry.static_output
-        if isinstance(raw_output, tuple):
-            # Aux-hidden-capture targets (DSpark/DFlash/Eagle3) return
-            # (hidden_states, aux_hidden_states); slice both on replay and
-            # let the C++ side unpack the tuple.
-            output = tuple(
-                t[:batch_size].clone() for t in raw_output if torch.is_tensor(t)
-            )
-        else:
-            output = raw_output[:batch_size].clone()
+        with step_timer.host_phase(step_timer.PHASE_REPLAY_HOST):
+            entry.graph.replay()
+            raw_output = entry.static_output
+            if isinstance(raw_output, tuple):
+                # Aux-hidden-capture targets (DSpark/DFlash/Eagle3) return
+                # (hidden_states, aux_hidden_states); slice both on replay and
+                # let the C++ side unpack the tuple.
+                output = tuple(
+                    t[:batch_size].clone() for t in raw_output if torch.is_tensor(t)
+                )
+            else:
+                output = raw_output[:batch_size].clone()
 
         # A captured FIA task waits on its update event before execution.  This
         # lets replay run concurrently with the host-side updates for later

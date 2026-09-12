@@ -17,6 +17,7 @@ from __future__ import annotations
 import torch
 
 from xllm.python.attention.backend import AttentionMetadata
+from xllm.python.model_executor import step_timer
 from xllm.python.model_executor.cp_utils import build_cp_context
 from xllm.python.model_executor.forward_context import (
     ForwardContext,
@@ -54,7 +55,8 @@ class EagerRunner(BaseRunner):
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
     ) -> torch.Tensor:
-        self.attention_backend.prepare(metadata)
+        with step_timer.host_phase(step_timer.PHASE_EAGER_PREPARE_HOST):
+            self.attention_backend.prepare(metadata)
 
         cp_context = None
         if self.cp_size > 1 and metadata.is_prefill:
