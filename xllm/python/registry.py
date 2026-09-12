@@ -111,5 +111,9 @@ def _register_builtin_models() -> None:
         "deepseek_v32_mtp",
     )
 
+    from xllm.python.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+    register_model("deepseek_v4")(DeepseekV4ForCausalLM)
+
 
 _register_builtin_models()
