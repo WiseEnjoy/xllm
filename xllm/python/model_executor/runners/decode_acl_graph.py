@@ -37,6 +37,7 @@ import torch.nn as nn
 
 from xllm.python import kernels
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata
+from xllm.python.attention.dsa_attention import _DRAFT_EXPLICIT_INDICES
 from xllm.python.attention.expanded_decode_metadata import (
     ExpandedDecodeMetadata,
     resolve_expanded_decode_metadata,
@@ -92,6 +93,10 @@ class _StaticAttentionMetadata:
     dsa_graph_mode: bool = False
     max_query_len: int = 1
     max_seq_len: int = 1
+    # Framework-provided SWA write slots for the current batch (padded to
+    # the bucket, -1 for padding lanes); the refresh passes them to the
+    # DSA metadata builder so block-parallel rows keep distinct slots.
+    new_cache_slots: torch.Tensor | None = None
 
 
 class _DecodeGraphEntry:
@@ -103,6 +108,7 @@ class _DecodeGraphEntry:
         "static_positions",
         "static_input_embedding",
         "static_metadata",
+        "static_new_cache_slots",
         "kv_seq_lens_delta",
         "graph_tasks",
         "execution_state",
@@ -157,17 +163,31 @@ class DecodeAclGraphRunner(BaseRunner):
         is_expanded_spec_verify = (
             resolve_expanded_decode_metadata(metadata) is not None
         )
+        # DSpark draft (COMPATIBILITY geometry): the chunked-prefill batch
+        # expands every draft block row into its own q_len=1 sequence, so
+        # the one-token-per-sequence decode contract holds -- only the
+        # explicit-indices attention route makes it graph-capturable.
+        is_draft_expanded = (
+            _DRAFT_EXPLICIT_INDICES
+            and getattr(self.attention_backend, "_dspark_block_size", 0) > 0
+            and not metadata.is_prefill
+            and metadata.is_chunked_prefill
+        )
         return (
             (
                 (not metadata.is_prefill and not metadata.is_chunked_prefill)
                 or is_expanded_spec_verify
+                or is_draft_expanded
             )
             and self._has_compatible_decode_metadata(input_ids, metadata)
             and (
                 input_embedding is None
                 or input_embedding.shape[0] == batch_size
             )
-            and bucket_size <= self.max_batch
+            and (
+                bucket_size <= self.max_batch
+                or (is_draft_expanded and batch_size <= self.max_batch)
+            )
         )
 
     def _decode_metadata(
@@ -663,6 +683,7 @@ class DecodeAclGraphRunner(BaseRunner):
         entry.batch_size = padded_batch_size
         entry.graph = None
         entry.static_output = None
+        entry.static_new_cache_slots = None
         entry.graph_tasks = []
         entry.execution_state = AclGraphExecutionState({})
         entry.static_input_ids = torch.zeros(
@@ -869,6 +890,37 @@ class DecodeAclGraphRunner(BaseRunner):
                 dst.fill_(-1)
                 cols = min(src.shape[1], dst.shape[1])
                 dst[:batch_size, :cols].copy_(src[:batch_size, :cols])
+
+            # Preserve the framework-provided new_cache_slots for the
+            # refresh's SWA slot build. Without them the builder's fallback
+            # derives each row's slot from ctx_len - q_len, which collapses
+            # the DSpark draft's block-parallel rows (they share one KV
+            # length) onto a single slot. Padding to the bucket width with
+            # -1 keeps the builder's length check on the padded batch and
+            # leaves padding lanes scatter-guarded. Gated to draft runners
+            # only: the target verify keeps its existing (validated)
+            # fallback, whose incremental per-row lengths already resolve
+            # distinct slots.
+            if getattr(self.attention_backend, "_dspark_block_size", 0) > 0:
+                new_slots = getattr(metadata, "new_cache_slots", None)
+                if new_slots is not None and new_slots.numel() > 0:
+                    if (
+                        entry.static_new_cache_slots is None
+                        or entry.static_new_cache_slots.numel()
+                        < padded_batch_size
+                    ):
+                        entry.static_new_cache_slots = torch.full(
+                            (self.max_batch,), -1, dtype=torch.int32
+                        )
+                    entry.static_new_cache_slots.fill_(-1)
+                    entry.static_new_cache_slots[: new_slots.numel()].copy_(
+                        new_slots.to(torch.int32).cpu()
+                    )
+                    static_metadata.new_cache_slots = (
+                        entry.static_new_cache_slots[:padded_batch_size]
+                    )
+                else:
+                    static_metadata.new_cache_slots = None
 
         # Padded lanes must remain valid inputs for sparse MLA tiling.  Their
         # token and slot mapping are dummy values, so one KV token is safe.

@@ -278,6 +278,15 @@ class ModelExecutor:
             graph_runner.warmup(
                 input_ids.device, input_ids.dtype, input_embedding
             )
+            if self._timer_is_draft:
+                # The draft may itself replay through a graph (explicit
+                # indices); keep the step timer's event sequence uniform by
+                # marking its completion as the draft event either way.
+                result = graph_runner.execute(
+                    input_ids, positions, metadata, input_embedding
+                )
+                step_timer.mark_event(step_timer.EVENT_DRAFT)
+                return result
             step_timer.mark_event(step_timer.EVENT_VERIFY_FILL)
             result = graph_runner.execute(
                 input_ids, positions, metadata, input_embedding

@@ -57,15 +57,18 @@ from xllm.python.platform import current_platform
 from xllm.python import dsa_dump
 from scripts.logger import logger
 
-# DSA_DRAFT_EXPLICIT_INDICES=1 routes the eager DSpark draft attention
-# through explicit per-row slot indices (ori_sparse_indices) instead of the
-# prefill encoding over the raw ring table, mirroring the reference DSpark
-# implementations: the window->slot resolution happens in index construction
-# (torch ops) and the kernel never interprets the ring table. Numerically
-# gated: eager A/B must show bit-exact greedy output and unchanged
-# acceptance before this becomes a default.
+# DSA_DRAFT_EXPLICIT_INDICES routes the DSpark draft attention through
+# explicit per-row logical-position indices (ori_sparse_indices) instead of
+# the prefill encoding over the raw ring table, mirroring the reference
+# DSpark implementations: the window->slot resolution happens in index
+# construction (torch ops) and the kernel never interprets the ring table.
+# Validated end to end (bit-exact greedy outputs, unchanged acceptance,
+# perfect verbatim recall) including ring tables up to 4K-token sequences;
+# it also makes the draft forward decode-encoded and graph-capturable,
+# which removes most of the draft's unoverlapped host dispatch from the
+# decode step. Set to 0 to fall back to the eager prefill-encoding draft.
 _DRAFT_EXPLICIT_INDICES = os.environ.get(
-    "DSA_DRAFT_EXPLICIT_INDICES", "0"
+    "DSA_DRAFT_EXPLICIT_INDICES", "1"
 ) == "1"
 
 if TYPE_CHECKING:
@@ -736,20 +739,16 @@ class DsaAttentionBackend(AttentionBackend):
         if (
             _DRAFT_EXPLICIT_INDICES
             and self._dspark_block_size > 0
-            and not self._graph_mode
             and use_prefill_attn
             and not is_prefill
             and compress_ratio == 1
         ):
-            (
-                draft_grid,
-                draft_topk_length,
-                draft_view_table,
-            ) = self._build_draft_swa_indices(metadata, seq_kv)
-            if draft_grid is not None:
-                # The kernel resolves logical positions through the table;
-                # the ring must be presented in logical view.
-                ori_block_table_for_attn = draft_view_table
+            # Both eager and graph mode: the grid build is pure device ops
+            # on persistent tensors, so the captured forward replays it
+            # against the refreshed table and KV lengths.
+            draft_grid, draft_topk_length = self._build_draft_swa_indices(
+                ori_block_table, seq_kv
+            )
         out, _lse = _sparse_attn_sharedkv(
             _dump_layer=layer,
             q=q,
@@ -1152,74 +1151,61 @@ class DsaAttentionBackend(AttentionBackend):
 
     def _build_draft_swa_indices(
         self,
-        metadata: "AttentionMetadata",
+        ori_block_table: torch.Tensor | None,
         seq_kv: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[None, None, None]:
-        """Explicit logical-position indices for the DSpark draft (row, 1, W).
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
+        """Explicit logical-position indices for the DSpark draft (rows, 1, W).
 
         Port of the reference DSpark index construction onto the
         sparse_flash_mla SWA-sparse-ori contract: every expanded row of a
         draft block sees the trailing ``window_size`` prefix tokens plus the
         WHOLE draft block (non-causal), i.e. logical positions
         ``[end - (window + block), end)`` with ``end`` the group's shared KV
-        length. Entries are ABSOLUTE logical positions (the kernel resolves
-        them through the block table); columns beyond the visible length are
+        length. Entries are ABSOLUTE logical positions; the kernel resolves
+        them through the block table. Columns beyond the visible length are
         -1 with the per-row count in the returned topk_length.
 
-        The ring table cannot be passed as-is: the kernel direct-indexes
-        ``block_table[pos // block_size]`` without the ring modulo (verified
-        on device: wrong data past the first wrap, then out-of-bounds
-        crash). Returns a logical-view table -- the ring expanded to the
-        full logical block width via the placeholder-stable modulo
-        ``(pos // 128) % width`` -- which restores correct addressing while
-        staying pure torch (graph-capturable).
+        Reads the REBUILT per-manager SWA table (the builder maps logical
+        block column j to the ring physical column j % width, so the
+        kernel's direct ``bt[pos // 128]`` addressing is correct for the
+        trailing draft window). Everything is a device op on persistent
+        tensors -- no host reads, no data-dependent shapes -- so the path is
+        ACL-graph capturable. Rows whose window fell entirely on invalid
+        table entries (graph bucket padding keeps the dummy KV length with
+        an all-invalid table) get a zero topk length so the kernel reads
+        nothing through them; their outputs are sliced off on replay.
         """
-        raw_tables = getattr(metadata, "multi_block_tables", None) or []
-        if not raw_tables:
-            return None, None, None
-        raw_bt = raw_tables[0]  # SWA-only draft: manager 0 is the SWA table
-        if raw_bt.numel() == 0:
-            return None, None, None
+        if ori_block_table is None or ori_block_table.numel() == 0:
+            return None, None
         device = seq_kv.device
         rows = int(seq_kv.numel())
-        block = self._dspark_block_size
-        window = self.window_size
-        min_width = window + block
+        if rows < 1 or ori_block_table.size(0) < rows:
+            return None, None
         width = self._draft_index_width()
-        table_width = int(raw_bt.size(1))
-        if table_width <= 0:
-            return None, None, None
+        min_width = self.window_size + max(self._dspark_block_size, 1)
 
-        row_bt = raw_bt.to(device=device, dtype=torch.int64)
-        if row_bt.size(0) != rows:
-            # Per-sequence table (one row per draft block): broadcast each
-            # sequence's row to its `block` expanded rows.
-            seq_idx = (
-                torch.arange(rows, device=device, dtype=torch.int64) // block
-            ).clamp(max=row_bt.size(0) - 1)
-            row_bt = row_bt.index_select(0, seq_idx)
-
+        row_bt = ori_block_table[:rows].to(device=device, dtype=torch.int64)
         ends = seq_kv.to(device=device, dtype=torch.int64)
         starts = (ends - min_width).clamp(min=0)
         visible = (ends - starts).to(torch.int32)
         cols = torch.arange(width, device=device, dtype=torch.int64)
         pos = starts.unsqueeze(1) + cols.unsqueeze(0)
         col_ok = cols.unsqueeze(0) < (ends - starts).unsqueeze(1)
+        # Resolve each column's block entry to detect padding rows (their
+        # tables are all-invalid). The clamp only guards the gather against
+        # out-of-bounds columns on rows whose positions already fail
+        # col_ok; live rows always index inside the rebuilt width.
+        table_cols = int(row_bt.size(1))
+        blk_col = (pos // 128).clamp(max=table_cols - 1)
+        blk = torch.gather(row_bt, 1, blk_col)
+        row_ok = ((blk >= 0) | ~col_ok).all(dim=1)
         indices = torch.where(
-            col_ok, pos, torch.full_like(pos, -1)
+            col_ok & row_ok.unsqueeze(1), pos, torch.full_like(pos, -1)
         ).to(torch.int32).unsqueeze(1)
-
-        # Logical-view table: expand the ring to one column per logical
-        # block of the longest row so block_table[pos // 128] direct-indexes
-        # correctly for any sequence length.
-        logical_blocks = int(int(ends.max().item()) + 127) // 128
-        logical_blocks = max(logical_blocks, 1)
-        view_cols = (
-            torch.arange(logical_blocks, device=device, dtype=torch.int64)
-            % table_width
-        )
-        view_table = row_bt.index_select(1, view_cols).to(torch.int32)
-        return indices, visible.reshape(-1, 1), view_table
+        topk_length = torch.where(
+            row_ok, visible, torch.zeros_like(visible)
+        ).reshape(-1, 1)
+        return indices, topk_length
 
     def _decode_window_compact_eager(
         self,
