@@ -192,6 +192,11 @@ struct ModelArgs {
   PROPERTY(float, beta_fast) = 0.0f;
   PROPERTY(float, beta_slow) = 0.0f;
   PROPERTY(std::string, scale_fmt);
+  // Quantization method declared by the checkpoint's nested
+  // quantization_config (e.g. "fp8" for DeepSeek-V4 MXFP8/MXFP4 official
+  // releases). Filled by WorkerImpl::init_model; empty for checkpoints
+  // without a quantization_config block (e.g. external W8A8 re-quants).
+  PROPERTY(std::string, weight_quant_method);
   PROPERTY(int32_t, hc_mult) = 0;
   PROPERTY(int32_t, hc_sinkhorn_iters) = 0;
   PROPERTY(float, hc_eps) = 1e-6f;

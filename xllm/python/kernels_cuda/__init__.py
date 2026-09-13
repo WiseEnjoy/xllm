@@ -56,6 +56,7 @@ from .moe import (
     grouped_moe,
     grouped_moe_with_selected_experts,
     moe_fused_topk,
+    mxfp4_moe_with_selected_experts,
     prepare_grouped_moe_weights,
     supports_cutlass_moe,
 )
@@ -102,6 +103,7 @@ __all__ = [
     "fused_moe",
     "grouped_moe",
     "grouped_moe_with_selected_experts",
+    "mxfp4_moe_with_selected_experts",
     "prepare_grouped_moe_weights",
     "supports_cutlass_moe",
     "prepare_row_parallel_weight",

@@ -32,6 +32,7 @@ from __future__ import annotations
 # FakeTensor implementations of the C++ operators. Imported first so that a
 # graph capture reaching any kernel below finds a registered fake.
 from . import _custom_op  # noqa: F401
+from . import mxfp  # noqa: F401
 from .activation import silu_and_mul
 from .attention import (
     reshape_paged_cache,
@@ -70,6 +71,7 @@ from .moe import (
     grouped_moe,
     grouped_moe_with_selected_experts,
     moe_fused_topk,
+    mxfp4_moe_with_selected_experts,
     prepare_grouped_moe_weights,
     supports_cutlass_moe,
 )
@@ -120,6 +122,7 @@ __all__ = [
     "fused_moe",
     "grouped_moe",
     "grouped_moe_with_selected_experts",
+    "mxfp4_moe_with_selected_experts",
     "prepare_grouped_moe_weights",
     "supports_cutlass_moe",
     "prepare_row_parallel_weight",

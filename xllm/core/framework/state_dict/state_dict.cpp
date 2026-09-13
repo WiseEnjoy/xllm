@@ -51,6 +51,11 @@ torch::ScalarType get_dtype(const Dtype& dtype) {
       return torch::kFloat8_e5m2;
     case Dtype::F8_E4M3:
       return torch::kFloat8_e4m3fn;
+    case Dtype::F8_E8M0:
+      // UE8M0 is a pure-exponent 1-byte format; expose the raw bits as
+      // uint8 so Python consumers can reinterpret (value = 2^(byte - 127)).
+      // torch itself has no float8_e8m0 dtype on this toolchain.
+      return torch::kUInt8;
     case Dtype::I16:
       return torch::kInt16;
     case Dtype::F16:

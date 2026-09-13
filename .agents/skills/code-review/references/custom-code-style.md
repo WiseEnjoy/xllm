@@ -381,3 +381,8 @@ print(f"[INFO] build start: device={device}")   # diagnostic via print
 logger.warning("[WARN] missing --device")       # duplicated level prefix
 logger.info("build failed, exiting")            # wrong level for a failure
 ```
+
+## 13. Shell 操作纪律（执行环境规则）
+
+- **`pgrep`/`ps | grep` 会匹配到自身所在的 shell 命令行**（bash -c 的 argv 里含关键词），导致误判“进程仍在运行”。判断后台进程存活必须用 `pgrep -f "<pattern>" | grep -v $$` 或先拿 PID 再 `ps -p <PID>`，禁止直接 `pgrep -f <脚本名>` 后当作存活证据。
+- **后台长任务必须落盘日志 + 短轮询**：`nohup ... > log 2>&1 &` 后立即返回，用固定间隔（如 15-30s）轮询日志/端口，绝不 sleep 挂死单条命令直到工具超时。

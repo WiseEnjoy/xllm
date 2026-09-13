@@ -33,8 +33,17 @@ from xllm.python.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4RotaryEmbedding,
     RMSNorm,
+    _mxfp_runtime_available,
 )
 from xllm.python.layers import ColumnParallelLinear
+
+# MXFP8 modules only exist for FP8 checkpoints; the guarded import keeps
+# W8A8-only deployments working when the MX dtypes or compiled kernels are
+# unavailable.
+try:
+    from xllm.python.models.dsv4_mxfp import MXFP8DynamicLinear
+except Exception:  # pragma: no cover - MXFP unavailable on this build
+    MXFP8DynamicLinear = None  # type: ignore[assignment,misc]
 
 
 class DSV4DSparkMarkovHead(nn.Module):
@@ -87,9 +96,15 @@ class DSV4DSparkModel(nn.Module):
         super().__init__()
         self.cfg = cfg
         capture_count = cfg.dspark_num_layers
-        self.main_proj = nn.Linear(
-            cfg.hidden_size * capture_count, cfg.hidden_size, bias=False,
-            dtype=dtype, device=device)
+        if cfg.use_mxfp:
+            self.main_proj = MXFP8DynamicLinear(
+                cfg.hidden_size * capture_count, cfg.hidden_size, device,
+                transpose_weight_after_loading=False,
+            )
+        else:
+            self.main_proj = nn.Linear(
+                cfg.hidden_size * capture_count, cfg.hidden_size, bias=False,
+                dtype=dtype, device=device)
         self.main_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
         self.rotary = DeepseekV4RotaryEmbedding(
             cfg.qk_rope_head_dim, cfg.max_position_embeddings,
@@ -171,6 +186,11 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
     def __init__(self, config: dict) -> None:
         super().__init__()
         self.cfg = DeepseekV4Config.from_dict(config)
+        if self.cfg.use_mxfp and not _mxfp_runtime_available():
+            raise RuntimeError(
+                "This checkpoint uses the FP8 (MXFP8/MXFP4) weight format, "
+                "but the MXFP modules are unavailable in this build."
+            )
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         device = torch.device(config.get("device", "npu:0"))
         self.model = DSV4DSparkModel(self.cfg, dtype, device)
@@ -187,6 +207,9 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
 
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
         loader = W8A8WeightLoader(self, state_dicts, tp_size, tp_rank)
+        if self.cfg.use_mxfp:
+            self._load_mxfp_weights(loader)
+            return
         n_layers = self.cfg.dspark_num_layers
         last = n_layers - 1
 
@@ -304,6 +327,200 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
         for module in self.modules():
             if hasattr(module, "process_weights_after_loading"):
                 module.process_weights_after_loading()
+
+    def _load_mxfp_weights(self, loader: W8A8WeightLoader) -> None:
+        """Load the DSpark draft from an official FP8 checkpoint."""
+        cfg = self.cfg
+        n_layers = cfg.dspark_num_layers
+        last = n_layers - 1
+
+        def _has(name: str) -> bool:
+            return loader.find(name) is not None
+
+        def _cp(ckpt_key: str, param_name: str,
+                shard_dim: int | None = None) -> None:
+            if not _has(ckpt_key):
+                return
+            t = loader.load_tensor(ckpt_key)
+            if shard_dim is not None:
+                t = loader.shard(t, dim=shard_dim)
+            loader.copy_in(param_name, t)
+
+        def _mxfp8(ckpt_prefix: str, param_prefix: str,
+                   shard_dims: dict | None = None) -> None:
+            weight = loader.load_tensor(ckpt_prefix + ".weight")
+            scale = loader.load_tensor(ckpt_prefix + ".scale")
+            dim = (shard_dims or {}).get("weight")
+            if dim is not None:
+                weight = loader.shard(weight, dim=dim)
+                scale = loader.shard(scale, dim=dim)
+            loader.copy_in(param_prefix + ".weight", weight)
+            loader.copy_in(param_prefix + ".weight_scale", scale)
+
+        for i in range(n_layers):
+            ck = f"mtp.{i}."
+            pm = f"model.layers.{i}."
+            layer = self.model.layers[i]
+            attn = layer.self_attn
+            _mxfp8(ck + "attn.wq_a", pm + "self_attn.q_a_proj")
+            _mxfp8(ck + "attn.wq_b", pm + "self_attn.q_b_proj",
+                   {"weight": 0})
+            _mxfp8(ck + "attn.wkv", pm + "self_attn.kv_proj")
+            _mxfp8(ck + "attn.wo_a", pm + "self_attn.o_a_proj", {"weight": 0})
+            loader.copy_in(
+                pm + "self_attn.o_b_proj.weight",
+                loader.load_tensor(ck + "attn.wo_b.weight"),
+            )
+            loader.copy_in(
+                pm + "self_attn.o_b_proj.weight_scale",
+                loader.load_tensor(ck + "attn.wo_b.scale"),
+            )
+            _cp(ck + "attn.q_norm.weight", pm + "self_attn.q_a_layernorm.weight")
+            _cp(ck + "attn.kv_norm.weight", pm + "self_attn.kv_a_layernorm.weight")
+            if _has(ck + "attn.attn_sink"):
+                sink = loader.load_tensor(ck + "attn.attn_sink")
+                if (sink.dim() == 1 and sink.size(0) == cfg.n_heads
+                        and cfg.tp_size > 1):
+                    shard_size = cfg.n_heads // cfg.tp_size
+                    sink = sink.narrow(
+                        0, cfg.tp_rank * shard_size, shard_size)
+                loader.copy_in(pm + "self_attn.attn_sink", sink)
+            _cp(ck + "attn_norm.weight", pm + "input_layernorm.weight")
+            _cp(ck + "ffn_norm.weight", pm + "post_attention_layernorm.weight")
+            _cp(ck + "hc_attn_fn", pm + "hc.hc_attn_fn")
+            _cp(ck + "hc_attn_base", pm + "hc.hc_attn_base")
+            _cp(ck + "hc_attn_scale", pm + "hc.hc_attn_scale")
+            _cp(ck + "hc_ffn_fn", pm + "hc.hc_ffn_fn")
+            _cp(ck + "hc_ffn_base", pm + "hc.hc_ffn_base")
+            _cp(ck + "hc_ffn_scale", pm + "hc.hc_ffn_scale")
+            self._load_mxfp_moe(loader, ck, pm, layer)
+            # Explicit per-module processing (the main model's pattern): a
+            # modules() walk would invoke both the attention module and its
+            # children, double-processing the non-idempotent shards.
+            attn.process_weights_after_loading()
+            layer.mlp.process_weights_after_loading()
+
+        # main_proj / main_norm from mtp.0 (FP8 projection in this format).
+        loader.copy_in(
+            "model.main_proj.weight",
+            loader.load_tensor("mtp.0.main_proj.weight"),
+        )
+        loader.copy_in(
+            "model.main_proj.weight_scale",
+            loader.load_tensor("mtp.0.main_proj.scale"),
+        )
+        _cp("mtp.0.main_norm.weight", "model.main_norm.weight")
+
+        # norm / hc_head / markov / confidence from last layer.
+        _cp(f"mtp.{last}.norm.weight", "model.norm.weight")
+        _cp(f"mtp.{last}.hc_head_fn", "model.hc_head_fn")
+        _cp(f"mtp.{last}.hc_head_base", "model.hc_head_base")
+        _cp(f"mtp.{last}.hc_head_scale", "model.hc_head_scale")
+        _cp(f"mtp.{last}.markov_head.markov_w1.weight", "markov_head.markov_w1.weight")
+        _cp(f"mtp.{last}.markov_head.markov_w2.weight", "markov_head.markov_w2.weight")
+        _cp(f"mtp.{last}.confidence_head.proj.weight", "confidence_head.proj.weight")
+        _cp(f"mtp.{last}.confidence_head.proj.bias", "confidence_head.proj.bias")
+
+        # Vocabulary: dedicated mtp.0.embed wins over shared top-level embed.
+        # The draft embed is NOT TP-sharded (full hidden width), so the
+        # top-level fallback must not be narrowed either.
+        if _has("mtp.0.embed.weight"):
+            embed_t = loader.load_tensor("mtp.0.embed.weight")
+        else:
+            embed_t = loader.load_tensor("embed.weight")
+        if embed_t.size(1) != cfg.hidden_size and embed_t.size(0) == cfg.hidden_size:
+            embed_t = embed_t.t().contiguous()
+        if (embed_t.size(1) == cfg.hidden_size
+                and embed_t.size(1) != self.get_parameter("model.embed_tokens.weight").size(1)):
+            embed_t = loader.shard(embed_t, dim=1)
+        loader.copy_in("model.embed_tokens.weight", embed_t)
+
+        # LM head: dedicated mtp.<last>.head wins over shared top-level head.
+        head_t = None
+        if _has(f"mtp.{last}.head.weight"):
+            head_t = loader.load_tensor(f"mtp.{last}.head.weight")
+        elif _has("head.weight"):
+            head_t = loader.load_tensor("head.weight")
+        if head_t is not None:
+            if head_t.size(0) == cfg.vocab_size:
+                head_t = loader.shard(head_t, dim=0)
+            loader.copy_in("lm_head.weight", head_t)
+
+        # Post-load processing for the FP8 main projection (layers and MoE
+        # were already processed explicitly inside the loop above).
+        self.model.main_proj.process_weights_after_loading()
+
+    def _load_mxfp_moe(self, loader: W8A8WeightLoader, ck: str, pm: str, layer) -> None:
+        """Load one draft MoE layer from packed-fp4 + MXFP8 shared experts."""
+        mlp = layer.mlp
+
+        def _has(name: str) -> bool:
+            return loader.find(name) is not None
+
+        if _has(ck + "ffn.gate.weight"):
+            loader.copy_in(pm + "mlp.gate.weight",
+                           loader.load_tensor(ck + "ffn.gate.weight"))
+        if getattr(mlp, "hash_layer", False):
+            tid2eid_key = ck + "ffn.gate.tid2eid"
+            if not _has(tid2eid_key):
+                tid2eid_key += ".weight"
+            if _has(tid2eid_key):
+                loader.copy_in(pm + "mlp.tid2eid", loader.load_tensor(tid2eid_key))
+        else:
+            bias_key = ck + "ffn.gate.bias"
+            if not _has(bias_key):
+                bias_key = ck + "ffn.gate.e_score_correction_bias"
+            if _has(bias_key):
+                loader.copy_in(pm + "mlp.e_score_correction_bias",
+                               loader.load_tensor(bias_key))
+        tp = mlp.moe_tp_size
+        tp_rank = mlp.moe_tp_rank
+        start = mlp.start_expert_id
+        nepr = mlp.num_experts_per_rank
+        w13 = self.get_parameter(pm + "mlp.experts_w13")
+        w2 = self.get_parameter(pm + "mlp.experts_w2")
+        w13_scale = self.get_buffer(pm + "mlp.experts_w13_scale")
+        w2_scale = self.get_buffer(pm + "mlp.experts_w2_scale")
+        for local_idx in range(nepr):
+            global_id = start + local_idx
+            e = ck + f"ffn.experts.{global_id}."
+            w13_j = torch.cat(
+                [loader.load_tensor(e + "w1.weight"),
+                 loader.load_tensor(e + "w3.weight")], dim=0)
+            w2_j = loader.load_tensor(e + "w2.weight")
+            s13 = torch.cat(
+                [loader.load_tensor(e + "w1.scale"),
+                 loader.load_tensor(e + "w3.scale")], dim=0)
+            s2 = loader.load_tensor(e + "w2.scale")
+            if tp > 1:
+                w13_j = loader.shard(w13_j, dim=0, world=tp, rank=tp_rank)
+                s13 = loader.shard(s13, dim=0, world=tp, rank=tp_rank)
+                w2_j = loader.shard(w2_j, dim=1, world=tp, rank=tp_rank)
+                s2 = loader.shard(s2, dim=1, world=tp, rank=tp_rank)
+            w13[local_idx].copy_(w13_j.to(w13.dtype))
+            w2[local_idx].copy_(w2_j.to(w2.dtype))
+            w13_scale[local_idx].copy_(s13.to(w13_scale.dtype))
+            w2_scale[local_idx].copy_(s2.to(w2_scale.dtype))
+        se = ck + "ffn.shared_experts."
+        if _has(se + "w1.weight"):
+            se_w13 = torch.cat(
+                [loader.load_tensor(se + "w1.weight"),
+                 loader.load_tensor(se + "w3.weight")], dim=0)
+            se_s13 = torch.cat(
+                [loader.load_tensor(se + "w1.scale"),
+                 loader.load_tensor(se + "w3.scale")], dim=0)
+            if tp > 1:
+                se_w13 = loader.shard(se_w13, dim=0, world=tp, rank=tp_rank)
+                se_s13 = loader.shard(se_s13, dim=0, world=tp, rank=tp_rank)
+            loader.copy_in(pm + "mlp.shared_experts.gate_up_proj.weight", se_w13)
+            loader.copy_in(pm + "mlp.shared_experts.gate_up_proj.weight_scale", se_s13)
+            se_w2 = loader.load_tensor(se + "w2.weight")
+            se_s2 = loader.load_tensor(se + "w2.scale")
+            if tp > 1:
+                se_w2 = loader.shard(se_w2, dim=1, world=tp, rank=tp_rank)
+                se_s2 = loader.shard(se_s2, dim=1, world=tp, rank=tp_rank)
+            loader.copy_in(pm + "mlp.shared_experts.down_proj.weight", se_w2)
+            loader.copy_in(pm + "mlp.shared_experts.down_proj.weight_scale", se_s2)
 
     def _load_dspark_moe(self, loader, ck: str, pm: str, layer) -> None:
         """Load the draft layer's MoE (per-expert w1+w3->w13, EP sharding)."""
