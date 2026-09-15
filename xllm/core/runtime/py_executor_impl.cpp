@@ -101,6 +101,12 @@ PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
     }
     return tensor;
   });
+  m.def("moe_ep_hccl_comm_name", []() {
+    if (active_py_causal_lm != nullptr) {
+      return active_py_causal_lm->moe_ep_hccl_comm_name();
+    }
+    return std::string();
+  });
   m.def("mega_moe_context_tensor", [](int64_t max_num_tokens_per_rank) {
     if (active_py_causal_lm != nullptr) {
       return active_py_causal_lm->mega_moe_context_tensor(

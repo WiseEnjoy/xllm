@@ -117,6 +117,13 @@ class DSV4DSparkModel(nn.Module):
             DeepseekV4DecoderLayer(cfg, i, dtype, device)
             for i in range(capture_count)
         ])
+        # The draft's fused-MegaMoe path stays off: the draft MoE may have a
+        # different expert geometry than the target, and keeping the fused
+        # operator on the target-only path bounds the integration surface.
+        from xllm.python.models.deepseek_v4 import DeepseekV4MoE
+        for layer in self.layers:
+            if isinstance(layer.mlp, DeepseekV4MoE):
+                layer.mlp._megamoe_enabled = False
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
         # hc_head: merge hc_mult streams (matches C++ hc_head_fn/base/scale).
         self.hc_head_fn = nn.Parameter(
@@ -235,10 +242,6 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
                 dim = (shard_dims or {}).get(suffix)
                 if dim is not None:
                     t = loader.shard(t, dim=dim)
-                import sys
-                p = self.get_parameter(f"{param_prefix}.{suffix}") if f"{param_prefix}.{suffix}" in dict(self.named_parameters()) else self.get_buffer(f"{param_prefix}.{suffix}")
-                if t.shape != p.shape:
-                    print(f"[DSPARK-LOAD] MISMATCH {ckpt_key}: ckpt {list(t.shape)} vs param {list(p.shape)}", file=sys.stderr, flush=True)
                 loader.copy_in(f"{param_prefix}.{suffix}", t)
 
         # Draft layers from mtp.<i>.*

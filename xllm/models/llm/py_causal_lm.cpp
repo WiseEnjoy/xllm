@@ -137,7 +137,15 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
     // allreduce, matching the Qwen C++ FusedMoEImpl timing. The context
     // is created via the name-based lookup (HcclCommGetHandleWithName)
     // which resolves the same underlying c10d communicator.
-    if (::xllm::KernelConfig::get_instance().enable_mega_moe()) {
+    // DISABLED 2026-09-15: the dedicated AIV-mode comm
+    // (hcclOpExpansionMode=3) makes HcclCreateOpResCtx fail with
+    // HCCL_E_NOT_SUPPORT (result=5) on CANN 9.1.0, killing all ranks
+    // during construction. Python models (deepseek_v4) build their
+    // MegaMoe context via the glue (get_symm_buffer_for_mega_moe) on
+    // the STANDARD c10d comm, which only needs
+    // moe_ep_hccl_comm_name()/moe_ep_all_reduce() from this class;
+    // mega_moe_context_tensor() is not referenced by any model.
+    if (false && ::xllm::KernelConfig::get_instance().enable_mega_moe()) {
       MegaMoeCommSpec spec;
       spec.group_name = moe_ep_group_->hccl_comm_name(/*init_comm=*/true);
       // Extract the native HcclComm from the c10d ProcessGroupHCCL. The
@@ -146,15 +154,11 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
       // creates it with hcclOpExpansionMode=3 + capped buffer). The c10d
       // comm's standard mode does not support HcclCreateOpResCtx(AIV).
       spec.hccl_comm = moe_ep_group_->acquire_mega_moe_hccl_comm();
-      LOG(INFO) << "MEGAMOE-CTOR group='" << spec.group_name
-                << "' dedicated_hccl_comm=" << spec.hccl_comm;
       spec.ep_world_size = moe_ep_group_->world_size();
       spec.device_index = device_.index();
       spec.max_num_tokens_per_rank =
           ::xllm::SchedulerConfig::get_instance().max_tokens_per_batch();
       mega_moe_comm_ = moe_ep_group_->acquire_mega_moe_comm_resource(spec);
-      LOG(INFO) << "MegaMoe context initialized at PyCausalLM construction: "
-                << "comm=" << (mega_moe_comm_ != nullptr ? "OK" : "FAILED");
     }
   }
   moe_tp_size_ = (moe_tp_group_ != nullptr) ? moe_tp_group_->world_size() : 1;
@@ -280,6 +284,8 @@ py::dict PyCausalLM::build_config_dict(
                           ? false
                           : ExecutionConfig::get_instance().enable_graph();
   d["enable_mega_moe"] = ::xllm::KernelConfig::get_instance().enable_mega_moe();
+  d["megamoe_max_tokens_per_rank"] =
+      ::xllm::KernelConfig::get_instance().megamoe_max_tokens_per_rank();
   d["python_graph_backend"] =
       requires_eager_execution
           ? std::string("off")
@@ -429,6 +435,13 @@ void PyCausalLM::moe_ep_all_reduce(torch::Tensor& tensor) {
   if (moe_ep_group_ != nullptr) {
     moe_ep_group_->allreduce(tensor);
   }
+}
+
+std::string PyCausalLM::moe_ep_hccl_comm_name() {
+  if (moe_ep_group_ != nullptr) {
+    return moe_ep_group_->hccl_comm_name(false);
+  }
+  return std::string();
 }
 
 torch::Tensor PyCausalLM::mega_moe_context_tensor(

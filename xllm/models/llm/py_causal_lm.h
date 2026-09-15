@@ -104,6 +104,12 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
   void moe_tp_all_reduce(torch::Tensor& tensor);
   void moe_ep_all_reduce(torch::Tensor& tensor);
 
+  // HCCL comm name of the native MoE EP group. The fused MoE operator
+  // resolves its communication handle from the HCCL group-name registry, so a
+  // Python caller can reuse the native EP communicator (instead of creating a
+  // second one) by passing this name. Empty when the EP group is unavailable.
+  std::string moe_ep_hccl_comm_name();
+
   // MegaMoe bridge: build (or reuse) the HCCL communication resource for the
   // EP group and return the int32 context tensor the aclnnMegaMoe operator
   // consumes. Returns an undefined tensor when the EP group is unavailable.

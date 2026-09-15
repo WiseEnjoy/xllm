@@ -34,6 +34,7 @@ linear / MLP / MoE / YaRN-RoPE / weight-loader primitives from
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import os
 import threading
 from typing import Any
 
@@ -181,6 +182,9 @@ class DeepseekV4Config:
     # "fp8" selects the MXFP8/MXFP4 path (official DeepSeek-V4 releases);
     # anything else keeps the legacy W8A8 dynamic-quant path.
     weight_quant_method: str = ""
+    # Fused MegaMoe EP path (KernelConfig gflags -> py_causal_lm config dict).
+    enable_mega_moe: bool = False
+    megamoe_max_tokens_per_rank: int = 512
     tp_size: int = 1
     tp_rank: int = 0
     moe_tp_size: int = 1
@@ -302,6 +306,10 @@ class DeepseekV4Config:
             dspark_num_layers=int(d.get("dspark_num_layers", 0)),
             markov_rank=int(d.get("markov_rank", d.get("dspark_markov_rank", 0))),
             weight_quant_method=str(d.get("weight_quant_method") or ""),
+            enable_mega_moe=bool(_pick(d, "enable_mega_moe", default=False)),
+            megamoe_max_tokens_per_rank=int(
+                _pick(d, "megamoe_max_tokens_per_rank", default=512)
+            ),
         )
 
     @property
@@ -1305,6 +1313,10 @@ class DeepseekV4MoE(nn.Module):
     FusedMoEImpl::forward_with_selected_experts.
     """
 
+    # EP-comm-name -> (mega_moe callable, symm buffer). All MoE layers share
+    # one fused-operator comm context per native EP communicator.
+    _megamoe_buffers: dict = {}
+
     def __init__(self, cfg: DeepseekV4Config, layer_id: int, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.cfg = cfg
@@ -1331,6 +1343,22 @@ class DeepseekV4MoE(nn.Module):
         self.inter_local = inter_local
         self.ep_size = ep_size
         self.ep_rank = ep_rank
+
+        # Fused MegaMoe EP path (optional): the fused dispatch+GEMM+combine
+        # operator reuses the native EP communicator and replaces the routed
+        # experts' grouped-matmul chain and EP all-reduce. Driven by the xllm
+        # --enable_mega_moe / --megamoe_max_tokens_per_rank flags (KernelConfig
+        # -> py_causal_lm config dict); batches wider than the row cap fall
+        # back to the grouped path (the operator's symm buffer is sized once
+        # for the configured row cap). Supported with both MXFP (Ascend950)
+        # and W8A8 checkpoints; per-device vendor support is the glue's call.
+        self._megamoe_max_rows = max(1, int(cfg.megamoe_max_tokens_per_rank))
+        self._megamoe_enabled = (
+            cfg.enable_mega_moe
+            and self.ep_size > 1
+            and self.moe_tp_size == 1
+        )
+        self._megamoe_state = None
 
         # Gate weight [n_total_experts, hidden] float32 (replicated, not sharded).
         self.gate = nn.Linear(cfg.hidden_size, cfg.n_routed_experts, bias=False, dtype=torch.float32, device=device)
@@ -1451,6 +1479,20 @@ class DeepseekV4MoE(nn.Module):
             self.experts_w2_scale = kernels.mxfp.prepare_mxfp4_scale(
                 self.experts_w2_scale
             )
+            if self._megamoe_enabled:
+                # The fused operator consumes the same NZ_C0_32 weight storage
+                # as the grouped-matmul antiquant path: re-view the weights to
+                # [experts, N, K/2] (undoing the antiquant transpose) and the
+                # scales to [experts, N, K/64, 2] (undoing the strided view).
+                # Zero-copy: both consumers share the loaded tensors.
+                self._megamoe_w13 = self.experts_w13.data.transpose(1, 2)
+                self._megamoe_w2 = self.experts_w2.data.transpose(1, 2)
+                self._megamoe_w13_sf = self.experts_w13_scale.transpose(
+                    -3, -2
+                ).view(torch.float8_e8m0fnu)
+                self._megamoe_w2_sf = self.experts_w2_scale.transpose(
+                    -3, -2
+                ).view(torch.float8_e8m0fnu)
         else:
             # Transpose [expert, out, in] -> [expert, in, out] (matching C++
             # ensure_group_gemm_weight_layout). NO NZ — C++ forward_expert path
@@ -1459,8 +1501,150 @@ class DeepseekV4MoE(nn.Module):
             self.experts_w2.data = self.experts_w2.data.transpose(1, 2).contiguous()
             self.experts_w13_scale.data = self.experts_w13_scale.data.squeeze(-1).contiguous()
             self.experts_w2_scale.data = self.experts_w2_scale.data.squeeze(-1).contiguous()
+            if self._megamoe_enabled:
+                # W8A8 MegaMoe (dispatch_quant_mode=2, vendor A2/A3
+                # semantics): the fused operator consumes the same int8
+                # weights + per-channel float32 scales as the grouped-matmul
+                # antiquant path; re-view the weights to [experts, N, K]
+                # (undoing the grouped-layout transpose). Zero-copy views,
+                # mirroring the MXFP branch.
+                self._megamoe_w13 = self.experts_w13.data.transpose(1, 2)
+                self._megamoe_w2 = self.experts_w2.data.transpose(1, 2)
+                self._megamoe_w13_sf = self.experts_w13_scale.data
+                self._megamoe_w2_sf = self.experts_w2_scale.data
         self.shared_experts.process_weights_after_loading()
 
+
+    def _megamoe_routed(
+        self, hidden: torch.Tensor, topk_weights: torch.Tensor, topk_idx: torch.Tensor
+    ) -> torch.Tensor:
+        """Routed experts through the fused MegaMoe operator.
+
+        Takes the global (unmasked) routing outputs; the operator performs
+        dispatch + expert FFN + combine across the EP group internally.
+        """
+        import torch_npu
+
+        if self._megamoe_state is None:
+            self._init_megamoe(hidden.device)
+        mega_moe, sym_buffer = self._megamoe_state
+        if self.use_mxfp:
+            # MXFP route (Ascend950): packed FP4 weights + ue8m0 scale
+            # factors, FP8-E4M3 dispatch quantization.
+            routed, _ = mega_moe(
+                hidden,
+                topk_idx.to(torch.int32),
+                topk_weights.to(torch.bfloat16),
+                [self._megamoe_w13],
+                [self._megamoe_w2],
+                sym_buffer,
+                l1_weights_sf=[self._megamoe_w13_sf],
+                l2_weights_sf=[self._megamoe_w2_sf],
+                activation="swiglu",
+                activation_clamp=self.cfg.swiglu_limit,
+                weight1_type=torch_npu.float4_e2m1fn_x2,
+                weight2_type=torch_npu.float4_e2m1fn_x2,
+            )
+        else:
+            # W8A8 route: int8 weights + per-channel float32 scales, int8
+            # dispatch quantization (vendor A2/A3 dispatch_quant_mode=2).
+            routed, _ = mega_moe(
+                hidden,
+                topk_idx.to(torch.int32),
+                topk_weights.to(torch.bfloat16),
+                [self._megamoe_w13],
+                [self._megamoe_w2],
+                sym_buffer,
+                l1_weights_sf=[self._megamoe_w13_sf],
+                l2_weights_sf=[self._megamoe_w2_sf],
+                activation="swiglu",
+                activation_clamp=self.cfg.swiglu_limit,
+                weight1_type=torch.int8,
+                weight2_type=torch.int8,
+            )
+        return routed
+
+    def _init_megamoe(self, device: torch.device) -> None:
+        """Build the fused-operator state once, on the native EP communicator.
+
+        The vendor glue resolves the HCCL handle from the group-name registry,
+        so a duck-typed group backed by the native MoE EP process group lets
+        the operator share the existing communicator instead of creating a
+        second one. The symm buffer is cached on the class: every MoE layer
+        has identical operator parameters and reuses the same comm context.
+        """
+        import torch_npu
+
+        import xllm_runtime
+        from cann_ops_transformer.ops.mc2.mega_moe import (
+            get_symm_buffer_for_mega_moe,
+            mega_moe,
+        )
+
+        # A communicator that never ran a collective may report an empty name;
+        # warm the native EP group first.
+        warm = torch.zeros(1, device=device)
+        xllm_runtime.moe_ep_all_reduce(warm)
+        comm_name = xllm_runtime.moe_ep_hccl_comm_name()
+        if not comm_name:
+            raise RuntimeError("native MoE EP group has no HCCL comm name")
+
+        cached = DeepseekV4MoE._megamoe_buffers.get(comm_name)
+        if cached is None:
+            class _Backend:
+                def __init__(self, comm_name: str) -> None:
+                    self._comm_name = comm_name
+
+                def get_hccl_comm_name(
+                    self, rank: int, init_comm: bool = False
+                ) -> str:
+                    return self._comm_name
+
+            class _Group:
+                """Stand-in backed by the native MoE EP process group."""
+
+                def __init__(self, rank: int, size: int, comm_name: str) -> None:
+                    self._rank = rank
+                    self._size = size
+                    self._backend = _Backend(comm_name)
+
+                def _get_backend(self, device: torch.device) -> "_Backend":
+                    return self._backend
+
+            group = _Group(self.ep_rank, self.ep_size, comm_name)
+            # torch.distributed validates that a group was created through
+            # new_group; the glue only needs rank/size from those helpers, so
+            # answer for the native group during this one construction call.
+            real_get_rank = torch.distributed.get_rank
+            real_get_world_size = torch.distributed.get_world_size
+            torch.distributed.get_rank = lambda g: self.ep_rank
+            torch.distributed.get_world_size = lambda g: self.ep_size
+            try:
+                if self.use_mxfp:
+                    # MXFP: FP8-E4M3 dispatch quant (mode 4).
+                    dispatch_quant_mode = 4
+                    dispatch_quant_out_dtype = torch.float8_e4m3fn
+                else:
+                    # W8A8: int8 dispatch quant with per-channel weight
+                    # scales (mode 2, vendor A2/A3 semantics).
+                    dispatch_quant_mode = 2
+                    dispatch_quant_out_dtype = torch.int8
+                sym_buffer = get_symm_buffer_for_mega_moe(
+                    group,
+                    num_experts=self.num_total_experts,
+                    num_max_tokens_per_rank=self._megamoe_max_rows,
+                    num_topk=self.topk,
+                    hidden=self.cfg.hidden_size,
+                    intermediate_hidden=self.cfg.moe_intermediate_size,
+                    dispatch_quant_mode=dispatch_quant_mode,
+                    dispatch_quant_out_dtype=dispatch_quant_out_dtype,
+                )
+            finally:
+                torch.distributed.get_rank = real_get_rank
+                torch.distributed.get_world_size = real_get_world_size
+            cached = (mega_moe, sym_buffer)
+            DeepseekV4MoE._megamoe_buffers[comm_name] = cached
+        self._megamoe_state = cached
 
     def forward(self, hidden: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
         from xllm.python import kernels
@@ -1498,6 +1682,23 @@ class DeepseekV4MoE(nn.Module):
                 eps=1e-20, group_select_mode=1, renorm=renorm, norm_type=norm_type,
                 out_flag=False,
             )
+
+        # 2) Fused MegaMoe path: the operator consumes the global (unmasked)
+        # routing, dispatches each token to its experts across the EP group on
+        # the native EP communicator, and returns the combined output on every
+        # rank — the routed EP all-reduce disappears from this layer.
+        # The comm context is built on the first forward of any batch size
+        # (eager prefill included) so that decode-graph capture never has to
+        # allocate communication resources inside its capture window.
+        if self._megamoe_enabled:
+            if self._megamoe_state is None:
+                self._init_megamoe(hidden.device)
+            if hidden.size(0) <= self._megamoe_max_rows:
+                routed_out = self._megamoe_routed(hidden, topk_weights, topk_idx)
+                shared_out = self.shared_experts(hidden)
+                if self.moe_tp_size > 1:
+                    distributed.moe_tp_all_reduce(shared_out)
+                return routed_out + shared_out
 
         # 2) EP: zero out non-local expert weights (C++ fused_moe.cpp:843-850).
         ep_size = self.cfg.ep_size if self.cfg.ep_size > 0 else self.cfg.tp_size
