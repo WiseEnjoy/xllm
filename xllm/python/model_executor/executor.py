@@ -267,14 +267,6 @@ class ModelExecutor:
         if graph_runner is not None and graph_runner.can_execute(
             input_ids, metadata, input_embedding
         ):
-            self._graph_steps = getattr(self, "_graph_steps", 0) + 1
-            if self._graph_steps % 200 == 1:
-                from scripts.logger import logger
-
-                logger.info(
-                    f"decode via acl graph: step={self._graph_steps} "
-                    f"batch={input_ids.numel()}"
-                )
             graph_runner.warmup(
                 input_ids.device, input_ids.dtype, input_embedding
             )

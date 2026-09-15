@@ -1394,18 +1394,6 @@ class DsaAttentionBackend(AttentionBackend):
                 state.persistent_buffers[("win_src_all",)] = merged_buf
         else:
             merged_buf.copy_(unique.to(self.device), non_blocking=True)
-        # Host-side OOB diagnostic: the SWA pool is the smallest cache;
-        # indices beyond it would read out of bounds in the graph gather.
-        pool_slots = 74 * 128  # swa_cache=[74, 128, 1, 512]
-        if int(unique.max().item()) >= pool_slots:
-            from scripts.logger import logger
-
-            logger.error(
-                "WINDOW-SRC OOB (host): max_idx=%s pool=%s sample=%s "
-                "kv_lens=%s",
-                int(unique.max().item()), pool_slots,
-                unique.flatten()[:8].tolist(), list(kv_seq_lens[:4]),
-            )
 
     def _graph_window_compact(
         self,
