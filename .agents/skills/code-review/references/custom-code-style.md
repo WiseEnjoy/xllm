@@ -386,3 +386,9 @@ logger.info("build failed, exiting")            # wrong level for a failure
 
 - **`pgrep`/`ps | grep` 会匹配到自身所在的 shell 命令行**（bash -c 的 argv 里含关键词），导致误判“进程仍在运行”。判断后台进程存活必须用 `pgrep -f "<pattern>" | grep -v $$` 或先拿 PID 再 `ps -p <PID>`，禁止直接 `pgrep -f <脚本名>` 后当作存活证据。
 - **后台长任务必须落盘日志 + 短轮询**：`nohup ... > log 2>&1 &` 后立即返回，用固定间隔（如 15-30s）轮询日志/端口，绝不 sleep 挂死单条命令直到工具超时。
+
+## 14. 容器环境的 NPU 限制（执行环境规则）
+
+- **`npu-smi set -t reset` 在容器内不可用**（报 "This command cannot be executed on a container"）。NPU 级重置（reset/功率/时钟等 set 类操作）只能由宿主机执行，容器内只能查询（`npu-smi info`）。
+- **HCCL channel 资源泄漏的容器内恢复手段有限**：`Acquire HCCL channel failed, ret: 4` / `HcclCreateOpResCtx failed` 通常由 kill -9 的进程残留导致。容器内只能：①确保杀干净相关进程（含 forkserver 子进程）+ 等待设备回收（观察 `npu-smi info` HBM 回落）；②清理 `/dev/shm` 非 xllm 残留与 torch_extensions JIT 缓存；③泄漏不恢复时，唯一彻底手段是**请求宿主机管理员重置对应卡**，或重启容器。
+- 推论：**不要 kill -9 带 HCCL 通信的进程**（会造成上述泄漏）；测试脚本要处理 SIGTERM 优雅退出，或用 `timeout` 包裹让进程自然结束。
