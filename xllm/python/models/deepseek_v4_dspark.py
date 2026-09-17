@@ -70,22 +70,31 @@ class DSV4DSparkMarkovHead(nn.Module):
 
 
 class DSV4DSparkConfidenceHead(nn.Module):
-    """Sigmoid confidence from concat(hidden, markov_embed)."""
+    """Sigmoid confidence from concat(hidden, markov_embed).
+
+    Runs in the model dtype (bf16), matching the C++ head
+    (dspark_confidence_head.h casts the checkpoint weight to the model
+    options and converts both concat inputs to the weight dtype) and
+    vllm-ascend (bf16 ReplicatedLinear); only the sigmoid output is
+    promoted to FP32 per the [num_reqs] probability contract.
+    """
 
     def __init__(self, hidden_size: int, markov_rank: int, with_markov: bool,
-                 device: torch.device) -> None:
+                 dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.with_markov = with_markov
         input_size = hidden_size + markov_rank if with_markov else hidden_size
-        self.proj = nn.Linear(input_size, 1, bias=True, dtype=torch.float32, device=device)
+        self.proj = nn.Linear(input_size, 1, bias=True, dtype=dtype, device=device)
 
     def forward(self, hidden: torch.Tensor,
                 markov_embedding: torch.Tensor | None) -> torch.Tensor:
         if self.with_markov:
             if markov_embedding is None:
                 raise ValueError("DSpark confidence head requires markov embeddings")
-            hidden = torch.cat((hidden, markov_embedding), dim=-1)
-        return torch.sigmoid(self.proj(hidden.float())).squeeze(-1).to(torch.float32)
+            hidden = torch.cat(
+                (hidden, markov_embedding.to(hidden.dtype)), dim=-1
+            )
+        return torch.sigmoid(self.proj(hidden)).squeeze(-1).to(torch.float32)
 
 
 class DSV4DSparkModel(nn.Module):
@@ -207,7 +216,7 @@ class DeepseekV4DSparkForCausalLM(PyModelBase):
             self.cfg.vocab_size, self.cfg.markov_rank, dtype, device)
         self.confidence_head = DSV4DSparkConfidenceHead(
             self.cfg.hidden_size, self.cfg.markov_rank,
-            with_markov=True, device=device)
+            with_markov=True, dtype=dtype, device=device)
         self.lm_head = ColumnParallelLinear(
             self.cfg.hidden_size, self.cfg.vocab_size // self.cfg.tp_size,
             self.cfg.tp_size, gather_output=True, dtype=dtype, device=device)
