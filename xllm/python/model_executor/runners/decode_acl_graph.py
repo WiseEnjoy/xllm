@@ -627,6 +627,22 @@ class DecodeAclGraphRunner(BaseRunner):
             self._replay_done_event.record(torch.npu.current_stream())
         return output
 
+    def _pinned_stage(self, cpu_tensor: torch.Tensor) -> torch.Tensor:
+        """Return a pinned-memory view holding ``cpu_tensor``'s contents.
+
+        A CPU->NPU ``copy_`` from pageable memory blocks on a stream
+        synchronize; staging through a reusable pinned buffer keeps the
+        device-side upload asynchronous (``non_blocking=True``).
+        """
+        buf = getattr(self, "_pinned_stage_buffer", None)
+        numel = cpu_tensor.numel()
+        if buf is None or buf.numel() < numel or buf.dtype != cpu_tensor.dtype:
+            buf = torch.empty(max(numel, 1), dtype=cpu_tensor.dtype).pin_memory()
+            self._pinned_stage_buffer = buf
+        view = buf[:numel].view(cpu_tensor.shape)
+        view.copy_(cpu_tensor)
+        return view
+
     @staticmethod
     def _graph_key(
         padded_batch_size: int,
@@ -868,9 +884,19 @@ class DecodeAclGraphRunner(BaseRunner):
                 src_bt.shape[1],
                 static_metadata.block_table.shape[1],
             )
-            static_metadata.block_table[:batch_size, :copy_cols].copy_(
-                src_bt[:batch_size, :copy_cols]
-            )
+            dst_bt = static_metadata.block_table[:batch_size, :copy_cols]
+            src_rows = src_bt[:batch_size, :copy_cols]
+            if src_rows.device.type == "cpu":
+                # The framework exports the DSA manager tables as CPU
+                # tensors, and a pageable H2D copy_ blocks on a stream
+                # sync -- while the speculative draft still occupies the
+                # compute stream, which serializes the whole fill. Stage
+                # through pinned memory so the upload stays asynchronous.
+                dst_bt.copy_(
+                    self._pinned_stage(src_rows), non_blocking=True
+                )
+            else:
+                dst_bt.copy_(src_rows)
             if padded_batch_size > batch_size:
                 static_metadata.block_table[batch_size:].zero_()
 
