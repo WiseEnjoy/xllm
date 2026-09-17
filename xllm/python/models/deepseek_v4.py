@@ -1128,10 +1128,26 @@ class DeepseekV4Indexer(nn.Module):
             # length (kernel reads sequsedQ[bIdx] directly, preferring it
             # over cu_seqLens_q). cu_seqLens_q is the (B+1,) prefix sum of
             # query tokens with index 0 fixed to 0.
-            seqused_q = dsa.seq_lens_q.to(torch.int32)
-            seqused_k = (key_seq_lens // cmp_ratio).to(torch.int32)
-            cmp_residual_k = (key_seq_lens % cmp_ratio).to(torch.int32)
-            cu_seq_lens_q = dsa.actual_seq_lengths_query.to(torch.int32)
+            # The int32 conversions depend only on the per-forward DSA
+            # metadata; every ratio-4 layer shares it, so convert once per
+            # forward instead of once per layer.
+            meta_cache = getattr(self, "_qli_v2_meta", None)
+            if meta_cache is not None and meta_cache[0] is dsa:
+                (
+                    seqused_q,
+                    seqused_k,
+                    cmp_residual_k,
+                    cu_seq_lens_q,
+                ) = meta_cache[1]
+            else:
+                seqused_q = dsa.seq_lens_q.to(torch.int32)
+                seqused_k = (key_seq_lens // cmp_ratio).to(torch.int32)
+                cmp_residual_k = (key_seq_lens % cmp_ratio).to(torch.int32)
+                cu_seq_lens_q = dsa.actual_seq_lengths_query.to(torch.int32)
+                self._qli_v2_meta = (
+                    dsa,
+                    (seqused_q, seqused_k, cmp_residual_k, cu_seq_lens_q),
+                )
             topk, _ = kernels.quant_lightning_indexer_v2(
                 q_quant,
                 index_cache,

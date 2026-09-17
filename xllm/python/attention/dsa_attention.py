@@ -1418,6 +1418,37 @@ class DsaAttentionBackend(AttentionBackend):
         n_seqs = seq_kv.size(0)
         device = ori_kv.device
 
+        # Per-forward derived tensors (k / valid / seqused / block table)
+        # depend only on seq_kv and the bucket geometry; every layer of the
+        # forward shares them, so compute once per (seq_kv, n_blocks) instead
+        # of once per layer. Identity-keyed with a strong reference, same
+        # pattern as the rope chunk cache.
+        n_blocks = (
+            (win + block_size - 1) // block_size * n_seqs
+            if win != block_size
+            else n_seqs
+        )
+        state = getattr(self, "_win_compact_state", None)
+        if (
+            state is None
+            or state[0] is not seq_kv
+            or state[1] != n_blocks
+            or state[2] != win
+        ):
+            k = seq_kv.clamp(max=win).to(torch.int64)  # (B,)
+            offs = torch.arange(win, device=device).unsqueeze(0)  # (1, W)
+            valid = offs < k.unsqueeze(1)  # (B, W)
+            seqused = k.to(torch.int32)
+            bt = torch.arange(
+                n_blocks, device=device, dtype=torch.int32
+            ).reshape(n_seqs, -1)
+            zero_scalar = torch.zeros((), dtype=ori_kv.dtype, device=device)
+            self._win_compact_state = (
+                seq_kv, n_blocks, win, k, valid, seqused, bt, zero_scalar,
+            )
+        else:
+            _, _, _, k, valid, seqused, bt, zero_scalar = state
+
         src_all = get_execution_buffer(
             ("win_src_all",),
             lambda: torch.zeros(
@@ -1427,31 +1458,18 @@ class DsaAttentionBackend(AttentionBackend):
         row_map = getattr(self, "_win_src_row_map", None)
         row = row_map[layer_id] if row_map and layer_id < len(row_map) else 0
         src_idx = src_all[row]  # (B, W) view into the merged buffer
-        offs = torch.arange(win, device=device).unsqueeze(0)  # (1, W)
-        k = seq_kv.clamp(max=win).to(torch.int64)  # (B,)
-        valid = offs < k.unsqueeze(1)  # (B, W)
-
         kv_flat = ori_kv.reshape(-1, head_dim)
         # Safety clamp: out-of-bounds gather indices produce device error
         # 507011 (no .item() here -- this runs inside the captured graph).
         src_idx = src_idx.clamp(0, kv_flat.size(0) - 1)
         gathered = kv_flat[src_idx]  # (B, W, D)
-        compact = torch.where(
-            valid.unsqueeze(-1),
-            gathered,
-            torch.zeros((), dtype=ori_kv.dtype, device=device),
-        )
+        compact = torch.where(valid.unsqueeze(-1), gathered, zero_scalar)
         # One window-sized block per sequence: (B, bs, 1, D) with bs == win.
         compact_kv = compact.reshape(n_seqs, block_size, 1, head_dim) \
             if win == block_size else compact.reshape(
                 n_seqs * ((win + block_size - 1) // block_size),
                 block_size, 1, head_dim,
             )
-        n_blocks = compact_kv.size(0)
-        bt = torch.arange(
-            n_blocks, device=device, dtype=torch.int32
-        ).reshape(n_seqs, -1)
-        seqused = k.to(torch.int32)
         return compact_kv, bt, seqused
 
     def _persist_tensor(self, key: tuple[object, ...], tensor: torch.Tensor) -> torch.Tensor:
@@ -1780,6 +1798,36 @@ def _get_layer_cache_tensor(
     return layer_tensors[layer_id][cache_idx]
 
 
+_SLOT_GUARD_CACHE_MAX = 16
+_slot_guard_cache: list[
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+] = []
+
+
+def _slot_guard_tensors(
+    slot_mapping: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Derive (int64 slots, clamped slots, validity mask) once per slot tensor.
+
+    The metadata builder shares one slot tensor per cache group across all
+    layers of the group, so deriving per scatter call re-runs the int64
+    cast, the clamp, and the compare for every layer. Identity-keyed
+    caching computes them once per group per forward; entries hold strong
+    references (tensor ids cannot be reused while cached) and the cache
+    is bounded, so eviction only costs a recompute.
+    """
+    for entry in _slot_guard_cache:
+        if entry[0] is slot_mapping:
+            return entry[1], entry[2], entry[3]
+    slots = slot_mapping.reshape(-1).to(torch.long).to(device)
+    safe_slots = slots.clamp_min(0)
+    valid_mask = (slots >= 0).unsqueeze(1)
+    _slot_guard_cache.append((slot_mapping, slots, safe_slots, valid_mask))
+    if len(_slot_guard_cache) > _SLOT_GUARD_CACHE_MAX:
+        _slot_guard_cache.pop(0)
+    return slots, safe_slots, valid_mask
+
+
 def _scatter_by_slot(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -1801,13 +1849,6 @@ def _scatter_by_slot(
         return
     value_2d = value.reshape(-1, value.size(-1))
     cache_2d = cache.view(-1, value_2d.size(1))
-    slots = slot_mapping.reshape(-1).to(torch.long).to(cache.device)
-    update_rows = min(slots.size(0), value_2d.size(0))
-    if update_rows <= 0:
-        return
-
-    slots_slice = slots[:update_rows]
-    value_slice = value_2d[:update_rows]
 
     if cache.device.type != "cpu":
         # Faithful port of C++ scatter_by_slot (deepseek_sparse_attention.cpp:230-235):
@@ -1815,14 +1856,29 @@ def _scatter_by_slot(
         # unchanged, then scatter_nd_update.
         from xllm.python import kernels
 
-        safe_slots = slots_slice.clamp_min(0)
-        valid_mask = (slots_slice >= 0).unsqueeze(1)
+        slots, safe_slots_all, valid_mask_all = _slot_guard_tensors(
+            slot_mapping, cache.device
+        )
+        update_rows = min(slots.size(0), value_2d.size(0))
+        if update_rows <= 0:
+            return
+        safe_slots = safe_slots_all[:update_rows]
+        valid_mask = valid_mask_all[:update_rows]
+        value_slice = value_2d[:update_rows]
         old_values = cache_2d.index_select(0, safe_slots)
         safe_values = torch.where(valid_mask, value_slice, old_values)
         kernels.scatter_nd_update(
             cache_2d, safe_slots.reshape(-1, 1), safe_values
         )
         return
+
+    slots = slot_mapping.reshape(-1).to(torch.long).to(cache.device)
+    update_rows = min(slots.size(0), value_2d.size(0))
+    if update_rows <= 0:
+        return
+
+    slots_slice = slots[:update_rows]
+    value_slice = value_2d[:update_rows]
 
     valid_mask = slots_slice >= 0
     valid_slots = slots_slice[valid_mask]
