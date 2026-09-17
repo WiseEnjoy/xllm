@@ -468,6 +468,26 @@ class DeepseekV4HyperConnection(nn.Module):
                 nn.Parameter(torch.empty(3, dtype=torch.float32, device=device)),
             )
 
+    def process_weights_after_loading(self) -> None:
+        """Pre-cast the gating projection to the kernel's BF16 contract.
+
+        The hc_pre kernel runs the [mix_hc, hc_dim] gating projection on a
+        BF16 cube (the reduction accumulates in FP32 internally), casting
+        the FP32 checkpoint storage on every call otherwise -- twice per
+        layer per step. The pre-cast applies the identical rounding once,
+        so outputs stay bit-equal. hc_scale/hc_base stay FP32: the
+        sinkhorn stage requires FP32 and they are tiny.
+        """
+        # Idempotency guard: a second conversion would be a no-op copy,
+        # but keep the guard explicit like the MoE adapter's.
+        if getattr(self, "_hc_fn_preconverted", False):
+            return
+        self._hc_fn_preconverted = True
+        for part in ("attn", "ffn"):
+            fn = getattr(self, f"hc_{part}_fn")
+            if fn.dtype != torch.bfloat16:
+                fn.data = fn.data.to(torch.bfloat16)
+
     def hc_pre(
         self,
         x: torch.Tensor,
@@ -2328,6 +2348,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
                     loader.load_tensor(ck + "attn.compressor.norm.weight"),
                 )
             attn.process_weights_after_loading()
+            self.model.layers[i].hc.process_weights_after_loading()
             # MoE / dense MLP weights -- DSV4 MoE uses hash routing (gate.weight
             # + gate.tid2eid) and per-expert w1/w2/w3, distinct from DSV3.2's
             # noaux_tc grouped_moe. Staged by _load_dsv4_moe below when the MoE
@@ -2487,6 +2508,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
                     loader.load_tensor(ck + "attn.compressor.norm.weight"),
                 )
             attn.process_weights_after_loading()
+            self.model.layers[i].hc.process_weights_after_loading()
             mlp = self.model.layers[i].mlp
             if hasattr(mlp, "experts_w13") and _has(ck + "ffn.experts.0.w1.weight"):
                 self._load_mxfp_moe(loader, ck, pm, i)
