@@ -488,9 +488,10 @@ class DsaAttentionBackend(AttentionBackend):
         if css is None:
             css = self._rope_stash.get("cos_sin")
         if dsa.cos_table is None and css is not None and css.numel() > 0:
-            dsa.cos_table, dsa.sin_table = (
-                tensor.contiguous() for tensor in css.chunk(2, dim=-1)
-            )
+            # Strided views suffice (same contract as the metadata builder):
+            # no consumer reads the full table; gather-first consumers select
+            # rows before any layout requirement applies.
+            dsa.cos_table, dsa.sin_table = css.chunk(2, dim=-1)
         c4css = (
             getattr(metadata, "dsa_c4_cos_sin", None)
             if metadata is not None

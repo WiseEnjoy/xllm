@@ -759,6 +759,12 @@ class DeepseekV4Attention(Attention):
         # indexer build_query path (mirrors C++ select_qli's qr/qr_pertoken_scale).
         backend._current_qr = qr
         backend._current_qr_pertoken_scale = qr_pertoken_scale
+        # Stash the interleaved per-token RoPE tables for the same purpose:
+        # C++ passes the rotary build's gathered cos/sin into select_qli, and
+        # re-gathering from the base-table views in the indexer would force a
+        # full-table materialization per layer.
+        backend._current_rope_cos = cos
+        backend._current_rope_sin = sin
         attn_out = backend.execute(q, kv_tensor, kv_tensor, self)
         # Native DSA rotates the attention output back before o_a/o_b.
         _k.npu_inplace_partial_rotary_mul(
@@ -882,6 +888,8 @@ class DeepseekV4Attention(Attention):
             qr_pertoken_scale = getattr(backend, "_current_qr_pertoken_scale", None)
             hidden = getattr(backend, "_current_hidden", None)
             kv_hidden = getattr(backend, "_current_kv_hidden", hidden)
+            rope_cos = getattr(backend, "_current_rope_cos", None)
+            rope_sin = getattr(backend, "_current_rope_sin", None)
             return self.indexer.select_qli(
                 layer_id,
                 layer_cache,
@@ -892,6 +900,8 @@ class DeepseekV4Attention(Attention):
                 qr_pertoken_scale,
                 hidden,
                 kv_hidden,
+                rope_cos,
+                rope_sin,
             )
         return None
 
@@ -966,6 +976,8 @@ class DeepseekV4Indexer(nn.Module):
         qr_pertoken_scale,
         hidden,
         kv_hidden=None,
+        rope_cos=None,
+        rope_sin=None,
     ) -> torch.Tensor:
         """Quantized lightning indexer: returns top-k compressed block indices.
 
@@ -992,41 +1004,59 @@ class DeepseekV4Indexer(nn.Module):
         else:
             q_idx = self.wq_b(qr).view(-1, self.n_head, self.head_dim)
         # --- partial RoPE on q (C++ 417-422): apply_partial_rope over
-        # [rope_start_dim:rope_start_dim+rope_head_dim]. Uses the DEFAULT RoPE
-        # table (cos/sin) indexed by positions, 2D [M, rope_dim], NOT the
-        # compressed c4 table. Mirrors C++ apply_partial_rope ->
-        # npu_inplace_partial_rotary_mul (deepseek_sparse_attention.cpp:151-190).
+        # [rope_start_dim:rope_start_dim+rope_head_dim]. C++ receives the
+        # per-token interleaved cos/sin gathered once by the attention
+        # forward's rotary build (deepseek_v4_indexer.cpp:395-421); Python
+        # mirrors that via rope_cos/rope_sin. The dsa-table fallback
+        # re-gathers per call, and index_select on the strided half-width
+        # views forces the aclnnIndexSelect dispatch to materialize the
+        # whole (max_pos, rope_dim/2) table first (~190 MB of traffic per
+        # layer), so it is kept only for callers that bypass the attention
+        # forward.
         rope_start_dim = max(self.head_dim - self.rope_dim, 0)
-        cos_table = dsa.cos_table
-        sin_table = dsa.sin_table
-        if cos_table is not None and sin_table is not None and self.rope_dim > 0:
-            cos_v = cos_table.reshape(-1, cos_table.size(-1)) if cos_table.dim() > 2 else cos_table
-            sin_v = sin_table.reshape(-1, sin_table.size(-1)) if sin_table.dim() > 2 else sin_table
-            # Per-token cos/sin indexed by positions: 2D [M, rope_dim/2] (Python
-            # DeepseekYarnRotaryEmbedding stores half-dim cos/sin, NOT interleaved).
-            pos = dsa.input_positions.to(device).reshape(-1).long()
-            cos_sel = cos_v.index_select(0, pos).to(q_idx.dtype)  # [M, rope_dim/2]
-            sin_sel = sin_v.index_select(0, pos).to(q_idx.dtype)
-            # npu_inplace_partial_rotary_mul (interleave mode) expects cos/sin
-            # [M, rope_dim] in C++ interleaved format: freqs.repeat_interleave(2)
-            # (rotary_embedding_util.cpp:135-137). The half-dim cos/sin must be
-            # repeat_interleave'd to full rope_dim. Local fix only -- do NOT change
-            # the global DeepseekYarnRotaryEmbedding cache (the attention main path
-            # uses _interleave_rope_with which consumes half-dim).
-            if cos_sel.size(-1) * 2 == self.rope_dim:
-                cos_sel = cos_sel.repeat_interleave(2, dim=-1).contiguous()
-                sin_sel = sin_sel.repeat_interleave(2, dim=-1).contiguous()
-            elif cos_sel.size(-1) != self.rope_dim:
-                raise RuntimeError(
-                    f"QRoPE cos/sin dim mismatch: cos={cos_sel.shape}, "
-                    f"rope_dim={self.rope_dim}"
+        if self.rope_dim > 0:
+            if rope_cos is not None and rope_sin is not None:
+                cos_sel = rope_cos.to(q_idx.dtype)
+                sin_sel = rope_sin.to(q_idx.dtype)
+                if cos_sel.size(-1) != self.rope_dim:
+                    raise RuntimeError(
+                        f"QRoPE cos/sin dim mismatch: cos={cos_sel.shape}, "
+                        f"rope_dim={self.rope_dim}"
+                    )
+                kernels.npu_inplace_partial_rotary_mul(
+                    q_idx, cos_sel, sin_sel, rope_start_dim, self.rope_dim
                 )
-            # In-place partial RoPE: modifies q_idx[...rope_start_dim:rope_dim]
-            # via aclnnInplacePartialRotaryMul (interleave mode).
-            from xllm.python import kernels as _pk
-            _pk.npu_inplace_partial_rotary_mul(
-                q_idx, cos_sel, sin_sel, rope_start_dim, self.rope_dim
-            )
+            elif dsa.cos_table is not None and dsa.sin_table is not None:
+                cos_v = (
+                    dsa.cos_table.reshape(-1, dsa.cos_table.size(-1))
+                    if dsa.cos_table.dim() > 2
+                    else dsa.cos_table
+                )
+                sin_v = (
+                    dsa.sin_table.reshape(-1, dsa.sin_table.size(-1))
+                    if dsa.sin_table.dim() > 2
+                    else dsa.sin_table
+                )
+                # Per-token cos/sin indexed by positions: 2D [M, rope_dim/2]
+                # (Python DeepseekYarnRotaryEmbedding stores half-dim cos/sin,
+                # NOT interleaved).
+                pos = dsa.input_positions.to(device).reshape(-1).long()
+                cos_sel = cos_v.index_select(0, pos).to(q_idx.dtype)
+                sin_sel = sin_v.index_select(0, pos).to(q_idx.dtype)
+                # npu_inplace_partial_rotary_mul (interleave mode) expects
+                # cos/sin [M, rope_dim] in C++ interleaved format:
+                # freqs.repeat_interleave(2) (rotary_embedding_util.cpp:135-137).
+                if cos_sel.size(-1) * 2 == self.rope_dim:
+                    cos_sel = cos_sel.repeat_interleave(2, dim=-1).contiguous()
+                    sin_sel = sin_sel.repeat_interleave(2, dim=-1).contiguous()
+                elif cos_sel.size(-1) != self.rope_dim:
+                    raise RuntimeError(
+                        f"QRoPE cos/sin dim mismatch: cos={cos_sel.shape}, "
+                        f"rope_dim={self.rope_dim}"
+                    )
+                kernels.npu_inplace_partial_rotary_mul(
+                    q_idx, cos_sel, sin_sel, rope_start_dim, self.rope_dim
+                )
         # --- Hadamard rotation on q (C++ 423-424). ---
         hadamard = self._get_hadamard(device)
         q_idx = _rotate_hadamard(q_idx, hadamard, self.hadamard_scale)

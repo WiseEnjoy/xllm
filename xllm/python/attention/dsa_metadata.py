@@ -263,9 +263,11 @@ class DsaMetadataBuilder:
         dsa.input_positions = positions
         dsa.is_acl_graph = enable_graph
         if dsa_cos_sin is not None and dsa_cos_sin.numel() > 0:
-            cos_sin_chunks = dsa_cos_sin.chunk(2, dim=-1)
-            dsa.cos_table = cos_sin_chunks[0].contiguous()
-            dsa.sin_table = cos_sin_chunks[1].contiguous()
+            # Keep strided half-width views: the per-layer rope selection
+            # overwrites these before any consumer runs, and materializing
+            # each (max_pos, dim/2) table per forward is pure bandwidth
+            # waste. Consumers that need contiguous rows gather first.
+            dsa.cos_table, dsa.sin_table = dsa_cos_sin.chunk(2, dim=-1)
         if positions is not None and positions.numel() > 0:
             self._build_positions(dsa, kv_seq_lens, q_lens, enable_graph)
         dsa.start_pos = (dsa.actual_seq_lengths_kv - dsa.seq_lens_q).to(
