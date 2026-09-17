@@ -268,19 +268,12 @@ class DsaAttentionBackend(AttentionBackend):
         # kernels do not guard against -1 block IDs and compute invalid
         # addresses -> device error 507011 under concurrent batches with
         # padding. The window compact's valid mask already zeroes the
-        # attention contribution of padded lanes. Builder output shares one
-        # tensor per manager across layers, so dedup by object identity to
-        # process ~6 unique tensors instead of 258 layer-cache entries.
-        _seen_bts: set[int] = set()
-        for lid in range(len(dsa_metadata.block_tables)):
-            for ci in range(len(dsa_metadata.block_tables[lid])):
-                bt = dsa_metadata.block_tables[lid][ci]
-                if bt is not None and bt.numel() > 0 and bt.device.type == "cpu":
-                    bt_id = id(bt)
-                    if bt_id in _seen_bts:
-                        continue
-                    _seen_bts.add(bt_id)
-                    bt[bt < 0] = 0
+        # attention contribution of padded lanes. The layer grids alias one
+        # tensor per manager, so remapping the unique manager tables covers
+        # every layer entry.
+        for bt in dsa_metadata.manager_block_tables:
+            if bt is not None and bt.numel() > 0 and bt.device.type == "cpu":
+                bt[bt < 0] = 0
         self._move_metadata_to_device(dsa_metadata, persistent=True)
         # AICPU tiling metadata is built IN the captured graph (see
         # prepare_dsa_metadata_for_forward), not off-graph here, so the
@@ -898,6 +891,22 @@ class DsaAttentionBackend(AttentionBackend):
                     return ci.ratio
         return 1
 
+    def _layer_manager_grid(self) -> list[list[int]]:
+        """Static per-layer cache-group ids (the layer->manager map).
+
+        Derived only from ``caches_info``, which is fixed at backend
+        construction, so the grid is computed once and reused across
+        refreshes (the per-layer rescan ran on every step).
+        """
+        grid = getattr(self, "_cached_manager_grid", None)
+        if grid is None:
+            grid = [
+                [ci.group_id for ci in layer_caches]
+                for layer_caches in self.caches_info
+            ]
+            self._cached_manager_grid = grid
+        return grid
+
     def _resolve_cache_mapping(
         self, layer_id: int, compress_ratio: int
     ) -> _DsaCacheMapping:
@@ -1354,18 +1363,26 @@ class DsaAttentionBackend(AttentionBackend):
         merged: list[torch.Tensor] = []
         seen: dict[int, int] = {}
         row_ids: list[int] = []
-        for lid in range(n_layers):
-            mapping = self._resolve_cache_mapping(
-                lid, self._layer_compress_ratio(lid)
-            )
-            ori_idx = mapping.ori_cache_idx
-            gid = (
-                self.caches_info[lid][ori_idx].group_id
-                if ori_idx >= 0
-                and lid < len(self.caches_info)
-                and ori_idx < len(self.caches_info[lid])
-                else -1 - lid
-            )
+        # The layer -> (ori cache idx, manager group id) map is static (it
+        # derives only from caches_info); resolve it once instead of per step.
+        layer_specs = getattr(self, "_cached_window_layer_specs", None)
+        if layer_specs is None or len(layer_specs) != n_layers:
+            layer_specs = []
+            for lid in range(n_layers):
+                mapping = self._resolve_cache_mapping(
+                    lid, self._layer_compress_ratio(lid)
+                )
+                ori_idx = mapping.ori_cache_idx
+                gid = (
+                    self.caches_info[lid][ori_idx].group_id
+                    if ori_idx >= 0
+                    and lid < len(self.caches_info)
+                    and ori_idx < len(self.caches_info[lid])
+                    else -1 - lid
+                )
+                layer_specs.append((ori_idx, gid))
+            self._cached_window_layer_specs = layer_specs
+        for lid, (ori_idx, gid) in enumerate(layer_specs):
             if gid in seen:
                 row_ids.append(seen[gid])
                 continue
@@ -1545,15 +1562,31 @@ class DsaAttentionBackend(AttentionBackend):
 
         for name in scalar_names:
             add(getattr(dsa, name, None), lambda v, n=name: setattr(dsa, n, v))
-        # block_tables / slot_mappings: the builder shares one CPU tensor per
-        # manager across every layer referencing it; data_ptr dedup collapses
-        # them so all layers rebind the same packed view.
-        for layer_tensors in dsa.block_tables:
-            for index, tensor in enumerate(layer_tensors):
-                add(tensor, lambda v, lt=layer_tensors, i=index: lt.__setitem__(i, v))
-        for layer_tensors in dsa.slot_mappings:
-            for index, tensor in enumerate(layer_tensors):
-                add(tensor, lambda v, lt=layer_tensors, i=index: lt.__setitem__(i, v))
+        # block_tables / slot_mappings: the layer grids alias one tensor per
+        # manager. Pack each unique manager tensor once and rebind the grids
+        # through the static layer->manager cache map; scanning the full grid
+        # re-ran the dedup key build for every aliased entry (~hundreds of
+        # redundant add() calls per refresh step).
+        manager_bts = dsa.manager_block_tables
+        manager_slots = dsa.manager_slot_mappings
+        rebind_grid: list[list[int]] | None = None
+        bt_views: list = []
+        slot_views: list = []
+        if manager_bts and manager_slots:
+            bt_views = [None] * len(manager_bts)
+            slot_views = [None] * len(manager_slots)
+            for m, tensor in enumerate(manager_bts):
+                add(tensor, lambda v, m=m: bt_views.__setitem__(m, v))
+            for m, tensor in enumerate(manager_slots):
+                add(tensor, lambda v, m=m: slot_views.__setitem__(m, v))
+            rebind_grid = self._layer_manager_grid()
+        else:
+            for layer_tensors in dsa.block_tables:
+                for index, tensor in enumerate(layer_tensors):
+                    add(tensor, lambda v, lt=layer_tensors, i=index: lt.__setitem__(i, v))
+            for layer_tensors in dsa.slot_mappings:
+                for index, tensor in enumerate(layer_tensors):
+                    add(tensor, lambda v, lt=layer_tensors, i=index: lt.__setitem__(i, v))
 
         if not specs:
             return
@@ -1598,6 +1631,27 @@ class DsaAttentionBackend(AttentionBackend):
             )
             for setter in spec["targets"]:
                 setter(view)
+
+        # Rebind the per-layer grids to the packed manager views. This MUST
+        # run after the binding loop above (the setters fill the view lists);
+        # add() skips already-on-device tensors without a setter, and a None
+        # view means the grid entry still aliases the original manager tensor,
+        # which is then already on the device.
+        if rebind_grid is not None:
+            for lid, gid_row in enumerate(rebind_grid):
+                bt_row = dsa.block_tables[lid]
+                slot_row = dsa.slot_mappings[lid]
+                for ci, gid in enumerate(gid_row):
+                    if 0 <= gid < len(bt_views):
+                        if bt_views[gid] is not None:
+                            bt_row[ci] = bt_views[gid]
+                        if gid < len(slot_views) and slot_views[gid] is not None:
+                            slot_row[ci] = slot_views[gid]
+                    elif bt_row[ci].device.type == "cpu":
+                        # Groups without an active manager keep per-entry
+                        # empty placeholders; move them like the grid scan did.
+                        bt_row[ci] = bt_row[ci].to(device)
+                        slot_row[ci] = slot_row[ci].to(device)
 
     def _move_metadata_to_device(
         self, dsa: DsaMetadata, persistent: bool = False

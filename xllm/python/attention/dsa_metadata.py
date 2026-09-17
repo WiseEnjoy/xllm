@@ -105,6 +105,12 @@ class DsaMetadata:
     # same group share the same underlying tensor (no copy).
     block_tables: list[list[torch.Tensor]] = field(default_factory=list)
     slot_mappings: list[list[torch.Tensor]] = field(default_factory=list)
+    # The unique per-manager tensors the layer grids above re-reference.
+    # Consumers that only need to move data iterate these (~a dozen entries)
+    # instead of rescanning the per-layer grid (~hundreds of entries that all
+    # alias the manager tensors).
+    manager_block_tables: list[torch.Tensor] = field(default_factory=list)
+    manager_slot_mappings: list[torch.Tensor] = field(default_factory=list)
 
     # Precomputed AICPU tiling metadata (filled by the backend, not the builder).
     c1_metadata: torch.Tensor | None = None
@@ -488,6 +494,8 @@ class DsaMetadataBuilder:
                 else:
                     dsa.block_tables[lid].append(torch.empty(0))
                     dsa.slot_mappings[lid].append(torch.empty(0))
+        dsa.manager_block_tables = list(proc_bt)
+        dsa.manager_slot_mappings = list(proc_slots)
 
     # -- per-group processing (process_group, cpp:323-362) -----------------
 
