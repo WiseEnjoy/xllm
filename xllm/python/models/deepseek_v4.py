@@ -1425,6 +1425,19 @@ class DeepseekV4MoE(nn.Module):
             and self.moe_tp_size == 1
         )
         self._megamoe_state = None
+        # Pre-quantized x dispatch (ops-transformer 3fe39d237): quantize the
+        # T-row hidden once on the host side and pass it through the MTE
+        # dispatch (mode 0), instead of the operator re-quantizing the routed
+        # T x topK expansion internally (mode 4). Bit-equivalent by
+        # construction: MX quantization is per-row per-32-group, so expanding
+        # first and quantizing later yields identical bytes. Requires the
+        # megamoe_pq_transformer operator package and the matching glue that
+        # wires the same pre-quantized dispatch mode; enabled via the
+        # XLLM_MEGAMOE_PREQUANT environment variable.
+        self._megamoe_prequant = (
+            cfg.use_mxfp
+            and os.environ.get("XLLM_MEGAMOE_PREQUANT", "0") == "1"
+        )
 
         # Gate weight [n_total_experts, hidden] float32 (replicated, not sharded).
         self.gate = nn.Linear(cfg.hidden_size, cfg.n_routed_experts, bias=False, dtype=torch.float32, device=device)
@@ -1594,6 +1607,36 @@ class DeepseekV4MoE(nn.Module):
         if self._megamoe_state is None:
             self._init_megamoe(hidden.device)
         mega_moe, sym_buffer = self._megamoe_state
+        if self.use_mxfp and self._megamoe_prequant:
+            # Quantize the T-row hidden once (matching the operator's internal
+            # mode-4 semantics: e4m3 + ue8m0 per-32-group, scale_alg=0/rint),
+            # then hand the pre-quantized tensor and scales to dispatch. The
+            # kernel emits scales packed as [T, H/64, 2]; flattened in row
+            # order that is exactly the [T, H/32] layout the operator wants.
+            x_q, x_scale = torch_npu.npu_dynamic_mx_quant(
+                hidden, dst_type=torch.float8_e4m3fn, scale_alg=0, round_mode="rint"
+            )
+            scales = (
+                x_scale.view(torch.uint8)
+                .reshape(hidden.size(0), -1)
+                .view(torch.float8_e8m0fnu)
+            )
+            routed, _ = mega_moe(
+                x_q,
+                topk_idx.to(torch.int32),
+                topk_weights.to(torch.bfloat16),
+                [self._megamoe_w13],
+                [self._megamoe_w2],
+                sym_buffer,
+                l1_weights_sf=[self._megamoe_w13_sf],
+                l2_weights_sf=[self._megamoe_w2_sf],
+                scales=scales,
+                activation="swiglu",
+                activation_clamp=self.cfg.swiglu_limit,
+                weight1_type=torch_npu.float4_e2m1fn_x2,
+                weight2_type=torch_npu.float4_e2m1fn_x2,
+            )
+            return routed
         if self.use_mxfp:
             # MXFP route (Ascend950): packed FP4 weights + ue8m0 scale
             # factors, FP8-E4M3 dispatch quantization.
@@ -1687,8 +1730,14 @@ class DeepseekV4MoE(nn.Module):
             torch.distributed.get_world_size = lambda g: self.ep_size
             try:
                 if self.use_mxfp:
-                    # MXFP: FP8-E4M3 dispatch quant (mode 4).
-                    dispatch_quant_mode = 4
+                    if self._megamoe_prequant:
+                        # Pre-quantized passthrough: x arrives as FP8-E4M3
+                        # plus E8M0 scales (3fe39d237), dispatch skips its
+                        # internal dynamic MX quantization.
+                        dispatch_quant_mode = 0
+                    else:
+                        # MXFP: FP8-E4M3 dispatch quant (mode 4).
+                        dispatch_quant_mode = 4
                     dispatch_quant_out_dtype = torch.float8_e4m3fn
                 else:
                     # W8A8: int8 dispatch quant with per-channel weight
