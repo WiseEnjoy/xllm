@@ -44,6 +44,46 @@ from scripts.build_support.utils import (
 )
 from scripts.logger import logger
 
+# ---------------------------------------------------------------------------
+# Build-time guard: skip fla_npu's embedded OPP registration (compile time only).
+#
+# The image's fla_npu wheel auto-registers its embedded OPP vendor through
+# fla_npu_opp_env.pth at interpreter startup, prepending the vendor dir to
+# ASCEND_CUSTOM_OPP_PATH. That vendor's CausalConv1d exposes 12 inputs while
+# xllm_ops' CausalConv1d has 8; when opc compiles xllm_ops it merges both into
+# its op store and rejects xllm_ops' param json ("invalid input nums[8], which
+# should be equal to input nums[12]").
+#
+# The .pth hook has already run by the time this script executes, so the
+# ASCEND_CUSTOM_OPP_PATH inherited by build children (cmake/ninja/opc) may
+# already contain fla_npu's vendor dirs. Disable the hook for any interpreter
+# spawned later by the build and strip the inherited fla_npu vendor entries so
+# child processes compile xllm_ops against a clean op store. Runtime is
+# unaffected: xllm registers fla_npu's OPP in xllm.cpp init_npu_python_runtime()
+# before aclInit (see xllm/python/_npu_bootstrap.py), and build artifacts carry
+# no build-time environment.
+# ---------------------------------------------------------------------------
+os.environ["FLA_NPU_DISABLE_PTH"] = "1"
+
+
+def _strip_fla_npu_embedded_opp_from_path() -> None:
+    """Remove fla_npu's embedded OPP vendor dirs from ASCEND_CUSTOM_OPP_PATH."""
+    opp_path = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+    if not opp_path:
+        return
+    entries = [entry for entry in opp_path.split(os.pathsep) if entry]
+    kept = [entry for entry in entries if "/fla_npu/opp/" not in entry]
+    if len(kept) != len(entries):
+        os.environ["ASCEND_CUSTOM_OPP_PATH"] = os.pathsep.join(kept)
+        logger.info(
+            "Removed %d fla_npu embedded OPP dir(s) from ASCEND_CUSTOM_OPP_PATH "
+            "for the build (FLA_NPU_DISABLE_PTH=1).",
+            len(entries) - len(kept),
+        )
+
+
+_strip_fla_npu_embedded_opp_from_path()
+
 BUILD_TEST_FILE: bool = True
 BUILD_EXPORT: bool = True
 

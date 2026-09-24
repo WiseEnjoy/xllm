@@ -1,0 +1,130 @@
+# ==========================================================================
+# xLLM 开发镜像 —— 外部三方组件清单（单一事实来源）
+# ==========================================================================
+# 消费方：xllm-dockerfile 仓库的 xllm-image-build skill。构建「最终开发镜像」时
+#         读取本文件，在临时容器内按声明编译产物，再渲染安装步骤进镜像。
+#
+# 设计原则
+#   1. 本文件自解释：xllm 需要哪些外部组件、什么版本、怎么编、怎么验，都在这里表达；
+#      镜像仓库与脚本不得写死任何组件专有细节。
+#   2. 不含环境专有信息（代理地址、本机路径、机器名）——那些由构建环境/CLI 提供。
+#   3. 组件增删改只改本文件，重跑 skill 流程即可刷新镜像（Dockerfile 无需手改）。
+#
+# 版本配套规则（重要）
+#   算子类组件的源码分支必须与**运行镜像的 CANN 版本**配套（官方对照表见
+#   gitcode.com/cann/release-management 各版本 release-notes）。判定与处置顺序：
+#     1) 编译报缺头文件/缺符号时，先在镜像内 find 该头文件，确认它由哪个 CANN 版本提供；
+#     2) 再对比同仓库其它分支——上游发布分支可能跟随尚未发布的工具链，而 master 仍兼容当前 CANN。
+#        实测：ops-transformer 9.2.0 分支用 graph/error_codes.h（CANN 9.2.0 才有，
+#        9.1.0 只有 graph/ge_error_codes.h），master 用 ge_error_codes.h，可在 CANN 9.1.0 上编译，
+#        且 master 已包含本清单需要的全部算子 → 故 ref 用 master。
+#     3) 只有确认必须更高版本工具链时，才声明 requires_cann 并用 --build-image 指定编译期镜像；
+#        跨版本产物能否在运行镜像加载属官方未承诺组合，须由 verify 阶段的符号检查与真机实测判定。
+# ==========================================================================
+
+schema_version: 1
+
+# 芯片 flavor → CANN soc_version（官方命名）。构建时会与镜像内 toolkit 实际支持的
+# soc 列表交叉校验，不一致直接失败，不做猜测。
+soc_map:
+  a2: ascend910b
+  a3: ascend910_93
+  a5: ascend950
+
+# components 顺序 == 最终镜像中的安装顺序。
+# type=ascend-op-run 的组件：安装前 unset ASCEND_CUSTOM_OPP_PATH；安装后其 vendor 目录
+# 置于 ASCEND_CUSTOM_OPP_PATH 最前（即「后安装的排在更前面」）。
+components:
+
+  # ---- 算子 run 包（按 SoC 编译，产物含 kernel bin，运行时被 OPP vendors 加载）----
+  - name: cann-ops-transformer-run
+    type: ascend-op-run
+    repo: https://gitcode.com/cann/ops-transformer.git
+    # 钉 commit 保证复现（原 ref: master 为移动分支）；跟随上游时改回 master 并 deps --force 重编
+    ref: 0e15a6247e4ad52fd31bb8691086d6f28099ece6
+    source_dir: ops-transformer
+    build:
+      # 上游 install_deps.sh 建议的系统依赖（只安装在临时编译容器，不进最终镜像）
+      system_packages: [pigz, dos2unix, patch, make]
+      requirements: requirements.txt
+      cmd: >-
+        bash build.sh --pkg --soc={soc} --vendor_name={vendor_name}
+        --ops={ops} -j{jobs} -O3
+      vars:
+        vendor_name: ops_transformer
+        # xLLM 当前需要的算子清单（逗号分隔，勿折行）；新增算子在此追加即可
+        ops: quant_lightning_indexer_v2,quant_lightning_indexer_v2_metadata,sparse_flash_mla,sparse_flash_mla_metadata,mega_moe,key_pool,pool_key_indexer
+    artifacts:
+      - build_out/*.run
+    install:
+      # 镜像内安装用的命令行（{artifact} 为包路径占位符）。选项含义：
+      #   --quiet            非交互（docker build 必需）
+      #   --force            跳过 shared library 校验：镜像构建期没有 NPU 驱动/设备，校验必然失败
+      #   --install-for-all  允许非 root 用户使用该算子包（开发镜像常被普通用户运行）
+      cmd: bash {artifact} --quiet --force --install-for-all
+    verify:
+      # 免设备检查：docker build 的 RUN 也会执行（构建期没有 NPU 设备与宿主驱动）
+      # 包内记录的编译期 CANN 版本与运行镜像对账（跨版本编译时差异一眼可见）
+      - |
+        echo "  包内 custom_opp_compiler_version=$(sed -n 's/^custom_opp_compiler_version=//p' {vendor_dir}/version.info) / 运行镜像 CANN=$(basename ${ASCEND_HOME_PATH:-unknown})"
+      # 声明的算子必须都在包里：统一以 ascendc/<op> 目录为准（*_metadata 类算子只有 host 侧实现，
+      # 没有 dynamic/*.py 与 kernel），同时要求目标 SoC 的 kernel 根目录存在且非空（证明按 SoC 编过、不是空包）
+      - |
+        _v={vendor_dir}
+        _k="$_v/op_impl/ai_core/tbe/kernel/{soc}"
+        test -d "$_k" || { echo "缺少 SoC kernel 根目录: $_k"; exit 8; }
+        test -n "$(ls -A "$_k" 2>/dev/null)" || { echo "SoC kernel 目录为空: $_k"; exit 8; }
+        _nk=0
+        for _op in $(echo {ops} | tr ',' ' '); do
+          test -n "$(ls -d $_v/op_impl/ai_core/tbe/*_impl/ascendc/$_op 2>/dev/null)" || { echo "算子未打进包: $_op"; exit 8; }
+          if test -d "$_k/$_op"; then _nk=$((_nk + 1)); fi
+        done
+        echo "  算子齐全: $(echo {ops} | tr ',' ' ') | 其中带 {soc} kernel 的: $_nk 个"
+      # op_api 库存在（aclnn 调用入口）
+      - test -n "$(ls {vendor_dir}/op_api/lib/*.so* 2>/dev/null)"
+      # 运行期由 CANN 按 ASCEND_CUSTOM_OPP_PATH 动态加载，不依赖 LD_LIBRARY_PATH：
+      # 这里验证 op_api 库自身的依赖能被动态链接器解析（因此无需、也不应改 LD_LIBRARY_PATH）
+      - ldd -r {vendor_dir}/op_api/lib/*.so* | grep -q . && ldd -r {vendor_dir}/op_api/lib/*.so* > /dev/null && echo "  op_api 库依赖可自解析（无需 LD_LIBRARY_PATH）"
+
+  # ---- torch extension wheel（JIT 封装，py3-none-any，与 SoC 无关）----
+  - name: cann-ops-transformer-torch-ext
+    type: python-wheel
+    repo: https://gitcode.com/cann/ops-transformer.git
+    # 钉 commit 保证复现（原 ref: master 为移动分支）；跟随上游时改回 master 并 deps --force 重编
+    ref: 0e15a6247e4ad52fd31bb8691086d6f28099ece6
+    source_dir: ops-transformer
+    build:
+      system_packages: [pigz, dos2unix, patch, make]
+      requirements: torch_extension/requirements.txt
+      cmd: bash build.sh --torch_extension_only
+    artifacts:
+      - build_out/*.whl
+    verify:
+      # 免设备：wheel 已安装且发行元数据可见（docker build 的 RUN 也会执行）
+      - python3 -c "import importlib.metadata as m; print('  cann-ops-transformer', m.version('cann_ops_transformer'))"
+    verify_device:
+      # 需设备：会 import torch/torch_npu，构建期无 NPU 设备与宿主驱动，只能在特权容器里跑
+      - python3 -c "import cann_ops_transformer; from cann_ops_transformer import ops; names=[n for n in dir(ops) if not n.startswith('_')]; print('  torch_ext 暴露算子数:', len(names)); print('  样例:', sorted(names)[:8])"
+
+  # ---- 线性注意力算子库 wheel（按 SoC 编译）----
+  - name: flash-linear-attention-npu
+    type: python-wheel
+    repo: https://github.com/flashserve/flash-linear-attention-npu.git
+    ref: v26.9.1              # 不可变 tag（对应 commit 3ca0586a61493d2e9b6fbee99a0ac33d4b033b77）
+    source_dir: flash-linear-attention-npu
+    build:
+      requirements: requirements.txt
+      soc_env: FLA_NPU_SOC          # 该仓库通过此环境变量指定 SoC
+      cmd: python3 scripts/build_wheel.py
+    artifacts:
+      - dist/*.whl
+    install:
+      # wheel 一律 --no-deps 安装（避免 pip 解析器改动被 pin 死的 torch/torch_npu/numpy/CANN 配套）。
+      # 因此 wheel 的 Requires-Dist 中镜像里没有的项必须在此显式声明：deps 阶段下载到产物目录，
+      # final 阶段离线安装；未声明的缺失项会被 Requires-Dist 对账脚本判为失败。
+      # expecttest：本仓 wheel 声明的运行期依赖，基础镜像未包含。
+      pip_deps: [expecttest]
+    verify:
+      - python3 -c "import importlib.metadata as m; print('  ', [(d.name, d.version) for d in m.distributions() if d.name.lower().replace('_','-').startswith('flash-linear-attention')])"
+    verify_device:
+      - python3 -c "import fla_npu; from fla_npu.ops import ascendc; print('  fla_npu ok, ascendc.chunk_fwd_o:', hasattr(ascendc, 'chunk_fwd_o'))"
