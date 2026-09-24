@@ -84,7 +84,8 @@ components:
       - test -n "$(ls {vendor_dir}/op_api/lib/*.so* 2>/dev/null)"
       # 运行期由 CANN 按 ASCEND_CUSTOM_OPP_PATH 动态加载，不依赖 LD_LIBRARY_PATH：
       # 这里验证 op_api 库自身的依赖能被动态链接器解析（因此无需、也不应改 LD_LIBRARY_PATH）
-      - ldd -r {vendor_dir}/op_api/lib/*.so* | grep -q . && ldd -r {vendor_dir}/op_api/lib/*.so* > /dev/null && echo "  op_api 库依赖可自解析（无需 LD_LIBRARY_PATH）"
+      # 一次 ldd -r 同时取退出码与全量日志：失败时打印日志便于排障
+      - ldd -r {vendor_dir}/op_api/lib/*.so* > /tmp/opapi_ldd.log 2>&1 && echo "  op_api 库依赖可自解析（无需 LD_LIBRARY_PATH）" || { cat /tmp/opapi_ldd.log; exit 8; }
 
   # ---- torch extension wheel（JIT 封装，py3-none-any，与 SoC 无关）----
   - name: cann-ops-transformer-torch-ext

@@ -74,10 +74,12 @@ def _strip_fla_npu_embedded_opp_from_path() -> None:
     entries = [entry for entry in opp_path.split(os.pathsep) if entry]
     kept = [entry for entry in entries if "/fla_npu/opp/" not in entry]
     if len(kept) != len(entries):
-        os.environ["ASCEND_CUSTOM_OPP_PATH"] = os.pathsep.join(kept)
+        if kept:
+            os.environ["ASCEND_CUSTOM_OPP_PATH"] = os.pathsep.join(kept)
+        else:
+            os.environ.pop("ASCEND_CUSTOM_OPP_PATH", None)
         logger.info(
-            "Removed %d fla_npu embedded OPP dir(s) from ASCEND_CUSTOM_OPP_PATH "
-            "for the build (FLA_NPU_DISABLE_PTH=1).",
+            "Removed %d fla_npu embedded OPP dir(s) from ASCEND_CUSTOM_OPP_PATH for the build (FLA_NPU_DISABLE_PTH=1).",
             len(entries) - len(kept),
         )
 
