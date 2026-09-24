@@ -1,5 +1,6 @@
 import argparse
 import glob
+import importlib.util
 import os
 import re
 import shutil
@@ -45,34 +46,60 @@ from scripts.build_support.utils import (
 from scripts.logger import logger
 
 # ---------------------------------------------------------------------------
-# Build-time guard: skip fla_npu's embedded OPP registration (compile time only).
+# Build-time guard: keep fla_npu's embedded OPP out of the xllm_ops compile.
 #
-# The image's fla_npu wheel auto-registers its embedded OPP vendor through
-# fla_npu_opp_env.pth at interpreter startup, prepending the vendor dir to
-# ASCEND_CUSTOM_OPP_PATH. That vendor's CausalConv1d exposes 12 inputs while
-# xllm_ops' CausalConv1d has 8; when opc compiles xllm_ops it merges both into
-# its op store and rejects xllm_ops' param json ("invalid input nums[8], which
-# should be equal to input nums[12]").
+# The image's fla_npu wheel ships an embedded OPP whose CausalConv1d exposes
+# 12 inputs while xllm_ops' CausalConv1d has 8; when opc compiles xllm_ops it
+# merges both into its op store and rejects xllm_ops' param json ("invalid
+# input nums[8], which should be equal to input nums[12]").
 #
-# The .pth hook has already run by the time this script executes, so the
-# ASCEND_CUSTOM_OPP_PATH inherited by build children (cmake/ninja/opc) may
-# already contain fla_npu's vendor dirs. Disable the hook for any interpreter
-# spawned later by the build and strip the inherited fla_npu vendor entries so
-# child processes compile xllm_ops against a clean op store. Runtime is
-# unaffected: xllm registers fla_npu's OPP in xllm.cpp init_npu_python_runtime()
-# before aclInit (see xllm/python/_npu_bootstrap.py), and build artifacts carry
-# no build-time environment.
+# fla_npu registers that OPP when its AscendC op_api is first loaded,
+# prepending both the OPP root (<site-packages>/fla_npu/opp) and the vendor
+# dir (<site-packages>/fla_npu/opp/vendors/fla_npu_transformer) to
+# ASCEND_CUSTOM_OPP_PATH. Strip every inherited entry under that OPP root so
+# build children (cmake/ninja/opc) compile xllm_ops against a clean op store.
+# FLA_NPU_DISABLE_PTH=1 additionally covers wheels that register through a
+# .pth interpreter-startup hook. Runtime is unaffected: xllm registers
+# fla_npu's OPP in xllm.cpp init_npu_python_runtime() before aclInit (see
+# xllm/python/_npu_bootstrap.py), and build artifacts carry no build-time
+# environment.
 # ---------------------------------------------------------------------------
 os.environ["FLA_NPU_DISABLE_PTH"] = "1"
 
 
+def _fla_npu_embedded_opp_root() -> str | None:
+    """Return fla_npu's embedded OPP root dir, or None if the wheel is absent."""
+    try:
+        spec = importlib.util.find_spec("fla_npu")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.origin:
+        return None
+    opp_root = os.path.join(os.path.dirname(os.path.realpath(spec.origin)), "opp")
+    return opp_root if os.path.isdir(opp_root) else None
+
+
+def _is_within(path: str, ancestor: str) -> bool:
+    """Return True if path equals ancestor or lives underneath it."""
+    return path == ancestor or path.startswith(ancestor + os.sep)
+
+
 def _strip_fla_npu_embedded_opp_from_path() -> None:
-    """Remove fla_npu's embedded OPP vendor dirs from ASCEND_CUSTOM_OPP_PATH."""
+    """Remove fla_npu's embedded OPP dirs from ASCEND_CUSTOM_OPP_PATH.
+
+    fla_npu prepends both the OPP root (<pkg>/opp) and the vendor dir
+    (<pkg>/opp/vendors/<vendor>) to ASCEND_CUSTOM_OPP_PATH, so entries are
+    matched by realpath containment under the OPP root instead of a substring
+    that only fits the vendor dir.
+    """
     opp_path = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
     if not opp_path:
         return
+    opp_root = _fla_npu_embedded_opp_root()
+    if opp_root is None:
+        return
     entries = [entry for entry in opp_path.split(os.pathsep) if entry]
-    kept = [entry for entry in entries if "/fla_npu/opp/" not in entry]
+    kept = [entry for entry in entries if not _is_within(os.path.realpath(entry), opp_root)]
     if len(kept) != len(entries):
         if kept:
             os.environ["ASCEND_CUSTOM_OPP_PATH"] = os.pathsep.join(kept)
@@ -81,6 +108,12 @@ def _strip_fla_npu_embedded_opp_from_path() -> None:
         logger.info(
             "Removed %d fla_npu embedded OPP dir(s) from ASCEND_CUSTOM_OPP_PATH for the build (FLA_NPU_DISABLE_PTH=1).",
             len(entries) - len(kept),
+        )
+    else:
+        logger.warning(
+            "ASCEND_CUSTOM_OPP_PATH=%r has no entry under fla_npu's embedded OPP root %s; leaving it untouched for the build.",
+            opp_path,
+            opp_root,
         )
 
 
