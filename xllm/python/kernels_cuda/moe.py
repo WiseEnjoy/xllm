@@ -201,6 +201,53 @@ def grouped_moe(
     )
 
 
+def mxfp4_moe_with_selected_experts(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    num_total_experts: int = -1,
+    start_expert_id: int = 0,
+    num_experts_per_rank: int = -1,
+    swiglu_limit: float = 0.0,
+) -> torch.Tensor:
+    """Reject the NPU-specific MXFP4 grouped MoE path on CUDA.
+
+    Args:
+        hidden_states: Hidden states of shape ``[num_tokens, hidden_size]``.
+        topk_weights: Routing weight per token and slot.
+        topk_ids: Expert index per token and slot.
+        w13: Packed-fp4 gate and up projections of every local expert.
+        w2: Packed-fp4 down projection of every local expert.
+        w13_scale: ue8m0 group scales of ``w13``.
+        w2_scale: ue8m0 group scales of ``w2``.
+        num_total_experts: Global expert count across all EP ranks.
+        start_expert_id: First global expert index held by this rank.
+        num_experts_per_rank: Experts held by this rank.
+        swiglu_limit: Clamp bound of the gated activation.
+
+    Returns:
+        Hidden states of shape ``[num_tokens, hidden_size]``.
+    """
+    del (
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w13,
+        w2,
+        w13_scale,
+        w2_scale,
+        num_total_experts,
+        start_expert_id,
+        num_experts_per_rank,
+        swiglu_limit,
+    )
+    raise NotImplementedError("mxfp4_moe_with_selected_experts is currently implemented only for NPU")
+
+
 def moe_gate_routing(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor | None,
@@ -289,6 +336,7 @@ __all__ = [
     "fused_moe",
     "prepare_grouped_moe_weights",
     "grouped_moe",
+    "mxfp4_moe_with_selected_experts",
     "moe_gate_routing",
     "moe_expert_compute",
     "moe_token_dispatch",

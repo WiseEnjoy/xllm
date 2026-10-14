@@ -62,7 +62,10 @@ from xllm.python.model_executor.forward_context import (
     record_layer_event,
     wait_for_layer_load,
 )
-from xllm.python.model_loader.module_loaders import load_w8a8_dynamic_projection
+from xllm.python.model_loader.module_loaders import (
+    load_mxfp8_block_projection,
+    load_w8a8_dynamic_projection,
+)
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import (
@@ -72,6 +75,22 @@ from xllm.python.models.deepseek_v32 import (
     _tp_rank_from_device,
 )
 from xllm.python.models.weight_utils import W8A8WeightLoader
+
+# MXFP8/MXFP4 modules are only reachable for FP8 checkpoints; the guarded
+# import keeps W8A8-only deployments (older CANN without the MX dtypes, or
+# environments without the compiled xllm_ops lib) fully functional.
+try:
+    from xllm.python.models.dsv4_mxfp import (
+        MXFP8MLP,
+        MXFP8DynamicLinear,
+        MXFP8GroupedOProjection,
+        MXFP8RowParallelLinear,
+    )
+except Exception:  # pragma: no cover - MXFP unavailable on this build
+    MXFP8DynamicLinear = None  # type: ignore[assignment,misc]
+    MXFP8GroupedOProjection = None  # type: ignore[assignment,misc]
+    MXFP8MLP = None  # type: ignore[assignment,misc]
+    MXFP8RowParallelLinear = None  # type: ignore[assignment,misc]
 
 try:
     from xllm.python import distributed
@@ -115,6 +134,19 @@ def _pick(d: dict, *keys: str, default: Any = None) -> Any:
         if k in d and d[k] is not None:
             return d[k]
     return default
+
+
+def _mxfp_runtime_available() -> bool:
+    """Whether the MXFP modules and their runtime kernels are importable.
+
+    Guards FP8-checkpoint construction so unavailable builds fail with a clear
+    message instead of an AttributeError mid-forward. Resolved at call time
+    (not import time): ``kernels`` may be bound late in embedded runs, and on
+    builds whose CANN predates the MX dtypes ``kernels.mxfp`` exists but
+    reports ``MXFP_SUPPORTED=False``.
+    """
+    mxfp = getattr(kernels, "mxfp", None) if kernels is not None else None
+    return MXFP8DynamicLinear is not None and mxfp is not None and mxfp.MXFP_SUPPORTED
 
 
 def _find_checkpoint_key(loader: W8A8WeightLoader, candidates: Sequence[str]) -> str | None:
@@ -302,6 +334,10 @@ class DeepseekV4Config:
     n_group: int = 0
     topk_group: int = 0
     tie_word_embeddings: bool = False
+    # Weight format from the checkpoint's nested quantization_config:
+    # "fp8" selects the MXFP8/MXFP4 execution path (official DeepSeek-V4
+    # releases); anything else keeps the legacy W8A8 dynamic-quant path.
+    weight_quant_method: str = ""
     tp_size: int = 1
     tp_rank: int = 0
     moe_tp_size: int = 1
@@ -397,6 +433,7 @@ class DeepseekV4Config:
             n_group=int(_pick(d, "n_group", default=0)),
             topk_group=int(_pick(d, "topk_group", default=0)),
             tie_word_embeddings=bool(_pick(d, "tie_word_embeddings", default=False)),
+            weight_quant_method=str(d.get("weight_quant_method") or ""),
             tp_size=int(d.get("tp_size", 1)),
             tp_rank=int(d.get("tp_rank", _tp_rank_from_device(d.get("device", "npu:0")))),
             moe_tp_size=int(d.get("moe_tp_size", 1)),
@@ -413,6 +450,11 @@ class DeepseekV4Config:
 
     def head_split(self) -> tuple[int, int]:
         return self.n_heads // self.tp_size, 1
+
+    @property
+    def use_mxfp(self) -> bool:
+        """Whether this checkpoint uses the official MXFP8/MXFP4 format."""
+        return self.weight_quant_method == "fp8"
 
     # -- aliases so DSV3.2-reused modules (MoE/MLP) read DSV4 config unchanged --
     @property
@@ -653,16 +695,18 @@ class DeepseekV4Attention(Attention):
             nn.Parameter(torch.empty(num_heads, dtype=torch.float32, device=device)),
         )
         self.attn_sink_loaded = False
-        # q/kv down-projections (W8A8).
-        # Native DSV4 keeps dynamic-W8A8 weights in checkpoint [N, K] layout
-        # and calls quant_matmul with transpose2=true.
-        self.q_a_proj = W8A8DynamicLinear(
+        # q/kv down-projections (W8A8 or MXFP8, selected by checkpoint format).
+        # Native DSV4 keeps dynamic-quant weights in checkpoint [N, K] layout
+        # and calls quant_matmul with transpose2=true; the MXFP8 module keeps
+        # the same constructor contract and transposes in its own processing.
+        linear_cls = MXFP8DynamicLinear if cfg.use_mxfp else W8A8DynamicLinear
+        self.q_a_proj = linear_cls(
             cfg.hidden_size,
             cfg.q_lora_rank,
             device,
             transpose_weight_after_loading=False,
         )
-        self.kv_proj = W8A8DynamicLinear(
+        self.kv_proj = linear_cls(
             cfg.hidden_size,
             head_dim,
             device,
@@ -670,8 +714,8 @@ class DeepseekV4Attention(Attention):
         )
         self.q_a_layernorm = RMSNorm(cfg.q_lora_rank, cfg.rms_norm_eps, dtype=dtype, device=device)
         self.kv_a_layernorm = RMSNorm(head_dim, cfg.rms_norm_eps, dtype=dtype, device=device)
-        # q up-projection (W8A8) produces [T, num_heads, head_dim].
-        self.q_b_proj = W8A8DynamicLinear(
+        # q up-projection produces [T, num_heads, head_dim].
+        self.q_b_proj = linear_cls(
             cfg.q_lora_rank,
             num_heads * head_dim,
             device,
@@ -688,27 +732,41 @@ class DeepseekV4Attention(Attention):
         self.n_local_groups = cfg.o_groups // tp
         self.o_lora_rank = cfg.o_lora_rank
         o_a_in = (cfg.n_heads * head_dim) // cfg.o_groups
-        # ColumnParallelLinear takes out_features_PER_PARTITION, so shard the
-        # full o_groups*o_lora output by tp (matches the C++ ColumnParallelLinear
-        # which hands the per-partition count).
-        self.o_a_proj = ColumnParallelLinear(
-            o_a_in,
-            (cfg.o_groups * cfg.o_lora_rank) // tp,
-            tp,
-            dtype=dtype,
-            device=device,
-        )
-        # Native RowParallelLinear keeps the checkpoint [N, K] layout and calls
-        # F.linear(input, weight). Do not transpose o_b to FRACTAL_NZ here:
-        # that changes the NPU matmul accumulation order for BF16.
-        self.o_b_proj = RowParallelLinear(
-            (cfg.o_groups * cfg.o_lora_rank) // tp,
-            cfg.hidden_size,
-            tp,
-            dtype=dtype,
-            device=device,
-            use_checkpoint_layout=True,
-        )
+        if cfg.use_mxfp:
+            # MXFP8 keeps the official FP8 layout end-to-end: the grouped
+            # wo_a runs per-group MXFP8 matmuls and the row-parallel wo_b
+            # holds its own ue8m0 block scale (K-sharded at processing time).
+            self.o_a_proj = MXFP8GroupedOProjection(o_a_in, cfg.o_lora_rank, self.n_local_groups, device)
+            self.o_b_proj = MXFP8RowParallelLinear(
+                cfg.o_groups * cfg.o_lora_rank,
+                cfg.hidden_size,
+                tp,
+                cfg.tp_rank,
+                device,
+            )
+        else:
+            # ColumnParallelLinear takes out_features_PER_PARTITION, so shard
+            # the full o_groups*o_lora output by tp (matches the C++
+            # ColumnParallelLinear which hands the per-partition count).
+            self.o_a_proj = ColumnParallelLinear(
+                o_a_in,
+                (cfg.o_groups * cfg.o_lora_rank) // tp,
+                tp,
+                dtype=dtype,
+                device=device,
+            )
+            # Native RowParallelLinear keeps the checkpoint [N, K] layout and
+            # calls F.linear(input, weight). Do not transpose o_b to
+            # FRACTAL_NZ here: that changes the NPU matmul accumulation order
+            # for BF16.
+            self.o_b_proj = RowParallelLinear(
+                (cfg.o_groups * cfg.o_lora_rank) // tp,
+                cfg.hidden_size,
+                tp,
+                dtype=dtype,
+                device=device,
+                use_checkpoint_layout=True,
+            )
         compress_ratio = cfg.compress_ratios[layer_id]
         self.indexer: DeepseekV4Indexer | None = (
             DeepseekV4Indexer(cfg, dtype, device) if compress_ratio == 4 and cfg.index_topk > 0 else None
@@ -751,6 +809,8 @@ class DeepseekV4Attention(Attention):
             m.process_weights_after_loading()
         if hasattr(self.o_a_proj, "process_weights_after_loading"):
             self.o_a_proj.process_weights_after_loading()
+        if hasattr(self.o_b_proj, "process_weights_after_loading"):
+            self.o_b_proj.process_weights_after_loading()
         if self.indexer is not None:
             self.indexer.process_weights_after_loading()
         if hasattr(self, "cmp_wkv"):
@@ -825,10 +885,17 @@ class DeepseekV4Attention(Attention):
         # qr_pertoken_scale; q_b_proj consumes that pre-quantized qr (no
         # re-quant). The indexer reuses the same qr + qr_pertoken_scale in
         # build_query, so stash them on the backend for _run_indexer.
+        # The MXFP8 path is structurally identical with e4m3 activations and
+        # ue8m0 scales (fused rms_norm_dynamic_mx_quant).
         q_a = self.q_a_proj(hidden)
         from xllm.python import kernels as _k
 
-        qr, qr_pertoken_scale = _k.rms_norm_dynamic_quant(q_a, self.q_a_layernorm.weight, self.cfg.rms_norm_eps)
+        if self.cfg.use_mxfp:
+            qr, qr_pertoken_scale = _k.mxfp.rms_norm_dynamic_mx_quant(
+                q_a, self.q_a_layernorm.weight, self.cfg.rms_norm_eps
+            )
+        else:
+            qr, qr_pertoken_scale = _k.rms_norm_dynamic_quant(q_a, self.q_a_layernorm.weight, self.cfg.rms_norm_eps)
         q = self.q_b_proj.forward_quantized(qr, qr_pertoken_scale).view(num_tokens, self.num_heads_local, self.head_dim)
         q = _k.rms_norm(q, self.q_rms_gamma, self.cfg.rms_norm_eps)
 
@@ -876,6 +943,13 @@ class DeepseekV4Attention(Attention):
         # Two-stage output projection (o_a -> grouped -> o_b).
         num_tokens = attn_out.size(0)
         out = attn_out.view(num_tokens, self.n_local_groups, -1)
+        if isinstance(self.o_a_proj, MXFP8GroupedOProjection):
+            # The MXFP8 wo_a runs one grouped matmul per o-group (the fused
+            # transpose-quant batch-matmul is k/n-limited on this CANN build).
+            o = self.o_b_proj(self.o_a_proj(out))
+            # o_b_proj is MXFP8RowParallelLinear, which all-reduces over the
+            # TP group internally when tp > 1.
+            return o
         # Match C++ DSAttentionImpl exactly. A flattened F.linear is
         # mathematically equivalent but selects a different NPU accumulation
         # path and produces layer-by-layer BF16 drift.
@@ -974,8 +1048,9 @@ class DeepseekV4Indexer(nn.Module):
         self.hadamard_scale = cfg.index_head_dim**-0.5 if cfg.index_head_dim else 1.0
         # indexer q projection + scoring weights + compressor (K projection is
         # done by the compressor's wkv, so there is no separate wk/k_norm --
-        # matches C++ DeepseekV4IndexerImpl).
-        self.wq_b = W8A8DynamicLinear(
+        # matches C++ DeepseekV4IndexerImpl). The projection follows the
+        # checkpoint weight format (MXFP8 for official FP8 releases).
+        self.wq_b = (MXFP8DynamicLinear if cfg.use_mxfp else W8A8DynamicLinear)(
             cfg.q_lora_rank,
             self.n_head * self.head_dim,
             device,
@@ -1271,6 +1346,11 @@ class DeepseekV4MoE(nn.Module):
         # keep expert tensors empty until then to avoid allocating the W8A8
         # fallback shape for all 43 layers.
         self.w4a8_dynamic = False
+        # Official FP8 checkpoints (weight_quant_method == "fp8") store routed
+        # experts as packed fp4 (uint8 [N, K/2]) with ue8m0 1x32-group scales;
+        # the format is known from the config, so those buffers are allocated
+        # here directly.
+        self.use_mxfp = cfg.use_mxfp
 
         # Gate weight [n_total_experts, hidden] float32 (replicated, not sharded).
         self.gate = nn.Linear(cfg.hidden_size, cfg.n_routed_experts, bias=False, dtype=torch.float32, device=device)
@@ -1298,28 +1378,56 @@ class DeepseekV4MoE(nn.Module):
         # Expert weights — EP sharded: each rank holds num_experts_per_rank experts
         # (not all n_routed_experts). Mirrors C++ FusedMoEImpl (fused_moe.cpp:605-624).
         nepr = self.num_experts_per_rank
-        self.experts_w13 = nn.Parameter(torch.empty(0, dtype=torch.int8, device=device), requires_grad=False)
-        self.experts_w2 = nn.Parameter(torch.empty(0, dtype=torch.int8, device=device), requires_grad=False)
-        self.register_buffer("experts_w13_scale", torch.empty(0, dtype=torch.float32, device=device))
-        self.register_buffer("experts_w13_scale_second", torch.empty(0, dtype=torch.float32, device=device))
-        self.register_buffer("experts_w13_offset", torch.empty(0, dtype=torch.float32, device=device))
-        self.register_buffer("experts_w2_scale", torch.empty(0, dtype=torch.bfloat16, device=device))
-        self.register_buffer("experts_w2_scale_second", torch.empty(0, dtype=torch.float32, device=device))
-        self.register_buffer("experts_w2_offset", torch.empty(0, dtype=torch.float32, device=device))
-        self.register_buffer("experts_w13_scale_bias", torch.empty(0, dtype=torch.float32, device=device))
-        self.register_buffer("experts_w2_scale_bias", torch.empty(0, dtype=torch.float32, device=device))
+        if self.use_mxfp:
+            # Packed fp4: two values per byte along K (low nibble = even k).
+            self.experts_w13 = nn.Parameter(
+                torch.empty(nepr, 2 * inter_local, cfg.hidden_size // 2, dtype=torch.uint8, device=device),
+                requires_grad=False,
+            )
+            self.experts_w2 = nn.Parameter(
+                torch.empty(nepr, cfg.hidden_size, inter_local // 2, dtype=torch.uint8, device=device),
+                requires_grad=False,
+            )
+            self.register_buffer(
+                "experts_w13_scale",
+                torch.empty(nepr, 2 * inter_local, cfg.hidden_size // 32, dtype=torch.uint8, device=device),
+            )
+            self.register_buffer(
+                "experts_w2_scale",
+                torch.empty(nepr, cfg.hidden_size, inter_local // 32, dtype=torch.uint8, device=device),
+            )
+        else:
+            self.experts_w13 = nn.Parameter(torch.empty(0, dtype=torch.int8, device=device), requires_grad=False)
+            self.experts_w2 = nn.Parameter(torch.empty(0, dtype=torch.int8, device=device), requires_grad=False)
+            self.register_buffer("experts_w13_scale", torch.empty(0, dtype=torch.float32, device=device))
+            self.register_buffer("experts_w13_scale_second", torch.empty(0, dtype=torch.float32, device=device))
+            self.register_buffer("experts_w13_offset", torch.empty(0, dtype=torch.float32, device=device))
+            self.register_buffer("experts_w2_scale", torch.empty(0, dtype=torch.bfloat16, device=device))
+            self.register_buffer("experts_w2_scale_second", torch.empty(0, dtype=torch.float32, device=device))
+            self.register_buffer("experts_w2_offset", torch.empty(0, dtype=torch.float32, device=device))
+            self.register_buffer("experts_w13_scale_bias", torch.empty(0, dtype=torch.float32, device=device))
+            self.register_buffer("experts_w2_scale_bias", torch.empty(0, dtype=torch.float32, device=device))
 
         # Shared expert uses the orthogonal MoE TP group, matching C++
         # FusedMoEImpl. skip_tp_reduce keeps collective ordering in this class.
         shared_cfg = replace(cfg, tp_size=self.moe_tp_size, tp_rank=self.moe_tp_rank)
-        self.shared_experts = DeepseekV3MLP(
-            shared_cfg,
-            cfg.moe_intermediate_size * cfg.n_shared_experts,
-            dtype,
-            device,
-            skip_tp_reduce=True,
-            swiglu_limit=cfg.swiglu_limit,
-        )
+        if self.use_mxfp:
+            self.shared_experts = MXFP8MLP(
+                shared_cfg,
+                cfg.moe_intermediate_size * cfg.n_shared_experts,
+                device,
+                skip_tp_reduce=True,
+                swiglu_limit=cfg.swiglu_limit,
+            )
+        else:
+            self.shared_experts = DeepseekV3MLP(
+                shared_cfg,
+                cfg.moe_intermediate_size * cfg.n_shared_experts,
+                dtype,
+                device,
+                skip_tp_reduce=True,
+                swiglu_limit=cfg.swiglu_limit,
+            )
         # C++ applies this optional gate only when its checkpoint weight is
         # present. Keep the module registered so the parameter ownership and
         # forward structure match FusedMoEImpl without changing ungated
@@ -1328,7 +1436,24 @@ class DeepseekV4MoE(nn.Module):
         self.shared_expert_gate_is_loaded = False
 
     def process_weights_after_loading(self) -> None:
-        if self.w4a8_dynamic:
+        if self.use_mxfp:
+            # Idempotency guard: a second NZ cast / transpose on the already
+            # transformed expert tensors would corrupt them (the loader and
+            # the draft loader can both reach this node through modules()).
+            if getattr(self, "_mxfp_processed", False):
+                return
+            self._mxfp_processed = True
+            # NZ-cast the packed fp4 weights and build the strided antiquant
+            # scale views. The scale views must stay un-materialized: the
+            # grouped-matmul antiquant path reads their layout from strides
+            # and .contiguous() would silently corrupt non-uniform scales.
+            from xllm.python import kernels
+
+            self.experts_w13.data = kernels.mxfp.prepare_mxfp4_weight(self.experts_w13.data)
+            self.experts_w2.data = kernels.mxfp.prepare_mxfp4_weight(self.experts_w2.data)
+            self.experts_w13_scale = kernels.mxfp.prepare_mxfp4_scale(self.experts_w13_scale)
+            self.experts_w2_scale = kernels.mxfp.prepare_mxfp4_scale(self.experts_w2_scale)
+        elif self.w4a8_dynamic:
             # Match FusedMoEImpl::preprocess_w4a8_dynamic_weights.  Ascend
             # stores each W4 output pair in one int8 row; after transpose the
             # operator consumes NZ/INT32 packed weights and int64 bit-cast
@@ -1493,7 +1618,23 @@ class DeepseekV4MoE(nn.Module):
             topk_weights = topk_weights * local_mask.to(topk_weights.dtype)
 
         # 3) Expert computation with pre-selected routing (EP-sharded).
-        if self.w4a8_dynamic:
+        if self.use_mxfp:
+            # Official FP8: packed-fp4 experts with ue8m0 antiquant scales and
+            # MXFP8 activations, dispatched through the mxfp4 grouped MoE op.
+            routed_out = kernels.mxfp4_moe_with_selected_experts(
+                hidden,
+                topk_weights,
+                topk_idx.to(torch.int32),
+                self.experts_w13.data,
+                self.experts_w2.data,
+                self.experts_w13_scale,
+                self.experts_w2_scale,
+                self.num_total_experts,
+                self.start_expert_id,
+                self.num_experts_per_rank,
+                self.cfg.swiglu_limit,
+            )
+        elif self.w4a8_dynamic:
             # W4A8_DYNAMIC uses the same two grouped GEMMs as C++
             # forward_expert: W4 GMM1 -> SwiGLU -> dynamic int8 -> W4 GMM2.
             # Deferred import: torch_npu only exists on NPU builds.
@@ -1671,13 +1812,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             cfg.moe_layer_freq > 1 and layer_id % cfg.moe_layer_freq != 0
         )
         if is_dense:
-            self.mlp = DeepseekV3MLP(
-                cfg,
-                cfg.moe_intermediate_size,
-                dtype,
-                device,
-                swiglu_limit=cfg.swiglu_limit,
-            )
+            if cfg.use_mxfp:
+                self.mlp = MXFP8MLP(cfg, cfg.moe_intermediate_size, device, swiglu_limit=cfg.swiglu_limit)
+            else:
+                self.mlp = DeepseekV3MLP(
+                    cfg,
+                    cfg.moe_intermediate_size,
+                    dtype,
+                    device,
+                    swiglu_limit=cfg.swiglu_limit,
+                )
         else:
             self.mlp = DeepseekV4MoE(cfg, layer_id, dtype, device)
 
@@ -2012,6 +2156,13 @@ class DeepseekV4ForCausalLM(PyModelBase):
     def __init__(self, config: dict) -> None:
         super().__init__()
         self.cfg = DeepseekV4Config.from_dict(config)
+        if self.cfg.use_mxfp and not _mxfp_runtime_available():
+            raise RuntimeError(
+                "This checkpoint uses the FP8 (MXFP8/MXFP4) weight format, but "
+                "the MXFP modules are unavailable in this build (missing MX "
+                "dtypes in torch_npu or missing compiled kernels). Use a W8A8 "
+                "checkpoint or upgrade the runtime."
+            )
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         device = torch.device(config.get("device", "npu:0"))
         self.model = DeepseekV4Model(self.cfg, dtype, device)
@@ -2033,34 +2184,63 @@ class DeepseekV4ForCausalLM(PyModelBase):
         layer_parameter_prefix: str,
         attention: DeepseekV4Attention,
         *,
-        w8a8_loader: Callable[[str, str, dict[str, int] | None], None],
+        projection_loader: Callable[[str, str, dict[str, int] | None], None],
     ) -> None:
-        """Load the attention, layernorm, and HyperConnection weights of one layer."""
+        """Load the attention, layernorm, and HyperConnection weights of one layer.
+
+        ``projection_loader`` loads one quantized projection (checkpoint
+        format-specific: ``load_w8a8_dynamic_projection`` for W8A8 exports,
+        ``load_mxfp8_block_projection`` for official FP8 checkpoints).
+        """
         attention_parameter_prefix = layer_parameter_prefix + "self_attn."
-        w8a8_loader(
+        # Test doubles build minimal cfg namespaces; the real dataclass always
+        # carries the flag, and a missing one reads as the W8A8 default.
+        use_mxfp = getattr(self.cfg, "use_mxfp", False)
+        projection_loader(
             attention_checkpoint_prefix + "wq_a",
             attention_parameter_prefix + "q_a_proj",
             None,
         )
-        w8a8_loader(
+        projection_loader(
             attention_checkpoint_prefix + "wq_b",
             attention_parameter_prefix + "q_b_proj",
-            {"weight": 0, "weight_scale": 0, "weight_offset": 0},
+            {"weight": 0, "scale": 0} if use_mxfp else {"weight": 0, "weight_scale": 0, "weight_offset": 0},
         )
-        w8a8_loader(
+        projection_loader(
             attention_checkpoint_prefix + "wkv",
             attention_parameter_prefix + "kv_proj",
             None,
         )
 
-        loader.copy_in(
-            attention_parameter_prefix + "o_a_proj.weight",
-            loader.shard(loader.load_tensor(attention_checkpoint_prefix + "wo_a.weight"), dim=0),
-        )
-        loader.copy_in(
-            attention_parameter_prefix + "o_b_proj.weight",
-            loader.shard(loader.load_tensor(attention_checkpoint_prefix + "wo_b.weight"), dim=1),
-        )
+        if use_mxfp:
+            # wo_a: the TP shard keeps whole 128-row scale blocks (o_lora_rank
+            # is a multiple of 128), so a plain dim-0 shard covers both the
+            # weight rows and the scale block rows.
+            wo_a_weight = loader.shard(loader.load_tensor(attention_checkpoint_prefix + "wo_a.weight"), dim=0)
+            loader.copy_in(attention_parameter_prefix + "o_a_proj.weight", wo_a_weight)
+            loader.copy_in(
+                attention_parameter_prefix + "o_a_proj.weight_scale",
+                loader.shard(loader.load_tensor(attention_checkpoint_prefix + "wo_a.scale"), dim=0),
+            )
+            # wo_b holds the full [N, K] weight; MXFP8RowParallelLinear shards
+            # K (with matching scale columns) in process_weights_after_loading.
+            loader.copy_in(
+                attention_parameter_prefix + "o_b_proj.weight",
+                loader.load_tensor(attention_checkpoint_prefix + "wo_b.weight"),
+            )
+            loader.copy_in(
+                attention_parameter_prefix + "o_b_proj.weight_scale",
+                loader.load_tensor(attention_checkpoint_prefix + "wo_b.scale"),
+            )
+        else:
+            loader.copy_in(
+                attention_parameter_prefix + "o_a_proj.weight",
+                loader.shard(loader.load_tensor(attention_checkpoint_prefix + "wo_a.weight"), dim=0),
+            )
+            loader.copy_in(
+                attention_parameter_prefix + "o_b_proj.weight",
+                loader.shard(loader.load_tensor(attention_checkpoint_prefix + "wo_b.weight"), dim=1),
+            )
         loader.copy_in(
             attention_parameter_prefix + "q_a_layernorm.weight",
             loader.load_tensor(attention_checkpoint_prefix + "q_norm.weight"),
@@ -2108,7 +2288,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
         parameter_prefix: str,
         layer_id: int,
         *,
-        w8a8_loader: Callable[[str, str, dict[str, int] | None], None],
+        projection_loader: Callable[[str, str, dict[str, int] | None], None],
     ) -> tuple[DeepseekV4Attention, str]:
         """Resolve and load one attention block from a supported checkpoint layout."""
         attention_prefix = _find_checkpoint_prefix(
@@ -2129,7 +2309,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
             attention_prefix,
             parameter_prefix,
             attention,
-            w8a8_loader=w8a8_loader,
+            projection_loader=projection_loader,
         )
         return attention, attention_prefix
 
@@ -2146,15 +2326,39 @@ class DeepseekV4ForCausalLM(PyModelBase):
         def _has(name: str) -> bool:
             return loader.has(name)
 
-        def _w8a8(ckpt_prefix: str, param_prefix: str, shard_dims: dict | None = None) -> None:
-            """Load a W8A8-dynamic projection.
+        # Test doubles build minimal cfg namespaces; the real dataclass always
+        # carries the flag, and a missing one reads as the W8A8 default.
+        use_mxfp = getattr(cfg, "use_mxfp", False)
+        if use_mxfp:
+            # Official FP8 checkpoints: e4m3 weights + ue8m0 128x128 block
+            # scales under the ".scale" suffix.
+            def _projection(
+                ckpt_prefix: str,
+                param_prefix: str,
+                shard_dims: dict[str, int] | None = None,
+            ) -> None:
+                load_mxfp8_block_projection(
+                    loader,
+                    ckpt_prefix,
+                    param_prefix,
+                    shard_dims,
+                    description=f"DeepSeek-V4 FP8 projection {ckpt_prefix}",
+                )
+        else:
 
-            DSV4's checkpoint stores ``weight`` (int8) + ``weight_scale`` +
-            ``weight_offset`` (per-output-channel), which is the
-            ``W8A8DynamicLinear`` format -- NOT the static deq_scale/quant_bias
-            format of ``W8A8StaticLinear``.
-            """
-            load_w8a8_dynamic_projection(loader, ckpt_prefix, param_prefix, shard_dims)
+            def _projection(
+                ckpt_prefix: str,
+                param_prefix: str,
+                shard_dims: dict[str, int] | None = None,
+            ) -> None:
+                """Load a W8A8-dynamic projection.
+
+                DSV4's checkpoint stores ``weight`` (int8) + ``weight_scale`` +
+                ``weight_offset`` (per-output-channel), which is the
+                ``W8A8DynamicLinear`` format -- NOT the static deq_scale/quant_bias
+                format of ``W8A8StaticLinear``.
+                """
+                load_w8a8_dynamic_projection(loader, ckpt_prefix, param_prefix, shard_dims)
 
         embed_key = _require_checkpoint_key(
             loader,
@@ -2175,12 +2379,12 @@ class DeepseekV4ForCausalLM(PyModelBase):
                 checkpoint_prefix=ck,
                 parameter_prefix=pm,
                 layer_id=i,
-                w8a8_loader=_w8a8,
+                projection_loader=_projection,
             )
             # Indexer weights (ckpt layers.N.attn.indexer.*).
             if attn.indexer is not None and _has(attention_prefix + "indexer.wq_b.weight"):
                 # Indexer wq_b (ReplicatedLinear, not sharded) + weights_proj.
-                _w8a8(attention_prefix + "indexer.wq_b", pm + "self_attn.indexer.wq_b")
+                _projection(attention_prefix + "indexer.wq_b", pm + "self_attn.indexer.wq_b")
                 loader.copy_in(
                     pm + "self_attn.indexer.weights_proj.weight",
                     loader.load_tensor(attention_prefix + "indexer.weights_proj.weight"),
@@ -2228,7 +2432,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
                     raise KeyError(f"DeepSeek-V4 MoE weights not found under {ck}")
                 self._load_dsv4_moe(loader, ck, pm, i, moe_prefix)
                 mlp.process_weights_after_loading()
-            elif isinstance(mlp, DeepseekV3MLP):
+            elif hasattr(mlp, "gate_up_proj"):
                 self._load_dsv4_dense_mlp(loader, ck, pm, mlp)
 
         final_norm_key = _require_checkpoint_key(
@@ -2323,9 +2527,14 @@ class DeepseekV4ForCausalLM(PyModelBase):
         loader: W8A8WeightLoader,
         checkpoint_prefix: str,
         parameter_prefix: str,
-        mlp: DeepseekV3MLP,
+        mlp: DeepseekV3MLP | MXFP8MLP,
     ) -> None:
-        """Load a dense W8A8 MLP using the key aliases accepted by C++."""
+        """Load a dense MLP using the key aliases accepted by C++.
+
+        W8A8 exports load int8 weights with per-channel scales; official FP8
+        checkpoints load e4m3 weights with ue8m0 128x128 block scales into the
+        MXFP8MLP projections.
+        """
         source_prefix = _find_checkpoint_prefix(
             loader,
             (
@@ -2339,6 +2548,25 @@ class DeepseekV4ForCausalLM(PyModelBase):
         gate_name, up_name, down_name = _resolve_mlp_projection_names(loader, source_prefix)
         gate_up_prefix = parameter_prefix + "mlp.gate_up_proj."
         down_prefix = parameter_prefix + "mlp.down_proj."
+        if MXFP8MLP is not None and isinstance(mlp, MXFP8MLP):
+            gate_weight = loader.shard(loader.load_tensor(source_prefix + gate_name + ".weight"), dim=0)
+            up_weight = loader.shard(loader.load_tensor(source_prefix + up_name + ".weight"), dim=0)
+            loader.copy_in(gate_up_prefix + "weight", torch.cat([gate_weight, up_weight], dim=0))
+            gate_scale = loader.shard(loader.load_tensor(source_prefix + gate_name + ".scale"), dim=0)
+            up_scale = loader.shard(loader.load_tensor(source_prefix + up_name + ".scale"), dim=0)
+            loader.copy_in(gate_up_prefix + "weight_scale", torch.cat([gate_scale, up_scale], dim=0))
+            # down keeps its full N; its K (intermediate) dim and the matching
+            # scale columns shard on dim=1.
+            loader.copy_in(
+                down_prefix + "weight",
+                loader.shard(loader.load_tensor(source_prefix + down_name + ".weight"), dim=1),
+            )
+            loader.copy_in(
+                down_prefix + "weight_scale",
+                loader.shard(loader.load_tensor(source_prefix + down_name + ".scale"), dim=1),
+            )
+            mlp.process_weights_after_loading()
+            return
         for suffix in ("weight", "weight_scale", "weight_offset"):
             gate = loader.shard(
                 loader.load_tensor(source_prefix + gate_name + "." + suffix),
@@ -2396,6 +2624,132 @@ class DeepseekV4ForCausalLM(PyModelBase):
             loader.load_tensor(bias_key),
         )
 
+    def _load_dsv4_moe_mxfp_experts(
+        self,
+        loader: W8A8WeightLoader,
+        parameter_prefix: str,
+        layer_id: int,
+        source_prefix: str,
+    ) -> None:
+        """Stage one MoE layer's experts from an official FP8 checkpoint.
+
+        Routed experts are packed fp4 (uint8 ``[N, K/2]``, low nibble = even k)
+        with ue8m0 ``[N, K/32]`` group scales; EP keeps only local experts and
+        MoE-TP shards the output dim of w13 and the packed input dim of w2
+        with their scale columns. Shared experts are e4m3 + ue8m0 128x128
+        block scales fused into the MXFP8MLP projections.
+        """
+        cfg = self.cfg
+        mlp = self.model.layers[layer_id].mlp
+        tp = mlp.moe_tp_size
+        tp_rank = mlp.moe_tp_rank
+        start = mlp.start_expert_id
+        nepr = mlp.num_experts_per_rank
+        w13 = self.get_parameter(parameter_prefix + "mlp.experts_w13")
+        w2 = self.get_parameter(parameter_prefix + "mlp.experts_w2")
+        w13_scale = self.get_buffer(parameter_prefix + "mlp.experts_w13_scale")
+        w2_scale = self.get_buffer(parameter_prefix + "mlp.experts_w2_scale")
+
+        probe = source_prefix + f"experts.{start}."
+        gate_name, up_name, down_name = _resolve_mlp_projection_names(loader, probe)
+
+        def _load_packed(checkpoint_key: str, expected_shape: tuple[int, ...], tensor_name: str) -> torch.Tensor:
+            tensor = loader.load_tensor(checkpoint_key)
+            if tensor.shape != expected_shape:
+                raise ValueError(
+                    f"DeepSeek-V4 FP8 expert tensor {tensor_name} has shape "
+                    f"{tuple(tensor.shape)}, expected {expected_shape}"
+                )
+            return tensor
+
+        for local_idx in range(nepr):
+            global_id = start + local_idx
+            expert_prefix = source_prefix + f"experts.{global_id}."
+            # w1+w3 -> fused w13 (packed rows), with matching scale rows. Only
+            # the K dim is packed ([N, K/2]); the N rows stay unpacked.
+            w13_j = torch.cat(
+                [
+                    _load_packed(
+                        expert_prefix + gate_name + ".weight",
+                        (cfg.moe_intermediate_size, cfg.hidden_size // 2),
+                        expert_prefix + gate_name + ".weight",
+                    ),
+                    _load_packed(
+                        expert_prefix + up_name + ".weight",
+                        (cfg.moe_intermediate_size, cfg.hidden_size // 2),
+                        expert_prefix + up_name + ".weight",
+                    ),
+                ],
+                dim=0,
+            )
+            s13_j = torch.cat(
+                [
+                    loader.load_tensor(expert_prefix + gate_name + ".scale"),
+                    loader.load_tensor(expert_prefix + up_name + ".scale"),
+                ],
+                dim=0,
+            )
+            w2_j = _load_packed(
+                expert_prefix + down_name + ".weight",
+                (cfg.hidden_size, cfg.moe_intermediate_size // 2),
+                expert_prefix + down_name + ".weight",
+            )
+            s2_j = loader.load_tensor(expert_prefix + down_name + ".scale")
+            if tp > 1:
+                w13_j = loader.shard(w13_j, dim=0, world=tp, rank=tp_rank)
+                s13_j = loader.shard(s13_j, dim=0, world=tp, rank=tp_rank)
+                w2_j = loader.shard(w2_j, dim=1, world=tp, rank=tp_rank)
+                s2_j = loader.shard(s2_j, dim=1, world=tp, rank=tp_rank)
+            w13[local_idx].copy_(w13_j.to(w13.dtype))
+            w2[local_idx].copy_(w2_j.to(w2.dtype))
+            w13_scale[local_idx].copy_(s13_j.to(w13_scale.dtype))
+            w2_scale[local_idx].copy_(s2_j.to(w2_scale.dtype))
+
+        # Shared experts: w1+w3 fuse into gate_up (output-dim shard), w2
+        # shards its intermediate dim; every dim is a multiple of 128 so the
+        # block scales stay aligned.
+        shared_prefix = source_prefix + "shared_experts."
+        shared_gate_key = _find_checkpoint_key(
+            loader,
+            (
+                source_prefix + "shared_expert_gate.weight",
+                source_prefix + "shared_experts_gate.weight",
+            ),
+        )
+        if shared_gate_key is not None:
+            loader.copy_in(
+                parameter_prefix + "mlp.shared_expert_gate.weight",
+                loader.load_tensor(shared_gate_key),
+            )
+            mlp.shared_expert_gate_is_loaded = True
+        shared_gate_name, shared_up_name, shared_down_name = _resolve_mlp_projection_names(loader, shared_prefix)
+        se_w13 = torch.cat(
+            [
+                loader.load_tensor(shared_prefix + shared_gate_name + ".weight"),
+                loader.load_tensor(shared_prefix + shared_up_name + ".weight"),
+            ],
+            dim=0,
+        )
+        se_s13 = torch.cat(
+            [
+                loader.load_tensor(shared_prefix + shared_gate_name + ".scale"),
+                loader.load_tensor(shared_prefix + shared_up_name + ".scale"),
+            ],
+            dim=0,
+        )
+        if tp > 1:
+            se_w13 = loader.shard(se_w13, dim=0, world=tp, rank=tp_rank)
+            se_s13 = loader.shard(se_s13, dim=0, world=tp, rank=tp_rank)
+        loader.copy_in(parameter_prefix + "mlp.shared_experts.gate_up_proj.weight", se_w13)
+        loader.copy_in(parameter_prefix + "mlp.shared_experts.gate_up_proj.weight_scale", se_s13)
+        se_w2 = loader.load_tensor(shared_prefix + shared_down_name + ".weight")
+        se_s2 = loader.load_tensor(shared_prefix + shared_down_name + ".scale")
+        if tp > 1:
+            se_w2 = loader.shard(se_w2, dim=1, world=tp, rank=tp_rank)
+            se_s2 = loader.shard(se_s2, dim=1, world=tp, rank=tp_rank)
+        loader.copy_in(parameter_prefix + "mlp.shared_experts.down_proj.weight", se_w2)
+        loader.copy_in(parameter_prefix + "mlp.shared_experts.down_proj.weight_scale", se_s2)
+
     def _load_dsv4_moe(
         self,
         loader: W8A8WeightLoader,
@@ -2427,6 +2781,11 @@ class DeepseekV4ForCausalLM(PyModelBase):
         if gate_prefix is None:
             raise KeyError(f"DeepSeek-V4 layer {layer_id} routing gate weight not found")
         self._load_dsv4_moe_routing(loader, gate_prefix, pm, mlp, layer_id)
+        if getattr(mlp, "use_mxfp", False):
+            # Official FP8: packed-fp4 experts + MXFP8 shared experts; the
+            # W8A8/W4A8 storage discovery below does not apply.
+            self._load_dsv4_moe_mxfp_experts(loader, pm, layer_id, source_prefix)
+            return
         # Per-expert w1+w3 -> fused w13, w2 -> w2 (int8 + scale).
         # EP: only load local experts [start_expert_id, start_expert_id + num_experts_per_rank).
         tp = mlp.moe_tp_size

@@ -74,6 +74,7 @@ _EXPORTS = {
         "moe_gmm1",
         "moe_gmm2_combine",
         "moe_token_dispatch",
+        "mxfp4_moe_with_selected_experts",
         "prepare_grouped_moe_weights",
         "supports_cutlass_moe",
     ),
@@ -172,6 +173,7 @@ __all__ = [
     "moe_gmm1",
     "moe_gmm2_combine",
     "grouped_moe_with_selected_experts",
+    "mxfp4_moe_with_selected_experts",
     "prepare_grouped_moe_weights",
     "supports_cutlass_moe",
     "prepare_row_parallel_weight",
@@ -228,6 +230,13 @@ def _initialize_runtime() -> None:
     for module_name, names in _EXPORTS.items():
         module = importlib.import_module(f"{__name__}.{module_name}")
         exported.update((name, getattr(module, name)) for name in names)
+    # Publish the MXFP kernel module itself so consumers can address it as
+    # ``kernels.mxfp`` and probe ``mxfp.MXFP_SUPPORTED`` (False on CANN builds
+    # without the MX dtypes). It is deliberately absent from ``__all__``:
+    # before runtime init, ``kernels.mxfp`` then raises AttributeError (the
+    # attribute genuinely does not exist yet) instead of the not-initialized
+    # RuntimeError reserved for leaf kernel symbols.
+    exported["mxfp"] = importlib.import_module(f"{__name__}.mxfp")
 
     globals().update(exported)
     _runtime_initialized = True

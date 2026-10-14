@@ -59,6 +59,42 @@ class _DynamicW8A8WeightLoader(Protocol):
     def copy_in(self, param_name: str, tensor: torch.Tensor) -> None: ...
 
 
+def load_mxfp8_block_projection(
+    loader: _DynamicW8A8WeightLoader,
+    checkpoint_module: str,
+    parameter_module: str,
+    shard_dims: dict[str, int] | None = None,
+    *,
+    description: str = "MXFP8 block projection",
+) -> None:
+    """Load an e4m3 projection with its ue8m0 128x128 block scale.
+
+    Official DeepSeek-V4 FP8 checkpoints store quantized projections as
+    ``<module>.weight`` (float8_e4m3) plus ``<module>.scale`` (uint8 ue8m0
+    block-scale bytes). The destination modules (``MXFP8DynamicLinear`` and
+    friends) keep the parameter names ``weight`` / ``weight_scale``.
+
+    ``shard_dims`` maps the checkpoint suffixes (``"weight"`` / ``"scale"``)
+    to the dim to shard on. A ``"scale"`` entry falls back to the ``"weight"``
+    dim when omitted: block scales follow their tensor, and the 128-row /
+    128-column block grid keeps the shard boundaries aligned.
+    """
+    for suffix in ("weight", "scale"):
+        if not loader.has(f"{checkpoint_module}.{suffix}"):
+            raise KeyError(
+                f"{description} requires {checkpoint_module}.weight and {checkpoint_module}.scale; missing {suffix}"
+            )
+    weight = loader.load_tensor(checkpoint_module + ".weight")
+    scale = loader.load_tensor(checkpoint_module + ".scale")
+    weight_dim = (shard_dims or {}).get("weight")
+    if weight_dim is not None:
+        scale_dim = (shard_dims or {}).get("scale", weight_dim)
+        weight = loader.shard(weight, dim=weight_dim)
+        scale = loader.shard(scale, dim=scale_dim)
+    loader.copy_in(parameter_module + ".weight", weight)
+    loader.copy_in(parameter_module + ".weight_scale", scale)
+
+
 class _GqaAttentionModule(Protocol):
     """Structural contract :func:`load_gqa_fused_attention` requires of ``module``."""
 

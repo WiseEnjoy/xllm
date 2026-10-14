@@ -71,6 +71,7 @@ from .moe import (
     moe_gmm1,
     moe_gmm2_combine,
     moe_token_dispatch,
+    mxfp4_moe_with_selected_experts,
     prepare_grouped_moe_weights,
     supports_cutlass_moe,
 )
@@ -138,6 +139,7 @@ __all__ = [
     "moe_token_dispatch",
     "moe_gmm1",
     "moe_gmm2_combine",
+    "mxfp4_moe_with_selected_experts",
     "prepare_grouped_moe_weights",
     "supports_cutlass_moe",
     "prepare_row_parallel_weight",

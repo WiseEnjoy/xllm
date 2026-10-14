@@ -19,6 +19,17 @@ https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8
 Pro权重:
 https://modelers.cn/models/Eco-Tech/DeepSeek-V4-Pro-w4a8-mtp
 
+官方 FP8 权重（MXFP8/MXFP4，仅支持昇腾 950 / A5）：
+
+DeepSeek 官方 FP8 发布版将稠密投影存为 `float8_e4m3` 权重 +
+`ue8m0` 128x128 块缩放，路由专家存为 packed `float4` 权重 + `ue8m0`
+1x32 组缩放。xLLM 在 Python 执行路径上开箱即用，无需导出或重量化：
+当 checkpoint 的 `config.json` 携带
+`quantization_config.quant_method == "fp8"` 时自动选择该路径。该路径要求
+CANN 支持 MX dtype（`torch_npu.float8_e8m0fnu` / `float4_e2m1fn_x2`）；
+在较老的 CANN 版本上服务会报出明确错误，上述 W8A8/W4A8 checkpoint
+的用法不受任何影响。
+
 
 ## 1. 拉取镜像环境
 

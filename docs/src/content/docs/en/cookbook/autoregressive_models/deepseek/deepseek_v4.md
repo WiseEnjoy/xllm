@@ -19,6 +19,18 @@ https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8
 Pro weights:
 https://modelers.cn/models/Eco-Tech/DeepSeek-V4-Pro-w4a8-mtp
 
+Official FP8 weights (MXFP8/MXFP4, Ascend 950 / A5 only):
+
+DeepSeek official FP8 releases store dense projections as `float8_e4m3`
+weights with `ue8m0` 128x128 block scales and routed experts as packed
+`float4` weights with `ue8m0` 1x32 group scales. xLLM serves them on the
+Python execution path out of the box: no export or re-quantization step is
+needed. The path is selected automatically when the checkpoint's
+`config.json` carries `quantization_config.quant_method == "fp8"` and
+requires a CANN build with the MX dtypes (`torch_npu.float8_e8m0fnu` /
+`float4_e2m1fn_x2`); on older CANN builds the service reports a clear error
+and the W8A8/W4A8 checkpoints above remain fully supported.
+
 
 ## 1. Pull the Docker Image
 

@@ -25,6 +25,7 @@ limitations under the License.
 #include <algorithm>
 
 #include "core/runtime/json_object_output_rows.h"
+#include "core/util/json_reader.h"
 #if defined(USE_NPU)
 #include "acl/acl.h"
 #include "kernels/npu/xllm_ops/xllm_ops_api.h"
@@ -2030,6 +2031,20 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   const bool embedding_mode = options_.task_type() == "embed";
   args.embedding_mode(embedding_mode);
   torch::ScalarType dtype = util::parse_dtype(args.dtype(), device_);
+
+  // Surface the checkpoint's nested quantization_config to the reflected
+  // config dict so Python models can pick their weight-format path (e.g.
+  // DeepSeek-V4 official FP8 vs external W8A8 re-quant) at build time.
+  {
+    JsonReader reader;
+    const std::string config_path = model_weights_path_ + "/config.json";
+    if (reader.parse(config_path)) {
+      args.weight_quant_method(reader.value_or<std::string>(
+          std::vector<std::string>{"quantization_config.quant_method",
+                                   "quantization_config.quant"},
+          std::string{}));
+    }
+  }
 
   // A draft engine is fed token ids and detokenized by the target, so it owns
   // no tokenizer (its weights dir may not even ship tokenizer files, e.g. the

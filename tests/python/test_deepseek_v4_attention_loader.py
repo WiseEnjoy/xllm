@@ -78,7 +78,7 @@ def test_attention_loader_accepts_supported_prefixes_and_sink_alias(module_name:
         checkpoint_prefix="layers.0.",
         parameter_prefix="model.layers.0.",
         layer_id=0,
-        w8a8_loader=partial(load_w8a8_dynamic_projection, loader),
+        projection_loader=partial(load_w8a8_dynamic_projection, loader),
     )
 
     assert loaded_attention is attention
@@ -113,5 +113,5 @@ def test_attention_loader_rejects_missing_attention_weights() -> None:
             checkpoint_prefix="layers.0.",
             parameter_prefix="model.layers.0.",
             layer_id=0,
-            w8a8_loader=partial(load_w8a8_dynamic_projection, loader),
+            projection_loader=partial(load_w8a8_dynamic_projection, loader),
         )

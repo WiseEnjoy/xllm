@@ -19,6 +19,10 @@ from __future__ import annotations
 import torch
 import torch_npu
 
+# Absolute import (not a relative one): several test suites load this
+# module by file path, where relative imports have no package context.
+from xllm.python.kernels_npu import mxfp
+
 _FRACTAL_NZ_FORMAT = 29
 # The installed torch_npu runtime uses 1 for int8. Keep this named instead of
 # using a magic value at the call site.
@@ -574,6 +578,150 @@ def _grouped_moe_with_selected_experts_fake(
     swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     del topk_weights, topk_ids, w13, w2, w13_scale, w2_scale, w13_offset, w2_offset
+    del num_total_experts, start_expert_id, num_experts_per_rank, swiglu_limit
+    return torch.empty_like(hidden_states)
+
+
+def _mxfp4_moe_with_selected_experts_impl(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    num_total_experts: int = -1,
+    start_expert_id: int = 0,
+    num_experts_per_rank: int = -1,
+    swiglu_limit: float = 0.0,
+) -> torch.Tensor:
+    """Run MXFP4 experts with pre-computed routing (no gate).
+
+    Mirrors :func:`_grouped_moe_with_selected_experts_impl` for DeepSeek-V4
+    official FP8 checkpoints: packed-fp4 weights with ue8m0 antiquant scales
+    and MXFP8 activations. ``w13``/``w2`` must already be in the layouts
+    produced by :func:`mxfp.prepare_mxfp4_weight` /
+    :func:`mxfp.prepare_mxfp4_scale` (NZ-cast transposed weight and strided
+    scale view).
+    """
+    if not mxfp.MXFP_SUPPORTED:
+        raise RuntimeError(
+            "mxfp4_moe_with_selected_experts requires MX dtypes "
+            "(torch_npu.float8_e8m0fnu / float4_e2m1fn_x2); this CANN build "
+            "is too old. Use a W8A8 checkpoint or upgrade the runtime."
+        )
+    num_tokens = hidden_states.shape[0]
+    expert_num = num_total_experts if num_total_experts > 0 else w13.shape[0]
+    local_expert_count = num_experts_per_rank if num_experts_per_rank > 0 else w13.shape[0]
+    active_range = [start_expert_id, start_expert_id + local_expert_count]
+    if start_expert_id < 0 or active_range[1] > expert_num:
+        raise ValueError(f"active expert range {active_range} is outside [0, {expert_num})")
+    if w13.shape[0] != local_expert_count or w2.shape[0] != local_expert_count:
+        raise ValueError("local expert count must match the first dimension of w13 and w2")
+    expanded_hidden, expanded_row_idx, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(
+        hidden_states,
+        topk_ids,
+        scale=None,
+        active_num=num_tokens * topk_ids.size(-1),
+        expert_num=expert_num,
+        expert_tokens_num_type=1,
+        expert_tokens_num_flag=True,
+        active_expert_range=active_range,
+        quant_mode=-1,
+    )
+    quantized, pertoken_scale = mxfp.dynamic_mx_quant(expanded_hidden)
+    if expert_tokens.numel() < local_expert_count:
+        raise RuntimeError("npu_moe_init_routing_v2 returned fewer groups than local experts")
+    # The antiquant grouped matmul expects the prefix-sum group list
+    # (group_list_type=0), unlike the quant path's per-group counts (type 1).
+    group_list = torch.cumsum(expert_tokens[:local_expert_count].to(torch.int64), 0)
+    gate_up = torch_npu.npu_grouped_matmul(
+        x=[quantized],
+        weight=[w13],
+        scale=None,
+        antiquant_scale=[w13_scale],
+        per_token_scale=[pertoken_scale],
+        bias=None,
+        split_item=2,
+        group_type=0,
+        group_list=group_list,
+        group_list_type=0,
+        output_dtype=torch.bfloat16,
+        per_token_scale_dtype=mxfp.E8M0,
+        x_dtype=torch.float8_e4m3fn,
+        weight_dtype=mxfp.FP4_X2,
+    )[0]
+    act = mxfp.clipped_swiglu(gate_up, swiglu_limit)
+    act_quant, act_scale = mxfp.dynamic_mx_quant(act)
+    output = torch_npu.npu_grouped_matmul(
+        x=[act_quant],
+        weight=[w2],
+        scale=None,
+        antiquant_scale=[w2_scale],
+        per_token_scale=[act_scale],
+        bias=None,
+        split_item=2,
+        group_type=0,
+        group_list=group_list,
+        group_list_type=0,
+        output_dtype=hidden_states.dtype,
+        per_token_scale_dtype=mxfp.E8M0,
+        x_dtype=torch.float8_e4m3fn,
+        weight_dtype=mxfp.FP4_X2,
+    )[0]
+    local_mask = (topk_ids >= active_range[0]) & (topk_ids < active_range[1])
+    local_topk_weights = topk_weights * local_mask
+    return torch_npu.npu_moe_token_unpermute(
+        permuted_tokens=output,
+        sorted_indices=expanded_row_idx.abs(),
+        probs=local_topk_weights.to(output.dtype),
+    )
+
+
+@torch.library.custom_op("xllm_python::mxfp4_moe_with_selected_experts", mutates_args=())
+def mxfp4_moe_with_selected_experts(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    num_total_experts: int = -1,
+    start_expert_id: int = 0,
+    num_experts_per_rank: int = -1,
+    swiglu_limit: float = 0.0,
+) -> torch.Tensor:
+    return _mxfp4_moe_with_selected_experts_impl(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w13,
+        w2,
+        w13_scale,
+        w2_scale,
+        num_total_experts,
+        start_expert_id,
+        num_experts_per_rank,
+        swiglu_limit,
+    )
+
+
+@mxfp4_moe_with_selected_experts.register_fake
+def _mxfp4_moe_with_selected_experts_fake(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    num_total_experts: int = -1,
+    start_expert_id: int = 0,
+    num_experts_per_rank: int = -1,
+    swiglu_limit: float = 0.0,
+) -> torch.Tensor:
+    del topk_weights, topk_ids, w13, w2, w13_scale, w2_scale
     del num_total_experts, start_expert_id, num_experts_per_rank, swiglu_limit
     return torch.empty_like(hidden_states)
 
@@ -1524,6 +1672,7 @@ __all__ = [
     "encode_mega_moe_scale",
     "moe_expert_compute",
     "grouped_moe_with_selected_experts",
+    "mxfp4_moe_with_selected_experts",
     "moe_fused_topk",
     "cutlass_fused_moe",
     "fused_moe",
