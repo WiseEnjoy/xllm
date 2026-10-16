@@ -49,6 +49,7 @@ from xllm.python.attention.dsa_metadata import (
     build_cache_specs,
 )
 from xllm.python.model_executor.forward_context import (
+    copy_into_execution_buffer,
     get_forward_context,
     get_forward_context_or_none,
 )
@@ -238,6 +239,9 @@ class DsaAttentionBackend(AttentionBackend):
         self.dspark_block_size = dspark_block_size
         self.dspark_use_native_sas = dspark_use_native_sas
         self._dspark_swa_location: tuple[int, int, int] | None = None
+        self._swa_window_layer_specs: list[tuple[int, int]] | None = None
+        self._swa_window_sources: torch.Tensor | None = None
+        self._swa_window_row_map: list[int] = []
         for layer_id, layer_caches in enumerate(self.caches_info):
             for cache_id, cache_info in enumerate(layer_caches):
                 if cache_info.cache_type == DSA_CACHE_SLIDING_WINDOW:
@@ -382,6 +386,8 @@ class DsaAttentionBackend(AttentionBackend):
             enable_graph=enable_graph,
             graph_block_table_capacity_cols=graph_capacity_cols,
         )
+        if enable_graph and _uses_a5_sparse_kernels():
+            self._build_swa_window_sources(compressed_metadata, kv_seq_lens)
         # Capacity-bucket bound (token rows) baked into the captured graph's
         # committed-row gathers. The decode-graph runner fixes it once per graph
         # entry; it must stay constant across replays of that entry or the
@@ -1006,9 +1012,14 @@ class DsaAttentionBackend(AttentionBackend):
         if _uses_a5_sparse_kernels():
             seqused_ori_kernel = seq_kv
             if not use_prefill_attn:
-                ori_kv_for_attn, ori_block_table_for_attn, seqused_ori_kernel = self._decode_window_compact_eager(
-                    ori_kv_for_attn, ori_block_table_for_attn, seq_kv
-                )
+                if bool(getattr(metadata, "dsa_graph_mode", False)):
+                    ori_kv_for_attn, ori_block_table_for_attn, seqused_ori_kernel = self._graph_window_compact(
+                        ori_kv_for_attn, seq_kv, layer_id
+                    )
+                else:
+                    ori_kv_for_attn, ori_block_table_for_attn, seqused_ori_kernel = self._decode_window_compact_eager(
+                        ori_kv_for_attn, ori_block_table_for_attn, seq_kv
+                    )
             if compress_ratio > 1:
                 seqused_cmp_kernel = seq_kv // compress_ratio
                 cmp_residual_kernel = seq_kv % compress_ratio
@@ -1416,6 +1427,162 @@ class DsaAttentionBackend(AttentionBackend):
         for layer_tensors in compressed_metadata.slot_mappings:
             for index, tensor in enumerate(layer_tensors):
                 layer_tensors[index] = tensor.to(self.device)
+
+    def _build_swa_window_layer_specs(self) -> list[tuple[int, int]]:
+        """Resolve the SWA cache index and manager group for each layer."""
+        if self._swa_window_layer_specs is None:
+            specs: list[tuple[int, int]] = []
+            for layer_id, layer_caches in enumerate(self.caches_info):
+                mapping = self._resolve_cache_mapping(
+                    layer_id,
+                    self._layer_compress_ratio(layer_id),
+                )
+                cache_idx = mapping.ori_cache_idx
+                group_id = layer_caches[cache_idx].group_id if 0 <= cache_idx < len(layer_caches) else -1
+                specs.append((cache_idx, group_id))
+            self._swa_window_layer_specs = specs
+        return self._swa_window_layer_specs
+
+    def _build_swa_window_source_indices(
+        self,
+        block_table: torch.Tensor,
+        kv_seq_lens: list[int],
+        *,
+        block_size: int,
+        token: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build SWA manager source indices on the host."""
+        if block_table.dim() != 2:
+            raise ValueError("SWA graph block table must have shape [batch, blocks]")
+        n_seqs = max(len(kv_seq_lens), 1)
+        if block_table.size(0) < n_seqs:
+            raise ValueError(f"SWA graph block table has {block_table.size(0)} rows, but {n_seqs} sequences are active")
+        if block_size <= 0 or self.window_size > block_size:
+            raise ValueError(
+                f"SWA window size {self.window_size} must be positive and no greater than cache block size {block_size}"
+            )
+
+        table_width = int(block_table.size(1))
+        if table_width <= 0:
+            return torch.full((n_seqs, self.window_size), -1, dtype=torch.int64)
+        host_table = block_table.detach().cpu().to(torch.int64)
+        block_pos = torch.div(token, block_size, rounding_mode="floor").remainder(table_width)
+        block_id = host_table[:n_seqs].gather(1, block_pos)
+        source = block_id.clamp(min=0) * block_size + token.remainder(block_size)
+        return torch.where(
+            valid & block_id.ge(0),
+            source,
+            torch.full_like(source, -1),
+        )
+
+    def _build_swa_window_sources(
+        self,
+        compressed_metadata: DsaMetadata,
+        kv_seq_lens: list[int],
+    ) -> torch.Tensor | None:
+        """Refresh SWA source indices captured by the ACL graph."""
+        specs = self._build_swa_window_layer_specs()
+        n_seqs = max(len(kv_seq_lens), 1)
+        kv_lens = torch.zeros(n_seqs, dtype=torch.int64)
+        if kv_seq_lens:
+            kv_lens[: min(len(kv_seq_lens), n_seqs)] = torch.tensor(kv_seq_lens[:n_seqs], dtype=torch.int64)
+        window_lens = kv_lens.clamp(min=0, max=self.window_size)
+        token = (
+            kv_lens.unsqueeze(1)
+            - window_lens.unsqueeze(1)
+            + torch.arange(self.window_size, dtype=torch.int64).unsqueeze(0)
+        )
+        valid = torch.arange(self.window_size).unsqueeze(0) < window_lens.unsqueeze(1)
+
+        source_rows_by_group: dict[int, int] = {}
+        source_rows: list[torch.Tensor] = []
+        for layer_id, (cache_idx, group_id) in enumerate(specs):
+            if cache_idx < 0 or group_id < 0 or group_id >= len(self.group_infos) or group_id in source_rows_by_group:
+                continue
+            block_table = _get_layer_cache_tensor(
+                compressed_metadata.block_tables,
+                layer_id,
+                cache_idx,
+            )
+            if block_table is None:
+                continue
+            source_rows_by_group[group_id] = len(source_rows)
+            source_rows.append(
+                self._build_swa_window_source_indices(
+                    block_table,
+                    kv_seq_lens,
+                    block_size=self.group_infos[group_id].block_size,
+                    token=token,
+                    valid=valid,
+                )
+            )
+
+        self._swa_window_row_map = [source_rows_by_group.get(group_id, -1) for _, group_id in specs]
+        if not source_rows:
+            self._swa_window_sources = None
+            return None
+
+        sources = torch.stack(source_rows).to(self.device)
+        context = get_forward_context_or_none()
+        if context is None or context.execution_state is None:
+            # Protocol-level metadata tests have no executor context. The
+            # production ACL graph path always carries execution state and
+            # uses a persistent fixed-address buffer.
+            self._swa_window_sources = sources
+        else:
+            self._swa_window_sources = copy_into_execution_buffer(
+                ("dsv4_swa_window_sources",),
+                sources,
+            )
+        return self._swa_window_sources
+
+    def _graph_window_compact(
+        self,
+        ori_kv: torch.Tensor,
+        seq_kv: torch.Tensor,
+        layer_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather the latest SWA window with a graph-stable shape."""
+        if ori_kv.dim() != 4 or ori_kv.size(2) != 1:
+            raise ValueError("SWA graph cache must have shape [blocks, block_size, 1, head_dim]")
+        block_size = int(ori_kv.size(1))
+        if block_size != self.window_size:
+            raise ValueError(f"SWA graph cache block size {block_size} must equal window size {self.window_size}")
+
+        sources = self._swa_window_sources
+        row_map = self._swa_window_row_map
+        if sources is None or sources.dim() != 3:
+            raise RuntimeError("ACL graph SWA source indices were not captured")
+        if layer_id < 0 or layer_id >= len(row_map):
+            raise RuntimeError(f"ACL graph SWA source row is missing for layer {layer_id}")
+        source_row = row_map[layer_id]
+        if source_row < 0 or source_row >= sources.size(0):
+            raise RuntimeError(f"ACL graph SWA source row is missing for layer {layer_id}")
+
+        n_seqs = int(seq_kv.size(0))
+        if sources.size(1) < n_seqs or sources.size(2) != self.window_size:
+            raise RuntimeError("ACL graph SWA source-index shape changed")
+        source_indices = sources[source_row, :n_seqs]
+        source_valid = source_indices.ge(0)
+        safe_indices = source_indices.clamp(
+            min=0,
+            max=ori_kv.numel() // ori_kv.size(-1) - 1,
+        )
+        head_dim = ori_kv.size(-1)
+        gathered = ori_kv.reshape(-1, head_dim)[safe_indices]
+
+        window_lens = seq_kv.to(torch.int64).clamp(min=0, max=self.window_size)
+        offsets = torch.arange(self.window_size, device=seq_kv.device).unsqueeze(0)
+        valid = (offsets < window_lens.unsqueeze(1)) & source_valid
+        compact = torch.where(
+            valid.unsqueeze(-1),
+            gathered,
+            torch.zeros((), dtype=ori_kv.dtype, device=ori_kv.device),
+        )
+        compact_kv = compact.reshape(n_seqs, block_size, 1, head_dim)
+        compact_bt = torch.arange(n_seqs, device=seq_kv.device, dtype=torch.int32).unsqueeze(1)
+        return compact_kv, compact_bt, window_lens.to(torch.int32)
 
     def _decode_window_compact_eager(
         self,

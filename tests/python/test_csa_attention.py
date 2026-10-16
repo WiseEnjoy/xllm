@@ -42,6 +42,11 @@ from xllm.python.attention.csa_attention import (
     _scatter_by_slot,
 )
 from xllm.python.attention.dsa_metadata import build_cache_specs
+from xllm.python.model_executor.forward_context import (
+    AclGraphExecutionState,
+    ForwardContext,
+    forward_context,
+)
 from xllm.python.model_executor.v4_cp_context import (
     build_deepseek_v4_cp_context,
 )
@@ -179,6 +184,173 @@ def test_decode_window_compact_eager_rejects_missing_block_table_rows() -> None:
 
     with pytest.raises(ValueError, match="SWA block table has 1 rows"):
         backend._decode_window_compact_eager(ori_kv, ori_bt, seq_kv)
+
+
+def test_graph_window_compact_matches_eager_semantics() -> None:
+    backend = CsaAttentionBackend(
+        compress_ratios=[1, 1],
+        window_size=4,
+        n_layers=2,
+        num_heads=2,
+        attn_head_dim=4,
+        index_topk=1,
+        index_n_heads=2,
+        index_head_dim=4,
+        rope_head_dim=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    ori_kv = torch.arange(40, dtype=torch.float32).reshape(5, 4, 1, 2)
+    ori_bt = torch.tensor([[0, 1], [2, 3], [0, -1]], dtype=torch.int32)
+    seq_kv = torch.tensor([4, 3, 0], dtype=torch.int32)
+    compressed_metadata = SimpleNamespace(block_tables=[[ori_bt], [ori_bt]])
+    context = ForwardContext(
+        attention_backend=backend,
+        device=torch.device("cpu"),
+        metadata=SimpleNamespace(),
+        layer_caches=[],
+        execution_state=AclGraphExecutionState(persistent_buffers={}),
+    )
+
+    with forward_context(context):
+        sources = backend._build_swa_window_sources(compressed_metadata, [4, 3, 0])
+
+    assert sources is not None
+    assert sources.shape == (1, 3, 4)
+    assert backend._swa_window_row_map == [0, 0]
+    assert sources[0, 2].tolist() == [-1, -1, -1, -1]
+
+    graph_kv, graph_bt, graph_lens = backend._graph_window_compact(
+        ori_kv,
+        seq_kv,
+        layer_id=1,
+    )
+    eager_kv, eager_bt, eager_lens = backend._decode_window_compact_eager(
+        ori_kv,
+        ori_bt,
+        seq_kv,
+    )
+
+    assert graph_kv.shape == (3, 4, 1, 2)
+    assert graph_bt.tolist() == [[0], [1], [2]]
+    assert graph_lens.tolist() == [4, 3, 0]
+    assert eager_bt.tolist() == graph_bt.tolist()
+    assert eager_lens.tolist() == graph_lens.tolist()
+    torch.testing.assert_close(graph_kv, eager_kv)
+    assert torch.equal(graph_kv[2], torch.zeros_like(graph_kv[2]))
+
+
+def test_graph_window_sources_keep_stable_address_on_refresh() -> None:
+    backend = CsaAttentionBackend(
+        compress_ratios=[1],
+        window_size=4,
+        n_layers=1,
+        num_heads=2,
+        attn_head_dim=4,
+        index_topk=1,
+        index_n_heads=2,
+        index_head_dim=4,
+        rope_head_dim=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    block_table = torch.tensor([[0, 1], [2, 3], [0, -1]], dtype=torch.int32)
+    compressed_metadata = SimpleNamespace(block_tables=[[block_table]])
+    context = ForwardContext(
+        attention_backend=backend,
+        device=torch.device("cpu"),
+        metadata=SimpleNamespace(),
+        layer_caches=[],
+        execution_state=AclGraphExecutionState(persistent_buffers={}),
+    )
+
+    with forward_context(context):
+        first = backend._build_swa_window_sources(compressed_metadata, [4, 3, 0])
+        assert first is not None
+        address = first.data_ptr()
+        initial_values = first.clone()
+
+        second = backend._build_swa_window_sources(compressed_metadata, [2, 1, 0])
+
+    assert second is first
+    assert second.data_ptr() == address
+    assert not torch.equal(second, initial_values)
+    assert second[0, 0].tolist() == [0, 1, -1, -1]
+    assert second[0, 2].tolist() == [-1, -1, -1, -1]
+
+
+def test_a5_graph_execute_uses_window_compact(monkeypatch) -> None:
+    monkeypatch.setattr(csa_attention_module, "_uses_a5_sparse_kernels", lambda: True)
+    backend = CsaAttentionBackend(
+        compress_ratios=[1],
+        window_size=4,
+        n_layers=1,
+        num_heads=2,
+        attn_head_dim=4,
+        index_topk=1,
+        index_n_heads=2,
+        index_head_dim=4,
+        rope_head_dim=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    swa = torch.zeros(1, 4, 1, 4, dtype=torch.float32)
+    backend.bind_kv_caches([LayerCache(key=None, value=None, swa=swa)])
+    ori_bt = torch.tensor([[0]], dtype=torch.int32)
+    seq_kv = torch.tensor([3], dtype=torch.int32)
+    compressed_metadata = SimpleNamespace(
+        block_tables=[[ori_bt]],
+        slot_mappings=[[torch.tensor([2], dtype=torch.int32)]],
+        actual_seq_lengths_query=torch.tensor([0, 1], dtype=torch.int32),
+        actual_seq_lengths_kv=seq_kv,
+        input_positions=torch.tensor([2], dtype=torch.int64),
+        cos_table=torch.empty(0),
+        sin_table=torch.empty(0),
+        c4_cos=torch.empty(0),
+        c128_cos=torch.empty(0),
+        c1_metadata=torch.zeros(1, dtype=torch.int32),
+        sparse_metadata_ori_win_left=3,
+    )
+    metadata = SimpleNamespace(
+        dsa_metadata=compressed_metadata,
+        is_prefill=False,
+        is_chunked_prefill=False,
+        dsa_graph_mode=True,
+    )
+    backend._metadata = metadata
+    context = ForwardContext(
+        attention_backend=backend,
+        device=torch.device("cpu"),
+        metadata=metadata,
+        layer_caches=[LayerCache(key=None, value=None, swa=swa)],
+        execution_state=AclGraphExecutionState(persistent_buffers={}),
+    )
+    calls: list[dict] = []
+
+    def fake_sparse_attn(**kwargs):
+        calls.append(kwargs)
+        return kwargs["q"].clone(), torch.empty(0)
+
+    monkeypatch.setattr(csa_attention_module, "_sparse_attn_sharedkv", fake_sparse_attn)
+    q = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4)
+    kv = torch.full((1, 1, 4), 7.0)
+    layer = SimpleNamespace(layer_id=0, attn_sink=None, attn_sink_loaded=False)
+
+    with forward_context(context):
+        assert backend._build_swa_window_sources(compressed_metadata, [3]) is not None
+        out = backend.execute(q, kv, kv, layer)
+
+    assert torch.equal(out, q)
+    assert len(calls) == 1
+    eager_kv, eager_bt, eager_lens = backend._decode_window_compact_eager(
+        swa,
+        ori_bt,
+        seq_kv,
+    )
+    assert calls[0]["ori_block_table"].tolist() == eager_bt.tolist()
+    assert calls[0]["seqused_ori_kv"].tolist() == eager_lens.tolist()
+    torch.testing.assert_close(calls[0]["ori_kv"], eager_kv)
+    assert calls[0]["ori_kv"][0, 2, 0].tolist() == [7.0, 7.0, 7.0, 7.0]
 
 
 def test_dspark_native_sas_window_matches_cpp_contract() -> None:
