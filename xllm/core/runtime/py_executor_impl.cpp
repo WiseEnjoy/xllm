@@ -113,6 +113,13 @@ void register_xllm_runtime_module(py::module_& m) {
     }
     return tensor;
   });
+  m.def("moe_ep_hccl_comm_name", []() {
+    PyCausalLM* py_causal_lm = PyCausalLM::active_instance();
+    if (py_causal_lm != nullptr) {
+      return py_causal_lm->moe_ep_hccl_comm_name();
+    }
+    return std::string();
+  });
   m.def("eplb_batch_isend_irecv",
         [](py::list operation_types, py::list tensors, py::list remote_ranks) {
           PyCausalLM* py_causal_lm = PyCausalLM::active_instance();
