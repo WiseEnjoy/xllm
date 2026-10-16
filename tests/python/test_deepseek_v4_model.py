@@ -209,6 +209,7 @@ def test_qli_decode_uses_request_shaped_rope_rows(monkeypatch: pytest.MonkeyPatc
         actual_seq_lengths_query=torch.tensor([1], dtype=torch.int32),
         actual_seq_lengths_kv=torch.tensor([112], dtype=torch.int32),
         qli_metadata=torch.tensor([1], dtype=torch.int32),
+        qli_expanded_rope={},
     )
     mapping = SimpleNamespace(index_cache_idx=0)
     rotary_mul = MagicMock()
@@ -279,6 +280,19 @@ def test_hyper_connection_shapes() -> None:
     assert hc.hc_attn_scale.shape == (3,)
     # hc_pre calls the compiled NPU kernel, which is not available in the
     # pure-Python unit-test context; only shape construction is verified here.
+
+
+def test_hyper_connection_weights_are_preconverted_once() -> None:
+    cfg = DeepseekV4Config.from_dict(_DSV4_CONFIG)
+    hc = DeepseekV4HyperConnection(cfg, torch.float32, torch.device("cpu"))
+
+    hc.process_weights_after_loading()
+    function_pointers = (hc.hc_attn_fn.data_ptr(), hc.hc_ffn_fn.data_ptr())
+    hc.process_weights_after_loading()
+
+    assert hc.hc_attn_fn.dtype == torch.bfloat16
+    assert hc.hc_ffn_fn.dtype == torch.bfloat16
+    assert (hc.hc_attn_fn.data_ptr(), hc.hc_ffn_fn.data_ptr()) == function_pointers
 
 
 def test_decoder_layer_builds() -> None:
@@ -431,6 +445,10 @@ def _capture_test_model(
             return torch.stack((values, values + 10.0), dim=-1)
 
     class Layer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rope_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+
         def forward(
             self,
             hidden: torch.Tensor,
@@ -438,8 +456,11 @@ def _capture_test_model(
             positions: torch.Tensor,
             cos_sin_cache: torch.Tensor,
             input_ids: torch.Tensor | None = None,
+            cos: torch.Tensor | None = None,
+            sin: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, None]:
             del residual, positions, cos_sin_cache, input_ids
+            self.rope_pairs.append((cos, sin))
             return hidden + 1.0, None
 
     class Norm(torch.nn.Module):
@@ -480,9 +501,9 @@ def _capture_test_model(
     model.embed_tokens = Embedding()
     model.layers = torch.nn.ModuleList([Layer()])
     model.norm = Norm()
-    model.rotary = SimpleNamespace(cos_sin_cache=torch.empty(0))
-    model.compress_rotary_c4 = SimpleNamespace(cos_sin_cache=torch.empty(0))
-    model.compress_rotary_c128 = SimpleNamespace(cos_sin_cache=torch.empty(0))
+    model.rotary = SimpleNamespace(cos_sin_cache=torch.zeros((2, 4)))
+    model.compress_rotary_c4 = SimpleNamespace(cos_sin_cache=torch.zeros((2, 4)))
+    model.compress_rotary_c128 = SimpleNamespace(cos_sin_cache=torch.zeros((2, 4)))
     model.aux_hidden_capture = deepseek_v4.AuxHiddenCapture(
         layers_to_capture,
         transform=lambda hidden: hidden.mean(dim=1) if hidden.dim() == 3 else hidden,
@@ -511,6 +532,41 @@ def test_model_returns_pre_hc_hidden_for_mtp_target(
     expected_streams = embedded.unsqueeze(1).expand(-1, 2, -1) + 1.0
     torch.testing.assert_close(target_hidden, expected_streams.flatten(1))
     torch.testing.assert_close(hidden, expected_streams.mean(dim=1) + 5.0)
+
+
+def test_model_expands_each_distinct_rope_table_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = _capture_test_model(
+        monkeypatch,
+        layers_to_capture=(),
+        num_speculative_tokens=0,
+    )
+    shared_table = torch.tensor(((1.0, 2.0, 3.0, 4.0), (5.0, 6.0, 7.0, 8.0)))
+    compressed_table = torch.tensor(((1.0, 3.0, 5.0, 7.0), (2.0, 4.0, 6.0, 8.0)))
+    model.cfg.compress_ratios = (1, 4, 128)
+    model.layers = torch.nn.ModuleList([type(model.layers[0])() for _ in range(3)])
+    model.rotary = SimpleNamespace(cos_sin_cache=shared_table)
+    model.compress_rotary_c4 = SimpleNamespace(cos_sin_cache=compressed_table)
+    model.compress_rotary_c128 = model.rotary
+    original_expand = deepseek_v4._expand_half_rope_cos_sin
+    expand = MagicMock(side_effect=original_expand)
+    monkeypatch.setattr(deepseek_v4, "_expand_half_rope_cos_sin", expand)
+
+    model(torch.tensor((1, 2)), torch.tensor((0, 1)))
+
+    expand.assert_called()
+    assert expand.call_count == 2
+    for layer in model.layers:
+        assert len(layer.rope_pairs) == 1
+        assert layer.rope_pairs[0][0] is not None
+        assert layer.rope_pairs[0][1] is not None
+    shared_pair = model.layers[0].rope_pairs[0]
+    compressed_pair = model.layers[1].rope_pairs[0]
+    torch.testing.assert_close(shared_pair[0], model.layers[2].rope_pairs[0][0])
+    torch.testing.assert_close(shared_pair[1], model.layers[2].rope_pairs[0][1])
+    torch.testing.assert_close(shared_pair[0], torch.tensor(((1.0, 1.0, 2.0, 2.0), (5.0, 5.0, 6.0, 6.0))))
+    torch.testing.assert_close(shared_pair[1], torch.tensor(((3.0, 3.0, 4.0, 4.0), (7.0, 7.0, 8.0, 8.0))))
+    torch.testing.assert_close(compressed_pair[0], torch.tensor(((1.0, 1.0, 3.0, 3.0), (2.0, 2.0, 4.0, 4.0))))
+    torch.testing.assert_close(compressed_pair[1], torch.tensor(((5.0, 5.0, 7.0, 7.0), (6.0, 6.0, 8.0, 8.0))))
 
 
 def test_layer_capture_takes_precedence_over_mtp_target_hidden(

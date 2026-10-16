@@ -121,6 +121,11 @@ class DsaMetadata:
     # on the request-owned metadata makes every ACL graph entry retain the
     # stable tensor addresses captured by each layer.
     input_rope_by_ratio: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    # Expanded QLI RoPE tables scoped to one forward so compressed layers can
+    # share the half-to-full-width conversion.
+    qli_expanded_rope: dict[tuple[int, int, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict
+    )
     # Global-position RoPE for the KV / compressor / index-cache writes under
     # prefill CP. ``cos_table`` / ``sin_table`` are localized to this rank's
     # query rows, but the projected-attention KV path runs on the full
@@ -133,12 +138,19 @@ class DsaMetadata:
     # same group share the same underlying tensor (no copy).
     block_tables: list[list[torch.Tensor]] = field(default_factory=list)
     slot_mappings: list[list[torch.Tensor]] = field(default_factory=list)
+    # One source table per cache manager. The per-layer grids re-reference
+    # these tensors, so data movement can visit each manager once.
+    manager_block_tables: list[torch.Tensor] = field(default_factory=list)
+    manager_slot_mappings: list[torch.Tensor] = field(default_factory=list)
 
     # Precomputed AICPU tiling metadata (filled by the backend, not the builder).
     c1_metadata: torch.Tensor | None = None
     c4_metadata: torch.Tensor | None = None
     c128_metadata: torch.Tensor | None = None
     qli_metadata: torch.Tensor | None = None
+    # A5 QLI v2 length tensors derived once for this forward. Each compressed
+    # layer reuses the same request-level values.
+    qli_v2_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     # Runtime window baked into c1/c4/c128 metadata. Native DSpark expands
     # this window and supplies explicit SWA indices to the attention kernel.
     sparse_metadata_ori_win_left: int = -1
@@ -405,9 +417,11 @@ class DsaMetadataBuilder:
         dsa.input_positions = positions
         dsa.is_acl_graph = enable_graph
         if dsa_cos_sin is not None and dsa_cos_sin.numel() > 0:
+            # Preserve the source layout instead of copying each half-width
+            # RoPE table; NPU kernels accept these request-shaped views.
             cos_sin_chunks = dsa_cos_sin.chunk(2, dim=-1)
-            dsa.cos_table = cos_sin_chunks[0].contiguous()
-            dsa.sin_table = cos_sin_chunks[1].contiguous()
+            dsa.cos_table = cos_sin_chunks[0]
+            dsa.sin_table = cos_sin_chunks[1]
         if positions is not None and positions.numel() > 0:
             self._build_positions(dsa, kv_seq_lens, q_lens, enable_graph)
         dsa.start_pos = (dsa.actual_seq_lengths_kv - dsa.seq_lens_q).to(torch.int32)
@@ -593,6 +607,8 @@ class DsaMetadataBuilder:
                 else:
                     dsa.block_tables[lid].append(torch.empty(0))
                     dsa.slot_mappings[lid].append(torch.empty(0))
+        dsa.manager_block_tables = list(proc_bt)
+        dsa.manager_slot_mappings = list(proc_slots)
 
     # -- per-group processing (process_group, cpp:323-362) -----------------
 

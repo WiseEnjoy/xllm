@@ -517,7 +517,7 @@ def test_graph_slots_and_block_tables_use_bucket_capacity() -> None:
     assert dsa.block_tables[0][0].shape == (1, 4)
 
 
-def test_rope_cache_is_split_into_contiguous_cos_and_sin_tables() -> None:
+def test_rope_cache_is_split_into_zero_copy_cos_and_sin_tables() -> None:
     builder, _, _ = _make_builder()
     cos_sin = torch.arange(24, dtype=torch.float32).view(3, 8)
     dsa = builder.build(
@@ -532,8 +532,10 @@ def test_rope_cache_is_split_into_contiguous_cos_and_sin_tables() -> None:
 
     assert torch.equal(dsa.cos_table, cos_sin[:, :4])
     assert torch.equal(dsa.sin_table, cos_sin[:, 4:])
-    assert dsa.cos_table.is_contiguous()
-    assert dsa.sin_table.is_contiguous()
+    assert not dsa.cos_table.is_contiguous()
+    assert not dsa.sin_table.is_contiguous()
+    assert dsa.cos_table.data_ptr() == cos_sin.data_ptr()
+    assert dsa.sin_table.data_ptr() != cos_sin.data_ptr()
 
 
 def test_compressed_positions_preserve_position_dtype() -> None:
