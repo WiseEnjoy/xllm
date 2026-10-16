@@ -51,6 +51,7 @@ class KernelConfig final {
          "enable_aclnn_swiglu",
          "enable_mega_moe",
          "enable_dspark_native_sas",
+         "megamoe_max_tokens_per_rank",
          "enable_flashcomm1",
          "enable_dsa_cp",
          "flashcomm1_min_prefill_tokens",
@@ -79,6 +80,8 @@ class KernelConfig final {
   PROPERTY(bool, enable_aclnn_swiglu) = false;
 
   PROPERTY(bool, enable_mega_moe) = false;
+
+  PROPERTY(int32_t, megamoe_max_tokens_per_rank) = 512;
 
   PROPERTY(bool, enable_dspark_native_sas) = false;
 
