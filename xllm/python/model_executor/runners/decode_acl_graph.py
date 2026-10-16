@@ -285,6 +285,7 @@ class DecodeAclGraphRunner(BaseRunner):
         *,
         is_spec_draft: bool = False,
         draft_query_width: int = 1,
+        spec_verify_rows: int = 1,
         eplv2_graph_token_limit: int | None = None,
     ) -> None:
         super().__init__(model, attention_backend, device)
@@ -292,12 +293,20 @@ class DecodeAclGraphRunner(BaseRunner):
         self.dp_rank = dp_rank
         # Each rank may receive every sequence in the batch. The scheduler's
         # remaining_seq_budget is the full max_seqs_per_batch, not an even
-        # split, so the graph capacity matches that budget.
-        self.max_batch = max_batch
+        # split, so the graph sequence capacity matches that budget.
+        self.sequence_batch_capacity = max(1, int(max_batch))
+        # max_batch is the largest token-row bucket this runner can capture.
+        # Speculative target verification expands each sequence to several
+        # independent decode rows; only the executor knows that the model is
+        # running that mode, so it supplies the row width explicitly. Direct
+        # runner callers keep the previous sequence-only behavior.
+        spec_verify_rows = max(1, int(spec_verify_rows))
+        self.max_batch = self.sequence_batch_capacity
+        if spec_verify_rows > 1:
+            self.max_batch = _decode_bucket(self.sequence_batch_capacity * spec_verify_rows)
         # Token rows per logical sequence: 1 for plain decode, num_spec+1 for
         # MTP spec-verify. Static paging buffers are sized in token rows so the
-        # expanded-verify graph (N*width rows) gets matching capacity instead
-        # of the sequence-only max_batch (item 二).
+        # expanded-verify graph gets matching capacity.
         self.num_decoding_tokens = max(1, int(num_decoding_tokens))
         # Optional memory guardrail: buckets above the limit fall back to
         # eager instead of capturing ever-larger graphs (0 disables).
@@ -332,10 +341,10 @@ class DecodeAclGraphRunner(BaseRunner):
     def _engram_graph_token_capacity(self) -> int:
         """Floor, in token rows, for the graph-visible engram staging block.
 
-        ``max_batch`` counts sequences (segments), not token rows: the captured
-        graph packs ``num_decoding_tokens`` token rows per sequence at the
-        verify slots (1 for plain decode) -- the same per-sequence width
-        ``_shared_graph_plan`` folds into ``verify_width``. A spec-draft runner
+        The captured graph packs ``num_decoding_tokens`` token rows per
+        sequence at the verify slots (1 for plain decode) -- the same
+        per-sequence width ``_shared_graph_plan`` folds into ``verify_width``.
+        A spec-draft runner
         additionally emits up to ``draft_query_width`` query rows per sequence;
         that is a different quantity from the verify rows and may be
         larger, so fold the wider of the two, keeping the block from being sized
@@ -350,7 +359,7 @@ class DecodeAclGraphRunner(BaseRunner):
         it large only wastes HBM. ``_decode_bucket`` then aligns this floor to
         the graph key's padded token-row bucket.
         """
-        seq_capacity = self.max_batch
+        seq_capacity = self.sequence_batch_capacity
         if self.decode_batch_size_limit > 0:
             seq_capacity = min(seq_capacity, self.decode_batch_size_limit)
         rows_per_seq = self.num_decoding_tokens
@@ -530,15 +539,11 @@ class DecodeAclGraphRunner(BaseRunner):
         is_expanded_spec_verify = expanded_view is not None
         if disable_verify_graph and is_expanded_spec_verify:
             return False
-        # MTP spec-verify packs (num_speculative_tokens+1) token-rows per
-        # sequence, so batch_size (input_ids.numel()) is in TOKENS while
-        # self.max_batch (derived from max_seqs_per_batch) is in SEQS. Comparing
-        # tokens to seqs wrongly rejects an 8-seq × 4-row verify (32 tokens,
-        # 8 seqs ≤ 16) as bucket-overflow, forcing eager (~10x slower) under
-        # concurrency. For expanded verify, gate on the actual SEQUENCE count
-        # (linear_state_indices is per-seq) — the graph still captures/replays
-        # at the full token bucket (keyed by padded_batch_size below), this
-        # only fixes the graph-vs-eager admission decision.
+        # max_batch is a token-row bucket, while expanded-verify metadata
+        # reports one row per logical sequence. Gate those rows by sequence
+        # count so an expanded group cannot bypass the scheduler sequence
+        # budget; plain decode and unexpanded speculative target verification
+        # stay in token-row units.
         if self.dp_size == 1 and is_expanded_spec_verify:
             lsi = getattr(metadata, "linear_state_indices", None)
             has_kda_layers = lsi is not None and lsi.numel() > 0
@@ -1253,9 +1258,8 @@ class DecodeAclGraphRunner(BaseRunner):
     ) -> None:
         metadata = self._normalize_dsa_metadata(metadata)
         batch_size = input_ids.shape[0]
-        # Same seq-vs-token admission as execute: MTP verify packs
-        # (num_spec+1) token-rows per seq, so the capacity gate (max_batch,
-        # in seqs) must compare SEQUENCE count, not token count.
+        # Admission is in token-row buckets; _shared_graph_plan folds expanded
+        # verify rows back to logical sequences.
         _, _, admission_batch = self._shared_graph_plan(
             metadata,
             batch_size,
@@ -1283,10 +1287,8 @@ class DecodeAclGraphRunner(BaseRunner):
     ) -> ModelExecutionOutput:
         metadata = self._normalize_dsa_metadata(metadata)
         batch_size = input_ids.shape[0]
-        # Same seq-vs-token admission as can_execute: MTP verify packs
-        # (num_spec+1) token-rows per seq, so the capacity gate (max_batch, in
-        # seqs) must compare SEQUENCE count, not token count. The graph is still
-        # keyed/captured at the full token bucket (padded_batch_size).
+        # Admission is in token-row buckets. The graph is keyed/captured at the
+        # full padded token bucket.
         if self.dp_size > 1:
             # DP ranks share one captured graph shape: the bucket must be the
             # GLOBAL max token count, not this rank's local batch_size, so
@@ -1294,10 +1296,8 @@ class DecodeAclGraphRunner(BaseRunner):
             # dp_execution_token_counts agree across ranks and the fixed-shape
             # all_gather matches). The bucket is in TOKEN rows — same unit as
             # the non-DP _decode_bucket(batch_size) — because the static
-            # buffers / q_cu / q_seq_lens are all per token row; folding tokens
-            # back to sequences here would under-size the buffers and crash
-            # _fill_entry's per-token-row copy. The sequence capacity gate
-            # below uses the shared verify layout, including an empty rank.
+            # buffers / q_cu / q_seq_lens are all per token row. The shared
+            # verify layout also covers an empty DP rank.
             # Assert this rank's count equals its batch_size.
             execution_counts = getattr(metadata, "dp_execution_token_counts", None)
             if execution_counts is None or len(execution_counts) != self.dp_size:
@@ -1846,12 +1846,11 @@ class DecodeAclGraphRunner(BaseRunner):
         if self._paged_kv_indices_buffer is None:
             page_size = self.attention_backend.page_size
             max_blocks_per_sequence = (self.max_model_len + page_size - 1) // page_size
-            # Capacity in TOKEN rows: MTP spec-verify captures N*width rows,
-            # so the flat paged_kv_indices buffer must hold
-            # max_batch * num_decoding_tokens * max_blocks entries (item 二);
-            # sizing it by sequences alone underflows on expanded-verify copy.
+            # Capacity in token rows: speculative verify captures N*width
+            # independent paging rows, so size the flat paged_kv indices from
+            # the sequence budget and verify width.
             self._paged_kv_indices_buffer = torch.zeros(
-                self.max_batch * self.num_decoding_tokens * max_blocks_per_sequence,
+                self.sequence_batch_capacity * self.num_decoding_tokens * max_blocks_per_sequence,
                 dtype=paged_kv_indices.dtype,
                 device=device,
             )

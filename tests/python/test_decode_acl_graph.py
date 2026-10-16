@@ -68,6 +68,45 @@ def _metadata(linear_state_indices: torch.Tensor) -> SimpleNamespace:
     )
 
 
+def test_spec_verify_rows_expand_to_token_row_bucket() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        attention_backend,
+        torch.device("cpu"),
+        max_batch=2,
+        max_model_len=8,
+        num_decoding_tokens=6,
+        spec_verify_rows=6,
+    )
+    metadata = _metadata(torch.arange(2, dtype=torch.int32))
+
+    assert runner.sequence_batch_capacity == 2
+    assert runner.max_batch == 16
+    assert runner._engram_graph_token_capacity() == 16
+    with patch.object(runner, "_has_compatible_decode_metadata", return_value=True):
+        assert runner.can_execute(torch.zeros(12, dtype=torch.int32), metadata)
+
+
+def test_plain_decode_does_not_inherit_spec_verify_capacity() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        attention_backend,
+        torch.device("cpu"),
+        max_batch=2,
+        max_model_len=8,
+        num_decoding_tokens=6,
+    )
+    metadata = _metadata(torch.arange(2, dtype=torch.int32))
+
+    assert runner.sequence_batch_capacity == 2
+    assert runner.max_batch == 2
+    assert runner._engram_graph_token_capacity() == 16
+    with patch.object(runner, "_has_compatible_decode_metadata", return_value=True):
+        assert runner.can_execute(torch.zeros(12, dtype=torch.int32), metadata) is False
+
+
 @pytest.mark.parametrize(
     "limit,sequences,expected",
     [(16, 1, True), (16, 2, True), (16, 3, False), (24, 3, False), (32, 3, True), (32, 4, True), (32, 5, False)],
