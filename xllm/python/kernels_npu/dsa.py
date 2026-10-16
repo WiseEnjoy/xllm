@@ -232,3 +232,123 @@ def sparse_attn_sharedkv_metadata(
         has_ori_kv,
         has_cmp_kv,
     )
+
+
+def sparse_flash_mla(
+    q: torch.Tensor,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the Ascend 950 sparse MLA attention operator."""
+    import cann_ops_transformer
+
+    return cann_ops_transformer.sparse_flash_mla(q, **kwargs)
+
+
+def sparse_flash_mla_metadata(
+    num_heads_q: int,
+    num_heads_kv: int,
+    head_dim: int,
+    **kwargs,
+) -> torch.Tensor:
+    """Build Ascend 950 sparse MLA attention tiling metadata."""
+    import cann_ops_transformer
+
+    return cann_ops_transformer.sparse_flash_mla_metadata(num_heads_q, num_heads_kv, head_dim, **kwargs)
+
+
+def quant_lightning_indexer_v2(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
+    seqused_q: torch.Tensor | None,
+    seqused_k: torch.Tensor | None,
+    cmp_residual_k: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+    output_idx_offset: torch.Tensor | None,
+    metadata: torch.Tensor | None,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_dim: int,
+    topk: int,
+    quant_mode: int,
+    max_seqlen_q: int,
+    layout_q: str,
+    layout_k: str,
+    mask_mode: int,
+    cmp_ratio: int,
+    return_value: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select compressed key blocks with the Ascend 950 indexer operator."""
+    return torch.ops.xllm_ops.quant_lightning_indexer_v2(
+        q,
+        k,
+        w,
+        q_descale,
+        k_descale,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        cmp_residual_k,
+        block_table,
+        output_idx_offset,
+        metadata,
+        num_heads_q,
+        num_heads_k,
+        head_dim,
+        topk,
+        quant_mode,
+        max_seqlen_q,
+        layout_q,
+        layout_k,
+        mask_mode,
+        cmp_ratio,
+        return_value,
+    )
+
+
+def quant_lightning_indexer_v2_metadata(
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
+    seqused_q: torch.Tensor | None,
+    seqused_k: torch.Tensor | None,
+    cmp_residual_k: torch.Tensor | None,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_dim: int,
+    topk: int,
+    quant_mode: int,
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    layout_q: str,
+    layout_k: str,
+    mask_mode: int,
+    cmp_ratio: int,
+    device: str,
+) -> torch.Tensor:
+    """Build Ascend 950 indexer tiling metadata."""
+    return torch.ops.xllm_ops.quant_lightning_indexer_v2_metadata(
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        cmp_residual_k,
+        num_heads_q,
+        num_heads_k,
+        head_dim,
+        topk,
+        quant_mode,
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        layout_q,
+        layout_k,
+        mask_mode,
+        cmp_ratio,
+        device,
+    )

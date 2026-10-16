@@ -237,6 +237,11 @@ def test_qli_decode_uses_request_shaped_rope_rows(monkeypatch: pytest.MonkeyPatc
         MagicMock(return_value=expected_topk),
         raising=False,
     )
+    monkeypatch.setattr(
+        deepseek_v4.current_platform,
+        "get_ascend_soc_generation",
+        lambda: "a2",
+    )
 
     output = DeepseekV4Indexer.select_qli_dsv4(
         indexer,

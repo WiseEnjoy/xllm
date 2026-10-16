@@ -52,6 +52,7 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context,
     get_forward_context_or_none,
 )
+from xllm.python.platform import current_platform
 
 if TYPE_CHECKING:
     from xllm.python.attention.backend import AttentionMetadata
@@ -67,6 +68,11 @@ HEAVILY_COMPRESSED_ATTENTION = "heavily_compressed_attention"
 _MASK_MODE_RIGHT_DOWN_CAUSAL = 3
 _MASK_MODE_COMPRESS = 4
 _DSPARK_SWA_INDEX_ALIGNMENT = 128
+
+
+def _uses_a5_sparse_kernels() -> bool:
+    """Whether DeepSeek-V4 should use the Ascend A5 sparse kernels."""
+    return current_platform.get_ascend_soc_generation() == "a5"
 
 
 def _uses_prefill_attention(metadata: AttentionMetadata) -> bool:
@@ -923,6 +929,7 @@ class DsaAttentionBackend(AttentionBackend):
                 ori_block_table,
                 self.window_size,
                 cp_ctx.local_kv_cu_seq_lens if cp_enabled else None,
+                use_zero_based_blocks=_uses_a5_sparse_kernels(),
             )
         else:
             if ori_kv is not None and ori_slot is not None:
@@ -980,7 +987,6 @@ class DsaAttentionBackend(AttentionBackend):
         seq_q = compressed_metadata.actual_seq_lengths_query
         seq_kv = compressed_metadata.actual_seq_lengths_kv
         sparse_meta_for_kernel = sparse_meta
-        ori_block_table_for_kernel = ori_block_table_for_attn
         cmp_block_table_for_kernel = cmp_block_table
         # Match C++ DSAttention's optional contract exactly: prefill and
         # chunked prefill pass query cu-seqlens, while decode leaves
@@ -994,6 +1000,18 @@ class DsaAttentionBackend(AttentionBackend):
             cu_seqlens_ori_kv_for_attn = cp_ctx.local_kv_cu_seq_lens if cp_enabled else seq_q
         else:
             cu_seqlens_ori_kv_for_attn = None
+        seqused_ori_kernel: torch.Tensor | None = None
+        seqused_cmp_kernel: torch.Tensor | None = None
+        cmp_residual_kernel: torch.Tensor | None = None
+        if _uses_a5_sparse_kernels():
+            seqused_ori_kernel = seq_kv
+            if not use_prefill_attn:
+                ori_kv_for_attn, ori_block_table_for_attn, seqused_ori_kernel = self._decode_window_compact_eager(
+                    ori_kv_for_attn, ori_block_table_for_attn, seq_kv
+                )
+            if compress_ratio > 1:
+                seqused_cmp_kernel = seq_kv // compress_ratio
+                cmp_residual_kernel = seq_kv % compress_ratio
         sinks = getattr(layer, "attn_sink", None) if getattr(layer, "attn_sink_loaded", False) else None
         if sinks is not None:
             sinks = sinks.to(q.device, dtype=torch.float32).contiguous()
@@ -1017,7 +1035,7 @@ class DsaAttentionBackend(AttentionBackend):
             cmp_kv=cmp_kv if compress_ratio > 1 else None,
             ori_sparse_indices=ori_sparse_indices,
             cmp_sparse_indices=compress_topk_idxs,
-            ori_block_table=ori_block_table_for_kernel,
+            ori_block_table=ori_block_table_for_attn,
             cmp_block_table=cmp_block_table_for_kernel if compress_ratio > 1 else None,
             cu_seqlens_q=seq_q,
             cu_seqlens_ori_kv=cu_seqlens_ori_kv_for_attn,
@@ -1026,6 +1044,9 @@ class DsaAttentionBackend(AttentionBackend):
             cu_seqlens_cmp_kv=None,
             seqused_q=None,
             seqused_kv=seq_kv,
+            seqused_ori_kv=seqused_ori_kernel,
+            seqused_cmp_kv=seqused_cmp_kernel,
+            cmp_residual_kv=cmp_residual_kernel,
             # sinks: the attention sink parameter (attn_sink) is required by the
             # sparse_attn_sharedkv kernel (C++ :949 passes attn_sink_ when loaded).
             sinks=sinks,
@@ -1230,33 +1251,68 @@ class DsaAttentionBackend(AttentionBackend):
             self._use_native_sas(is_prefill),
         )
         compressed_metadata.sparse_metadata_ori_win_left = ori_win_left
+        use_a5 = _uses_a5_sparse_kernels()
         for ratio in (1, 4, 128):
             has_cmp = ratio > 1
             cmp_topk = self.index_topk if ratio == 4 else 0
-            sparse_metadata = kernels.sparse_attn_sharedkv_metadata(
-                num_heads_q=self.num_heads,
-                num_heads_kv=1,
-                head_dim=self.head_dim,
-                cu_seqlens_q=seq_q,
-                cu_seqlens_ori_kv=cu_seqlens_ori_kv,
-                cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
-                seqused_q=seqused_q,
-                seqused_kv=seqused_kv,
-                batch_size=batch_size,
-                max_seqlen_q=max_q,
-                max_seqlen_kv=max_kv,
-                ori_topk=0,
-                cmp_topk=cmp_topk,
-                cmp_ratio=ratio,
-                ori_mask_mode=_MASK_MODE_COMPRESS,
-                cmp_mask_mode=_MASK_MODE_RIGHT_DOWN_CAUSAL,
-                ori_win_left=ori_win_left,
-                ori_win_right=0,
-                layout_q="TND",
-                layout_kv="PA_ND",
-                has_ori_kv=True,
-                has_cmp_kv=has_cmp,
-            )
+            if use_a5:
+                seqused_ori_kv = seq_kv if is_prefill else seq_kv.clamp(max=self.window_size)
+                seqused_cmp_kv = seq_kv // ratio if has_cmp else None
+                cmp_residual_kv = seq_kv % ratio if has_cmp else None
+                sparse_metadata = kernels.sparse_flash_mla_metadata(
+                    num_heads_q=self.num_heads,
+                    num_heads_kv=1,
+                    head_dim=self.head_dim,
+                    cu_seqlens_q=seq_q,
+                    cu_seqlens_ori_kv=None,
+                    cu_seqlens_cmp_kv=None,
+                    seqused_q=None,
+                    seqused_ori_kv=seqused_ori_kv,
+                    seqused_cmp_kv=seqused_cmp_kv,
+                    cmp_residual_kv=cmp_residual_kv,
+                    ori_topk_length=None,
+                    cmp_topk_length=None,
+                    batch_size=batch_size,
+                    max_seqlen_q=max_q,
+                    max_seqlen_ori_kv=max_kv,
+                    max_seqlen_cmp_kv=int(max_kv) // ratio if has_cmp else 0,
+                    ori_topk=0,
+                    cmp_topk=cmp_topk,
+                    cmp_ratio=ratio,
+                    ori_mask_mode=_MASK_MODE_COMPRESS,
+                    cmp_mask_mode=_MASK_MODE_RIGHT_DOWN_CAUSAL,
+                    ori_win_left=ori_win_left,
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_BBND",
+                    has_ori_kv=True,
+                    has_cmp_kv=has_cmp,
+                )
+            else:
+                sparse_metadata = kernels.sparse_attn_sharedkv_metadata(
+                    num_heads_q=self.num_heads,
+                    num_heads_kv=1,
+                    head_dim=self.head_dim,
+                    cu_seqlens_q=seq_q,
+                    cu_seqlens_ori_kv=cu_seqlens_ori_kv,
+                    cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                    seqused_q=seqused_q,
+                    seqused_kv=seqused_kv,
+                    batch_size=batch_size,
+                    max_seqlen_q=max_q,
+                    max_seqlen_kv=max_kv,
+                    ori_topk=0,
+                    cmp_topk=cmp_topk,
+                    cmp_ratio=ratio,
+                    ori_mask_mode=_MASK_MODE_COMPRESS,
+                    cmp_mask_mode=_MASK_MODE_RIGHT_DOWN_CAUSAL,
+                    ori_win_left=ori_win_left,
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_ND",
+                    has_ori_kv=True,
+                    has_cmp_kv=has_cmp,
+                )
             if ratio == 1:
                 compressed_metadata.c1_metadata = sparse_metadata
             elif ratio == 4:
@@ -1266,17 +1322,48 @@ class DsaAttentionBackend(AttentionBackend):
         query_lens = seq_q[1:].clone() if seq_q.numel() > 1 else compressed_metadata.seq_lens_q
         key_lens = compressed_metadata.seq_lens if compressed_metadata.seq_lens.numel() else seq_kv
         compressed_metadata.precomputed_metadata_inputs += (query_lens, key_lens)
-        compressed_metadata.qli_metadata = kernels.quant_lightning_indexer_metadata(
-            num_heads_q=max(self.index_n_heads, 1),
-            num_heads_k=1,
-            head_dim=max(self.index_head_dim, 1),
-            actual_seq_lengths_query=query_lens,
-            actual_seq_lengths_key=key_lens,
-            max_seqlen_q=max(max_q, 1),
-            max_seqlen_k=max(max_kv, 1),
-            sparse_count=self.index_topk,
-            cmp_ratio=4,
-        )
+        if use_a5:
+            key_lens_comp = (key_lens // 4).to(torch.int32)
+            cmp_residual_k = (key_lens % 4).to(torch.int32)
+            query_len_cumsum = seq_q if seq_q.numel() > 1 else compressed_metadata.kv_cu_seq_lens
+            compressed_metadata.precomputed_metadata_inputs += (
+                query_len_cumsum,
+                key_lens,
+                key_lens_comp,
+                cmp_residual_k,
+            )
+            compressed_metadata.qli_metadata = kernels.quant_lightning_indexer_v2_metadata(
+                cu_seqlens_q=query_len_cumsum,
+                cu_seqlens_k=None,
+                seqused_q=None,
+                seqused_k=key_lens_comp,
+                cmp_residual_k=cmp_residual_k,
+                num_heads_q=max(self.index_n_heads, 1),
+                num_heads_k=1,
+                head_dim=max(self.index_head_dim, 1),
+                topk=self.index_topk,
+                quant_mode=2,
+                batch_size=int(max(key_lens_comp.size(0), 1)),
+                max_seqlen_q=max(max_q, 1),
+                max_seqlen_k=max(max_kv, 1),
+                layout_q="TND",
+                layout_k="PA_BBND",
+                mask_mode=_MASK_MODE_RIGHT_DOWN_CAUSAL,
+                cmp_ratio=4,
+                device=str(self.device),
+            )
+        else:
+            compressed_metadata.qli_metadata = kernels.quant_lightning_indexer_metadata(
+                num_heads_q=max(self.index_n_heads, 1),
+                num_heads_k=1,
+                head_dim=max(self.index_head_dim, 1),
+                actual_seq_lengths_query=query_lens,
+                actual_seq_lengths_key=key_lens,
+                max_seqlen_q=max(max_q, 1),
+                max_seqlen_k=max(max_kv, 1),
+                sparse_count=self.index_topk,
+                cmp_ratio=4,
+            )
 
     def _move_metadata_to_device(self, compressed_metadata: DsaMetadata) -> None:
         """Mirror ``deepseek_v4_move_dsa_metadata_to_device`` for eager mode."""
@@ -1306,12 +1393,86 @@ class DsaAttentionBackend(AttentionBackend):
             tensor = getattr(compressed_metadata, name, None)
             if tensor is not None:
                 setattr(compressed_metadata, name, tensor.to(self.device))
+        host_cache: dict[int, torch.Tensor] = {}
+        device_cache: dict[int, torch.Tensor] = {}
+        use_a5 = _uses_a5_sparse_kernels()
         for layer_tensors in compressed_metadata.block_tables:
             for index, tensor in enumerate(layer_tensors):
-                layer_tensors[index] = tensor.to(self.device)
+                if tensor is None:
+                    continue
+                if use_a5 and tensor.device.type == "cpu" and tensor.numel() > 0:
+                    tensor_id = id(tensor)
+                    if tensor_id in device_cache:
+                        layer_tensors[index] = device_cache[tensor_id]
+                    else:
+                        device_tensor = tensor.to(self.device)
+                        layer_tensors[index] = device_tensor
+                        device_cache[tensor_id] = device_tensor
+                        host_cache[device_tensor.data_ptr()] = tensor
+                else:
+                    layer_tensors[index] = tensor.to(self.device)
+        if use_a5:
+            self._eager_bt_host = host_cache
         for layer_tensors in compressed_metadata.slot_mappings:
             for index, tensor in enumerate(layer_tensors):
                 layer_tensors[index] = tensor.to(self.device)
+
+    def _decode_window_compact_eager(
+        self,
+        ori_kv: torch.Tensor,
+        ori_bt: torch.Tensor,
+        seq_kv: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather the newest SWA window into a zero-based eager decode cache."""
+        if ori_kv.dim() != 4 or ori_kv.size(2) != 1:
+            raise ValueError("SWA decode cache must have shape [blocks, block_size, 1, head_dim]")
+        if ori_bt.dim() != 2:
+            raise ValueError("SWA decode block table must have shape [batch, blocks]")
+
+        block_size = int(ori_kv.size(1))
+        window = self.window_size
+        n_seqs = seq_kv.size(0)
+        head_dim = ori_kv.size(-1)
+        device = ori_kv.device
+        if block_size <= 0 or window <= 0 or window > block_size:
+            raise ValueError(
+                f"SWA window size {window} must be positive and no greater than cache block size {block_size}"
+            )
+        if ori_bt.size(0) < n_seqs:
+            raise ValueError(f"SWA block table has {ori_bt.size(0)} rows, but {n_seqs} sequences are active")
+
+        kv_cpu = seq_kv.detach().to("cpu", torch.int64)
+        window_lens = kv_cpu.clamp(max=window)
+        token = kv_cpu.unsqueeze(1) - window_lens.unsqueeze(1) + torch.arange(window)
+        valid = torch.arange(window).unsqueeze(0) < window_lens.unsqueeze(1)
+
+        host_cache = getattr(self, "_eager_bt_host", {})
+        bt_cpu = host_cache.get(ori_bt.data_ptr())
+        if bt_cpu is not None:
+            bt_host = bt_cpu.to(torch.int64)
+        else:
+            bt_host = ori_bt.detach().cpu().to(torch.int64)
+
+        width = bt_host.size(1)
+        row_bt = bt_host[:n_seqs]
+        block_pos = (token // block_size) % width
+        block_id = torch.gather(row_bt, 1, block_pos)
+        slot_valid = valid & (block_id >= 0)
+        src = block_id.clamp(min=0) * block_size + (token % block_size)
+        src = torch.where(slot_valid, src, torch.zeros_like(src))
+
+        src_idx = src.to(device)
+        valid_device = slot_valid.to(device)
+        window_lens_device = window_lens.to(torch.int32).to(device)
+        gathered = ori_kv.reshape(-1, head_dim)[src_idx]
+        compact = torch.where(
+            valid_device.unsqueeze(-1),
+            gathered,
+            torch.zeros((), dtype=ori_kv.dtype, device=device),
+        )
+        compact_kv = compact.reshape(n_seqs, block_size, 1, head_dim)
+        compact_bt = torch.arange(n_seqs, device=device, dtype=torch.int32).unsqueeze(1)
+        return compact_kv, compact_bt, window_lens_device
 
 
 # Keep the historical import stable.  There is one implementation and one
@@ -1357,6 +1518,7 @@ def _build_prefill_pa_nd_kv(
     block_table_hint: torch.Tensor | None,
     block_size: int,
     cu_seqlens_dst: torch.Tensor | None = None,
+    use_zero_based_blocks: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Python port of C++ build_prefill_pa_nd_kv (deepseek_sparse_attention.cpp:272-368).
 
@@ -1393,9 +1555,11 @@ def _build_prefill_pa_nd_kv(
         max_blocks_per_req,
     )
 
-    # Block 0 is zero-filled padding block; real blocks are 1-based.
+    # sparse_attn_sharedkv reserves block zero as padding, while
+    # sparse_flash_mla addresses the cache directly with zero-based block ids.
+    block_base = 0 if use_zero_based_blocks else 1
     packed_kv = torch.zeros(
-        total_blocks + 1,
+        total_blocks + block_base,
         block_size,
         kv.size(1),
         kv.size(2),
@@ -1404,7 +1568,7 @@ def _build_prefill_pa_nd_kv(
     )
 
     table_data = [0] * (batch_size * table_cols)
-    next_block = 1
+    next_block = block_base
     for req in range(batch_size):
         q_start = cu[req]
         src_len = cu[req + 1] - q_start
@@ -1499,4 +1663,31 @@ def _sparse_attn_sharedkv(**kwargs):
     """Thin indirection so the backend can be unit-tested without the kernel."""
     from xllm.python import kernels
 
-    return kernels.sparse_attn_sharedkv(**kwargs)
+    seqused_ori_kv = kwargs.pop("seqused_ori_kv", None)
+    seqused_cmp_kv = kwargs.pop("seqused_cmp_kv", None)
+    cmp_residual_kv = kwargs.pop("cmp_residual_kv", None)
+    if not _uses_a5_sparse_kernels():
+        return kernels.sparse_attn_sharedkv(**kwargs)
+
+    seqused_kv = kwargs.pop("seqused_kv", None)
+    cmp_ratio = kwargs.get("cmp_ratio", 1)
+    cmp_kv = kwargs.get("cmp_kv")
+    has_cmp = cmp_kv is not None and cmp_ratio > 1
+    kwargs["layout_kv"] = "PA_BBND"
+    kwargs["cu_seqlens_ori_kv"] = None
+    kwargs["cu_seqlens_cmp_kv"] = None
+    kwargs["seqused_ori_kv"] = seqused_ori_kv if seqused_ori_kv is not None else seqused_kv
+    if has_cmp:
+        if seqused_cmp_kv is None and seqused_kv is not None:
+            seqused_cmp_kv = seqused_kv // cmp_ratio
+            cmp_residual_kv = seqused_kv % cmp_ratio
+        kwargs["seqused_cmp_kv"] = seqused_cmp_kv
+        kwargs["cmp_residual_kv"] = cmp_residual_kv
+    else:
+        kwargs["seqused_cmp_kv"] = None
+        kwargs["cmp_residual_kv"] = None
+        kwargs["cmp_mask_mode"] = 0
+    kwargs.setdefault("ori_topk_length", None)
+    kwargs.setdefault("cmp_topk_length", None)
+    kwargs["topk_value_mode"] = 1
+    return kernels.sparse_flash_mla(**kwargs)
