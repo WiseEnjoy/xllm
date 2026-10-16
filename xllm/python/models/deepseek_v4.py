@@ -33,6 +33,7 @@ linear / MLP / MoE / YaRN-RoPE / weight-loader primitives from
 
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, ClassVar, Sequence
@@ -616,6 +617,15 @@ class DeepseekV4HyperConnection(nn.Module):
                 nn.Parameter(torch.empty(3, dtype=torch.float32, device=device)),
             )
 
+    def process_weights_after_loading(self) -> None:
+        """Convert mixed-residual weights once to the kernel's BF16 path."""
+        if getattr(self, "_hc_fn_preconverted", False):
+            return
+        for part in ("attn", "ffn"):
+            parameter = getattr(self, f"hc_{part}_fn")
+            parameter.data = parameter.data.to(torch.bfloat16)
+        self._hc_fn_preconverted = True
+
     def hc_pre(
         self,
         x: torch.Tensor,
@@ -875,6 +885,8 @@ class DeepseekV4Attention(Attention):
         hidden: torch.Tensor,
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         wait_for_layer_load(self.layer_id)
         num_tokens = hidden.shape[0]
@@ -917,7 +929,8 @@ class DeepseekV4Attention(Attention):
 
         # The compact Python cache stores half-width per-token cos/sin; expand
         # it to the C++ interleaved [M, rope_head_dim] kernel layout.
-        cos, sin = _expand_half_rope_cos_sin(cos_sin_cache.index_select(0, positions.long()))
+        if cos is None or sin is None:
+            cos, sin = _expand_half_rope_cos_sin(cos_sin_cache.index_select(0, positions.long()))
         _k.npu_inplace_partial_rotary_mul(q, cos, sin, self.nope_head_dim, self.rope_head_dim)
 
         if cp_ctx is not None and cp_ctx.enabled() and dsa is not None:
@@ -1153,8 +1166,15 @@ class DeepseekV4Indexer(nn.Module):
             # the global DeepseekYarnRotaryEmbedding cache (the attention main path
             # uses _interleave_rope_with which consumes half-dim).
             if cos_sel.size(-1) * 2 == self.rope_dim:
-                cos_sel = cos_sel.repeat_interleave(2, dim=-1).contiguous()
-                sin_sel = sin_sel.repeat_interleave(2, dim=-1).contiguous()
+                rope_key = (id(cos_v), id(sin_v), q_idx.dtype)
+                expanded_rope = dsa.qli_expanded_rope.get(rope_key)
+                if expanded_rope is None:
+                    expanded_rope = (
+                        cos_sel.repeat_interleave(2, dim=-1).contiguous(),
+                        sin_sel.repeat_interleave(2, dim=-1).contiguous(),
+                    )
+                    dsa.qli_expanded_rope[rope_key] = expanded_rope
+                cos_sel, sin_sel = expanded_rope
             elif cos_sel.size(-1) != self.rope_dim:
                 raise RuntimeError(f"QRoPE cos/sin dim mismatch: cos={cos_sel.shape}, rope_dim={self.rope_dim}")
             # In-place partial RoPE: modifies q_idx[...rope_start_dim:rope_dim]
@@ -1217,10 +1237,16 @@ class DeepseekV4Indexer(nn.Module):
                 raise RuntimeError(f"QLI {name} must be on {device}, got {tensor.device}")
         if current_platform.get_ascend_soc_generation() == "a5":
             cmp_ratio = 4
-            seqused_q = dsa.seq_lens_q.to(torch.int32)
-            seqused_k = (key_seq_lens // cmp_ratio).to(torch.int32)
-            cmp_residual_k = (key_seq_lens % cmp_ratio).to(torch.int32)
-            cu_seq_lens_q = dsa.actual_seq_lengths_query.to(torch.int32)
+            qli_v2_metadata = dsa.qli_v2_metadata
+            if qli_v2_metadata is None:
+                qli_v2_metadata = (
+                    dsa.seq_lens_q.to(torch.int32),
+                    (key_seq_lens // cmp_ratio).to(torch.int32),
+                    (key_seq_lens % cmp_ratio).to(torch.int32),
+                    dsa.actual_seq_lengths_query.to(torch.int32),
+                )
+                dsa.qli_v2_metadata = qli_v2_metadata
+            seqused_q, seqused_k, cmp_residual_k, cu_seq_lens_q = qli_v2_metadata
             topk, _ = kernels.quant_lightning_indexer_v2(
                 q_quant,
                 index_cache,
@@ -1443,6 +1469,9 @@ class DeepseekV4MoE(nn.Module):
                 raise RuntimeError("DeepSeek-V4 MegaMoe requires MoE TP == 1")
         self._megamoe_enabled = cfg.enable_mega_moe
         self._megamoe_state: tuple[Any, Any] | None = None
+        self._megamoe_prequant = (
+            cfg.enable_mega_moe and cfg.uses_mx_formats and os.environ.get("XLLM_MEGAMOE_PREQUANT", "0") == "1"
+        )
         # DSV4 Flash checkpoints use W4A8_DYNAMIC routed experts.  The packed
         # storage shape is discovered from the checkpoint in load_weights;
         # keep expert tensors empty until then to avoid allocating the W8A8
@@ -1660,7 +1689,7 @@ class DeepseekV4MoE(nn.Module):
                     num_topk=self.topk,
                     hidden=self.cfg.hidden_size,
                     intermediate_hidden=self.cfg.moe_intermediate_size,
-                    dispatch_quant_mode=4,
+                    dispatch_quant_mode=0 if self._megamoe_prequant else 4,
                     dispatch_quant_out_dtype=torch.float8_e4m3fn,
                 )
             finally:
@@ -1683,6 +1712,35 @@ class DeepseekV4MoE(nn.Module):
             raise RuntimeError("DeepSeek-V4 MegaMoe is not initialized")
 
         mega_moe, sym_buffer = self._megamoe_state
+        if self._megamoe_prequant:
+            # Quantize each token once and let dispatch consume that result,
+            # instead of re-quantizing the expanded token-by-expert view.
+            x_quant, x_scale = torch_npu.npu_dynamic_mx_quant(
+                hidden,
+                dst_type=torch.float8_e4m3fn,
+                scale_alg=0,
+                round_mode="rint",
+            )
+            x_scale = x_scale.view(torch.uint8).reshape(hidden.size(0), -1).view(torch.float8_e8m0fnu)
+            hidden = x_quant
+
+            routed, _ = mega_moe(
+                hidden,
+                topk_idx.to(torch.int32),
+                topk_weights.to(torch.bfloat16),
+                [self._megamoe_w13],
+                [self._megamoe_w2],
+                sym_buffer,
+                l1_weights_sf=[self._megamoe_w13_sf],
+                l2_weights_sf=[self._megamoe_w2_sf],
+                scales=x_scale,
+                activation="swiglu",
+                activation_clamp=self.cfg.swiglu_limit,
+                weight1_type=torch_npu.float4_e2m1fn_x2,
+                weight2_type=torch_npu.float4_e2m1fn_x2,
+            )
+            return routed
+
         routed, _ = mega_moe(
             hidden,
             topk_idx.to(torch.int32),
@@ -2063,6 +2121,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Match DeepseekV4DecoderLayerImpl::forward exactly: HyperConnection
         # selects the 2D sub-input first, then RMSNorm is applied to that input.
@@ -2074,7 +2134,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc.hc_attn_base,
         )
         attn_input = self.input_layernorm(attn_input)
-        attn_output = self.self_attn(attn_input, positions, cos_sin_cache)
+        attn_output = self.self_attn(attn_input, positions, cos_sin_cache, cos=cos, sin=sin)
         hidden = self.hc.hc_post(attn_output, residual_attn, post_attn, comb_attn)
 
         residual_ffn = hidden
@@ -2317,6 +2377,19 @@ class DeepseekV4Model(nn.Module):
         aux_hidden_buffer = self.aux_hidden_capture.create_buffer(hidden)
         hidden = hidden.unsqueeze(1).expand(-1, self.cfg.hc_mult, -1).contiguous()
         residual: torch.Tensor | None = None
+        # Every layer in a compression-ratio group reads the same RoPE rows.
+        # Expand each distinct table once and pass those kernel-ready tables to
+        # the layers instead of repeating the gather and interleave per layer.
+        expanded_rope_tables: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        def _expanded_rope(table: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            table_key = id(table)
+            expanded = expanded_rope_tables.get(table_key)
+            if expanded is None:
+                expanded = _expand_half_rope_cos_sin(table.index_select(0, positions))
+                expanded_rope_tables[table_key] = expanded
+            return expanded
+
         for layer_id, layer in enumerate(self.layers):
             compress_ratio = self.cfg.compress_ratios[layer_id] if layer_id < len(self.cfg.compress_ratios) else 1
             if compress_ratio == 4:
@@ -2332,6 +2405,7 @@ class DeepseekV4Model(nn.Module):
             if select_layer_rope is None:
                 raise RuntimeError("DeepSeek-V4 requires select_dsa_layer_rope")
             select_layer_rope(layer_id, layer_cos_sin_cache, metadata)
+            layer_cos, layer_sin = _expanded_rope(layer_cos_sin_cache)
             if cp_ctx is not None and cp_ctx.enabled():
                 kv_cos, kv_sin = cp_ctx.global_rope(compress_ratio)
                 dsa = getattr(metadata, "dsa_metadata", None)
@@ -2345,6 +2419,8 @@ class DeepseekV4Model(nn.Module):
                 positions,
                 layer_cos_sin_cache,
                 input_ids,
+                cos=layer_cos,
+                sin=layer_sin,
             )
             self.aux_hidden_capture.capture_layer(layer_id, hidden, None, aux_hidden_buffer)
             record_layer_event(layer_id)
@@ -2626,6 +2702,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
                     f"DeepSeek-V4 attention compressor weights not found under {attention_prefix}",
                 )
             attn.process_weights_after_loading()
+            self.model.layers[i].hc.process_weights_after_loading()
             # MoE / dense MLP weights. MoE layers use hash routing
             # (gate.weight + gate.tid2eid) and per-expert w1/w2/w3, while dense
             # layers use the fused W8A8 MLP loader below.

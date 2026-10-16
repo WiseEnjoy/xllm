@@ -68,6 +68,7 @@ def _moe(**overrides: object) -> DeepseekV4MoE:
     moe._megamoe_enabled = True
     moe._megamoe_max_rows = moe.cfg.megamoe_max_tokens_per_rank
     moe._megamoe_state = None
+    moe._megamoe_prequant = False
     return moe
 
 
@@ -136,6 +137,45 @@ def test_megamoe_uses_row_cap_and_unmasked_router(monkeypatch: pytest.MonkeyPatc
     assert fused.call_args.kwargs["weight1_type"] is fp4_type
     assert fused.call_args.kwargs["weight2_type"] is fp4_type
     assert fused.call_args.kwargs["activation_clamp"] == moe.cfg.swiglu_limit
+
+
+def test_megamoe_prequant_passes_scales_to_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    moe = _moe()
+    moe._megamoe_prequant = True
+    fused = MagicMock(return_value=(torch.zeros(2, 16), torch.zeros(2, dtype=torch.int32)))
+    moe._megamoe_state = (fused, SimpleNamespace())
+    moe._megamoe_w13 = torch.zeros(2, 8, 64, dtype=torch.uint8)
+    moe._megamoe_w2 = torch.zeros(2, 4, 16, dtype=torch.uint8)
+    moe._megamoe_w13_sf = torch.zeros(2, 8, 2, 2, dtype=torch.uint8)
+    moe._megamoe_w2_sf = torch.zeros(2, 2, 16, 2, dtype=torch.uint8)
+
+    quantized = torch.zeros(2, 16, dtype=torch.float8_e4m3fn)
+    quant_scale = torch.zeros(2, 1, 2, dtype=torch.uint8)
+
+    def dynamic_mx_quant(hidden: torch.Tensor, **kwargs):
+        assert hidden.shape == (2, 16)
+        assert kwargs["dst_type"] == torch.float8_e4m3fn
+        assert kwargs["scale_alg"] == 0
+        assert kwargs["round_mode"] == "rint"
+        return quantized, quant_scale
+
+    fp4_type = object()
+    monkeypatch.setattr(
+        deepseek_v4,
+        "torch_npu",
+        SimpleNamespace(
+            npu_dynamic_mx_quant=dynamic_mx_quant,
+            float4_e2m1fn_x2=fp4_type,
+        ),
+    )
+
+    routed = moe._megamoe_routed(torch.zeros(2, 16), torch.ones(2, 2), torch.zeros(2, 2, dtype=torch.int32))
+
+    assert routed.shape == (2, 16)
+    args = fused.call_args.args
+    assert args[0] is quantized
+    assert fused.call_args.kwargs["scales"].dtype == torch.float8_e8m0fnu
+    assert fused.call_args.kwargs["scales"].shape == (2, 2)
 
 
 def test_megamoe_reuses_symmetric_buffer_by_communicator(monkeypatch: pytest.MonkeyPatch) -> None:

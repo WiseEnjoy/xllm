@@ -312,6 +312,7 @@ class DecodeAclGraphRunner(BaseRunner):
         self._graphs: dict[_GraphKey, _DecodeGraphEntry] = {}
         self._paged_kv_indices_buffer: torch.Tensor | None = None
         self._max_blocks_per_sequence: int = 0
+        self._pinned_block_table_staging: dict[tuple[str, torch.dtype, torch.Size], torch.Tensor] = {}
         self._stream: torch.npu.Stream | None = None
         self._update_stream: torch.npu.Stream | None = None
         self._replay_done_event: torch.npu.Event | None = None
@@ -1602,7 +1603,7 @@ class DecodeAclGraphRunner(BaseRunner):
             "engram host-offload and use the HBM path instead, set "
             "engram_config.cpu_offload=false. This is a startup/restart "
             "configuration (it is not switchable online): restart the server with "
-            "--engram-config '{\"cpu_offload\":false,\"dp_shared_memory\":false}'."
+            '--engram-config \'{"cpu_offload":false,"dp_shared_memory":false}\'.'
         )
 
     def _allocate_graph_eplb_state(
@@ -2077,6 +2078,29 @@ class DecodeAclGraphRunner(BaseRunner):
             )
         return tuple(tables)
 
+    def _pinned_stage(self, source: torch.Tensor, kind: str) -> torch.Tensor:
+        """Return a reusable pinned CPU view for asynchronous graph refreshes."""
+        if source.device.type != "cpu" or source.is_pinned():
+            return source
+        key = (kind, source.dtype, source.shape)
+        staged = self._pinned_block_table_staging.get(key)
+        if staged is None:
+            try:
+                staged = torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
+                self._pinned_block_table_staging[key] = staged
+            except RuntimeError:
+                return source
+        staged.copy_(source)
+        return staged
+
+    def _copy_block_table(self, target: torch.Tensor, source: torch.Tensor) -> None:
+        if target.device.type == source.device.type:
+            target.copy_(source)
+            return
+        staged = self._pinned_stage(source, "block_table")
+        non_blocking = staged.is_pinned() and target.device.type in ("cuda", "npu")
+        target.copy_(staged, non_blocking=non_blocking)
+
     def _fill_entry(
         self,
         entry: _DecodeGraphEntry,
@@ -2183,7 +2207,10 @@ class DecodeAclGraphRunner(BaseRunner):
                 src_bt.shape[1],
                 static_metadata.block_table.shape[1],
             )
-            static_metadata.block_table[:batch_size, :copy_cols].copy_(src_bt[:batch_size, :copy_cols])
+            self._copy_block_table(
+                static_metadata.block_table[:batch_size, :copy_cols],
+                src_bt[:batch_size, :copy_cols],
+            )
             if padded_batch_size > batch_size:
                 static_metadata.block_table[batch_size:].zero_()
 
@@ -2328,7 +2355,7 @@ class DecodeAclGraphRunner(BaseRunner):
                     f"ACL graph DSA manager {manager_id} requires {source.shape[1]} "
                     f"columns, capacity is {target.shape[1]}"
                 )
-            target[:batch_size, : source.shape[1]].copy_(source[:batch_size])
+            self._copy_block_table(target[:batch_size, : source.shape[1]], source[:batch_size])
 
     def _fill_graph_dsa_positions(
         self,

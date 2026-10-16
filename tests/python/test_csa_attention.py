@@ -1286,10 +1286,14 @@ def test_cp_prefill_localization_clears_dspark_native_swa_indices(monkeypatch) -
 
 def test_graph_dsa_refresh_preserves_tensor_addresses() -> None:
     def make_metadata(value: int, seq_rows: int) -> SimpleNamespace:
+        manager_block_table = torch.full((seq_rows, 2), value, dtype=torch.int32)
+        manager_slot_mapping = torch.full((seq_rows,), value, dtype=torch.int32)
         return SimpleNamespace(
             seq_lens=torch.full((seq_rows,), value, dtype=torch.int32),
-            block_tables=[[torch.full((seq_rows, 2), value, dtype=torch.int32)]],
-            slot_mappings=[[torch.full((seq_rows,), value, dtype=torch.int32)]],
+            block_tables=[[manager_block_table]],
+            slot_mappings=[[manager_slot_mapping]],
+            manager_block_tables=[manager_block_table],
+            manager_slot_mappings=[manager_slot_mapping],
             input_rope_by_ratio={
                 1: (
                     torch.full((2, 2), value, dtype=torch.float32),

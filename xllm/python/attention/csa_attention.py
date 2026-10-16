@@ -520,28 +520,20 @@ class DsaAttentionBackend(AttentionBackend):
             pad_value=-1,
         )
 
-        if len(persistent.block_tables) != len(refreshed.block_tables):
-            raise RuntimeError("ACL graph DSA block-table layer count changed")
-        if len(persistent.slot_mappings) != len(refreshed.slot_mappings):
-            raise RuntimeError("ACL graph DSA slot-mapping layer count changed")
-        for layer_id, (persistent_layer, refreshed_layer) in enumerate(
-            zip(persistent.block_tables, refreshed.block_tables, strict=True)
-        ):
-            cls._copy_graph_tensor_list(
-                persistent_layer,
-                refreshed_layer,
-                f"block_tables[{layer_id}]",
-                pad_value=-1,
-            )
-        for layer_id, (persistent_layer, refreshed_layer) in enumerate(
-            zip(persistent.slot_mappings, refreshed.slot_mappings, strict=True)
-        ):
-            cls._copy_graph_tensor_list(
-                persistent_layer,
-                refreshed_layer,
-                f"slot_mappings[{layer_id}]",
-                pad_value=-1,
-            )
+        # Each layer grid aliases one manager tensor. Copy managers only;
+        # copying the grid would repeat every H2D transfer once per layer.
+        cls._copy_graph_tensor_list(
+            persistent.manager_block_tables,
+            refreshed.manager_block_tables,
+            "manager_block_tables",
+            pad_value=-1,
+        )
+        cls._copy_graph_tensor_list(
+            persistent.manager_slot_mappings,
+            refreshed.manager_slot_mappings,
+            "manager_slot_mappings",
+            pad_value=-1,
+        )
 
         if persistent.input_rope_by_ratio.keys() != refreshed.input_rope_by_ratio.keys():
             raise RuntimeError("ACL graph DSA RoPE ratio set changed")
@@ -741,8 +733,10 @@ class DsaAttentionBackend(AttentionBackend):
             cos, sin = self._slice_cos_sin_cache(cos_sin_cache)
             pair = (cos, sin)
         compressed_metadata.layer_id = layer_id
-        compressed_metadata.cos_table = pair[0].contiguous()
-        compressed_metadata.sin_table = pair[1].contiguous()
+        # Keep the request-shaped views selected above. Materializing them
+        # duplicates the half-width RoPE tables on every layer and forward.
+        compressed_metadata.cos_table = pair[0]
+        compressed_metadata.sin_table = pair[1]
 
     def select_compressed_attention_layer_rope(
         self,
@@ -762,9 +756,9 @@ class DsaAttentionBackend(AttentionBackend):
         metadata = self._metadata if metadata is None else metadata
         css = getattr(metadata, "dsa_cos_sin", None) if metadata is not None else None
         if compressed_metadata.cos_table is None and css is not None and css.numel() > 0:
-            compressed_metadata.cos_table, compressed_metadata.sin_table = (
-                tensor.contiguous() for tensor in css.chunk(2, dim=-1)
-            )
+            cos, sin = css.chunk(2, dim=-1)
+            compressed_metadata.cos_table = cos
+            compressed_metadata.sin_table = sin
         csa_cos_sin = getattr(metadata, "dsa_c4_cos_sin", None) if metadata is not None else None
         if csa_cos_sin is not None and compressed_metadata.c4_pad_positions.numel() > 0:
             csa_indices = compressed_metadata.c4_pad_positions.clamp_min(0).long().to(csa_cos_sin.device)
@@ -1407,26 +1401,46 @@ class DsaAttentionBackend(AttentionBackend):
         host_cache: dict[int, torch.Tensor] = {}
         device_cache: dict[int, torch.Tensor] = {}
         use_a5 = _uses_a5_sparse_kernels()
-        for layer_tensors in compressed_metadata.block_tables:
-            for index, tensor in enumerate(layer_tensors):
-                if tensor is None:
-                    continue
-                if use_a5 and tensor.device.type == "cpu" and tensor.numel() > 0:
-                    tensor_id = id(tensor)
-                    if tensor_id in device_cache:
-                        layer_tensors[index] = device_cache[tensor_id]
-                    else:
-                        device_tensor = tensor.to(self.device)
-                        layer_tensors[index] = device_tensor
-                        device_cache[tensor_id] = device_tensor
-                        host_cache[device_tensor.data_ptr()] = tensor
-                else:
-                    layer_tensors[index] = tensor.to(self.device)
+        self._move_grid_to_device(
+            compressed_metadata,
+            compressed_metadata.manager_block_tables,
+            compressed_metadata.block_tables,
+            host_cache,
+            device_cache,
+            use_a5=use_a5,
+        )
         if use_a5:
             self._eager_bt_host = host_cache
-        for layer_tensors in compressed_metadata.slot_mappings:
+        self._move_grid_to_device(
+            compressed_metadata,
+            compressed_metadata.manager_slot_mappings,
+            compressed_metadata.slot_mappings,
+        )
+
+    def _move_grid_to_device(
+        self,
+        metadata: DsaMetadata,
+        managers: list[torch.Tensor],
+        grids: list[list[torch.Tensor]],
+        host_cache: dict[int, torch.Tensor] | None = None,
+        device_cache: dict[int, torch.Tensor] | None = None,
+        *,
+        use_a5: bool = False,
+    ) -> None:
+        """Move unique manager tables and rebind the layer-grid aliases."""
+        device_managers: list[torch.Tensor] = []
+        for tensor in managers:
+            device_managers.append(tensor.to(self.device))
+        manager_by_id = {id(tensor): device for tensor, device in zip(managers, device_managers)}
+        for layer_tensors in grids:
             for index, tensor in enumerate(layer_tensors):
-                layer_tensors[index] = tensor.to(self.device)
+                layer_tensors[index] = manager_by_id.get(id(tensor), tensor.to(self.device))
+        if not use_a5 or host_cache is None or device_cache is None:
+            return
+        for host_tensor, device_tensor in zip(managers, device_managers):
+            if host_tensor.device.type == "cpu" and host_tensor.numel() > 0:
+                device_cache[id(host_tensor)] = device_tensor
+                host_cache[device_tensor.data_ptr()] = host_tensor
 
     def _build_swa_window_layer_specs(self) -> list[tuple[int, int]]:
         """Resolve the SWA cache index and manager group for each layer."""
@@ -1572,17 +1586,37 @@ class DsaAttentionBackend(AttentionBackend):
         head_dim = ori_kv.size(-1)
         gathered = ori_kv.reshape(-1, head_dim)[safe_indices]
 
-        window_lens = seq_kv.to(torch.int64).clamp(min=0, max=self.window_size)
-        offsets = torch.arange(self.window_size, device=seq_kv.device).unsqueeze(0)
+        compact_state = getattr(self, "_win_compact_state", None)
+        if (
+            compact_state is None
+            or compact_state[0] is not seq_kv
+            or compact_state[1] != n_seqs
+            or compact_state[2] != ori_kv.dtype
+            or compact_state[3] != seq_kv.device
+        ):
+            window_lens = seq_kv.to(torch.int64).clamp(min=0, max=self.window_size)
+            offsets = torch.arange(self.window_size, device=seq_kv.device).unsqueeze(0)
+            compact_state = (
+                seq_kv,
+                n_seqs,
+                ori_kv.dtype,
+                seq_kv.device,
+                offsets,
+                window_lens,
+                window_lens.to(torch.int32),
+                torch.arange(n_seqs, device=seq_kv.device, dtype=torch.int32).unsqueeze(1),
+                torch.zeros((), dtype=ori_kv.dtype, device=ori_kv.device),
+            )
+            self._win_compact_state = compact_state
+        _, _, _, _, offsets, window_lens, seqused, compact_bt, zero_scalar = compact_state
         valid = (offsets < window_lens.unsqueeze(1)) & source_valid
         compact = torch.where(
             valid.unsqueeze(-1),
             gathered,
-            torch.zeros((), dtype=ori_kv.dtype, device=ori_kv.device),
+            zero_scalar,
         )
         compact_kv = compact.reshape(n_seqs, block_size, 1, head_dim)
-        compact_bt = torch.arange(n_seqs, device=seq_kv.device, dtype=torch.int32).unsqueeze(1)
-        return compact_kv, compact_bt, window_lens.to(torch.int32)
+        return compact_kv, compact_bt, seqused
 
     def _decode_window_compact_eager(
         self,
@@ -1766,6 +1800,31 @@ def _get_layer_cache_tensor(
     return layer_tensors[layer_id][cache_idx]
 
 
+_SLOT_GUARD_CACHE_MAX = 16
+_slot_guard_cache: list[tuple[torch.Tensor, int, torch.device, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+
+def _slot_guard_tensors(
+    slot_mapping: torch.Tensor,
+    update_rows: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reuse index guards for the same slot mapping within recent forwards."""
+    for entry in _slot_guard_cache:
+        if entry[0] is slot_mapping and entry[1] == update_rows and entry[2] == device:
+            return entry[3], entry[4], entry[5]
+
+    slots = slot_mapping.reshape(-1).to(torch.long).to(device)
+    slots_slice = slots[:update_rows]
+    safe_slots = slots_slice.clamp_min(0)
+    valid_mask = slots_slice.ge(0).unsqueeze(1)
+    entry = (slot_mapping, update_rows, device, slots_slice, safe_slots, valid_mask)
+    _slot_guard_cache.append(entry)
+    if len(_slot_guard_cache) > _SLOT_GUARD_CACHE_MAX:
+        del _slot_guard_cache[0]
+    return slots_slice, safe_slots, valid_mask
+
+
 def _scatter_by_slot(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -1799,8 +1858,7 @@ def _scatter_by_slot(
         # for the first decode step.
         from xllm.python import kernels
 
-        slots_slice = slots[:update_rows]
-        safe_slots = slots_slice.clamp_min(0)
+        slots_slice, safe_slots, valid_mask = _slot_guard_tensors(slot_mapping, update_rows, cache.device)
         updates = value_2d[:update_rows].to(cache.dtype)
         context = get_forward_context_or_none()
         if context is not None and context.acl_graph is not None:
@@ -1808,7 +1866,6 @@ def _scatter_by_slot(
             # captured path; it is not reliably capturable on NPU.
             safe_values = updates
         else:
-            valid_mask = slots_slice.ge(0).unsqueeze(1)
             old_values = cache_2d.index_select(0, safe_slots)
             safe_values = torch.where(valid_mask, updates, old_values)
         kernels.scatter_nd_update(
