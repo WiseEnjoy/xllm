@@ -75,6 +75,7 @@ from xllm.python.models.deepseek_v32 import (
     _tp_rank_from_device,
 )
 from xllm.python.models.weight_utils import W8A8WeightLoader
+from xllm.python.platform import current_platform
 
 # MXFP8/MXFP4 modules are only reachable for FP8 checkpoints; the guarded
 # import keeps W8A8-only deployments (older CANN without the MX dtypes, or
@@ -1208,19 +1209,52 @@ class DeepseekV4Indexer(nn.Module):
                 raise RuntimeError(f"QLI {name} must be defined and non-empty")
             if tensor.device != device:
                 raise RuntimeError(f"QLI {name} must be on {device}, got {tensor.device}")
-        topk = kernels.quant_lightning_indexer(
-            q_quant,
-            index_cache,
-            weights.to(torch.float16),
-            q_scale,
-            key_dequant_scale,
-            qli_metadata,
-            query_seq_lens,
-            key_seq_lens,
-            block_table,
-            self.topk,
-            cmp_ratio=4,
-        )
+        if current_platform.get_ascend_soc_generation() == "a5":
+            cmp_ratio = 4
+            seqused_q = dsa.seq_lens_q.to(torch.int32)
+            seqused_k = (key_seq_lens // cmp_ratio).to(torch.int32)
+            cmp_residual_k = (key_seq_lens % cmp_ratio).to(torch.int32)
+            cu_seq_lens_q = dsa.actual_seq_lengths_query.to(torch.int32)
+            topk, _ = kernels.quant_lightning_indexer_v2(
+                q_quant,
+                index_cache,
+                weights.to(torch.float16),
+                q_scale,
+                key_dequant_scale,
+                cu_seq_lens_q,
+                None,
+                seqused_q,
+                seqused_k,
+                cmp_residual_k,
+                block_table,
+                None,
+                qli_metadata,
+                self.n_head,
+                1,
+                self.head_dim,
+                self.topk,
+                2,
+                -1,
+                "TND",
+                "PA_BBND",
+                3,
+                cmp_ratio,
+                0,
+            )
+        else:
+            topk = kernels.quant_lightning_indexer(
+                q_quant,
+                index_cache,
+                weights.to(torch.float16),
+                q_scale,
+                key_dequant_scale,
+                qli_metadata,
+                query_seq_lens,
+                key_seq_lens,
+                block_table,
+                self.topk,
+                cmp_ratio=4,
+            )
         return topk
 
     def _get_hadamard(self, device: torch.device) -> torch.Tensor:

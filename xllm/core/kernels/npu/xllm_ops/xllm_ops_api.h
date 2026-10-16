@@ -209,6 +209,32 @@ std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
     int64_t cmp_ratio,
     bool return_value);
 
+std::tuple<torch::Tensor, torch::Tensor> quant_lightning_indexer_v2(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& weights,
+    const torch::Tensor& query_descale,
+    const torch::Tensor& key_descale,
+    const std::optional<torch::Tensor>& cu_seqlens_q,
+    const std::optional<torch::Tensor>& cu_seqlens_k,
+    const std::optional<torch::Tensor>& seqused_q,
+    const std::optional<torch::Tensor>& seqused_k,
+    const std::optional<torch::Tensor>& cmp_residual_k,
+    const std::optional<torch::Tensor>& block_table,
+    const std::optional<torch::Tensor>& output_idx_offset,
+    const std::optional<torch::Tensor>& metadata,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t head_dim,
+    int64_t topk,
+    int64_t quant_mode,
+    int64_t max_seqlen_q,
+    c10::string_view layout_q,
+    c10::string_view layout_k,
+    int64_t mask_mode,
+    int64_t cmp_ratio,
+    int64_t return_value);
+
 torch::Tensor lightning_indexer(
     const torch::Tensor& query,
     const torch::Tensor& key,
@@ -471,6 +497,26 @@ at::Tensor quant_lightning_indexer_metadata(
     int64_t sparse_mode,
     int64_t pre_tokens,
     int64_t next_tokens,
+    int64_t cmp_ratio,
+    const c10::string_view device);
+
+torch::Tensor quant_lightning_indexer_v2_metadata(
+    const std::optional<torch::Tensor>& cu_seqlens_q,
+    const std::optional<torch::Tensor>& cu_seqlens_k,
+    const std::optional<torch::Tensor>& seqused_q,
+    const std::optional<torch::Tensor>& seqused_k,
+    const std::optional<torch::Tensor>& cmp_residual_k,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t head_dim,
+    int64_t topk,
+    int64_t quant_mode,
+    int64_t batch_size,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_k,
+    c10::string_view layout_q,
+    c10::string_view layout_k,
+    int64_t mask_mode,
     int64_t cmp_ratio,
     const c10::string_view device);
 

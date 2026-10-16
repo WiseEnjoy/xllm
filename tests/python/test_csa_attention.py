@@ -35,6 +35,7 @@ from xllm.python.attention.csa_attention import (
     CsaAttentionBackend,
     _attention_type_for_compress_ratio,
     _build_dspark_swa_indices,
+    _build_prefill_pa_nd_kv,
     _CompressedAttentionCacheMapping,
     _deepseek_v4_ori_window_left,
     _get_layer_cache_tensor,
@@ -62,6 +63,122 @@ def _make_backend() -> CsaAttentionBackend:
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
     )
+
+
+def _patch_metadata_kernels(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    use_a5: bool = False,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    sparse_calls: list[dict[str, object]] = []
+    qli_calls: list[dict[str, object]] = []
+
+    def fake_sparse_metadata(**kwargs: object) -> torch.Tensor:
+        sparse_calls.append(kwargs)
+        return torch.tensor([kwargs["cmp_ratio"]], dtype=torch.int32)
+
+    def fake_qli_metadata(**kwargs: object) -> torch.Tensor:
+        qli_calls.append(kwargs)
+        return torch.tensor([4], dtype=torch.int32)
+
+    for name in ("sparse_attn_sharedkv_metadata", "sparse_flash_mla_metadata"):
+        monkeypatch.setattr(kernels, name, fake_sparse_metadata, raising=False)
+    for name in ("quant_lightning_indexer_metadata", "quant_lightning_indexer_v2_metadata"):
+        monkeypatch.setattr(kernels, name, fake_qli_metadata, raising=False)
+    monkeypatch.setattr(
+        csa_attention_module.current_platform,
+        "get_ascend_soc_generation",
+        lambda: "a5" if use_a5 else "a2",
+    )
+    return sparse_calls, qli_calls
+
+
+@pytest.mark.parametrize(
+    ("use_zero_based_blocks", "first_block", "packed_blocks"),
+    [(False, 1, 3), (True, 0, 2)],
+)
+def test_prefill_pa_nd_kv_preserves_kernel_block_layout(
+    use_zero_based_blocks: bool,
+    first_block: int,
+    packed_blocks: int,
+) -> None:
+    kv = torch.arange(6, dtype=torch.float32).reshape(3, 1, 2)
+    cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
+    block_table_hint = torch.tensor([[7, 8]], dtype=torch.int32)
+
+    packed_kv, block_table = _build_prefill_pa_nd_kv(
+        kv,
+        cu_seqlens,
+        block_table_hint,
+        block_size=2,
+        use_zero_based_blocks=use_zero_based_blocks,
+    )
+
+    assert packed_kv.shape == (packed_blocks, 2, 1, 2)
+    assert block_table.tolist() == [[first_block, first_block + 1]]
+    if use_zero_based_blocks:
+        torch.testing.assert_close(packed_kv[0], kv[:2])
+        torch.testing.assert_close(packed_kv[1, 0], kv[2])
+        assert torch.equal(packed_kv[1, 1], torch.zeros(1, 2))
+    else:
+        assert torch.equal(packed_kv[0], torch.zeros(2, 1, 2))
+        torch.testing.assert_close(packed_kv[1], kv[:2])
+        torch.testing.assert_close(packed_kv[2, 0], kv[2])
+        assert torch.equal(packed_kv[2, 1], torch.zeros(1, 2))
+
+
+def test_decode_window_compact_eager_gathers_newest_window() -> None:
+    backend = CsaAttentionBackend(
+        compress_ratios=[1],
+        window_size=4,
+        n_layers=1,
+        num_heads=2,
+        attn_head_dim=4,
+        index_topk=1,
+        index_n_heads=2,
+        index_head_dim=4,
+        rope_head_dim=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    ori_kv = torch.arange(32, dtype=torch.float32).reshape(4, 4, 1, 2)
+    ori_bt = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    seq_kv = torch.tensor([4, 3], dtype=torch.int32)
+
+    compact_kv, compact_bt, compact_lens = backend._decode_window_compact_eager(
+        ori_kv,
+        ori_bt,
+        seq_kv,
+    )
+
+    assert compact_kv.shape == (2, 4, 1, 2)
+    assert compact_bt.tolist() == [[0], [1]]
+    assert compact_lens.tolist() == [4, 3]
+    torch.testing.assert_close(compact_kv[0, 0, 0], ori_kv[0, 0, 0])
+    torch.testing.assert_close(compact_kv[1, 0, 0], ori_kv[2, 0, 0])
+    assert torch.equal(compact_kv[1, 3, 0], torch.zeros(2))
+
+
+def test_decode_window_compact_eager_rejects_missing_block_table_rows() -> None:
+    backend = CsaAttentionBackend(
+        compress_ratios=[1],
+        window_size=4,
+        n_layers=1,
+        num_heads=2,
+        attn_head_dim=4,
+        index_topk=1,
+        index_n_heads=2,
+        index_head_dim=4,
+        rope_head_dim=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    ori_kv = torch.zeros(2, 4, 1, 2)
+    ori_bt = torch.zeros(1, 2, dtype=torch.int32)
+    seq_kv = torch.tensor([4, 3], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="SWA block table has 1 rows"):
+        backend._decode_window_compact_eager(ori_kv, ori_bt, seq_kv)
 
 
 def test_dspark_native_sas_window_matches_cpp_contract() -> None:
@@ -540,29 +657,7 @@ def test_graph_mode_is_recorded_on_metadata() -> None:
 
 def test_decode_precomputed_metadata_matches_cpp_contract(monkeypatch) -> None:
     backend = _make_backend()
-    sparse_calls: list[dict] = []
-    qli_calls: list[dict] = []
-
-    def fake_sparse_metadata(**kwargs):
-        sparse_calls.append(kwargs)
-        return torch.tensor([kwargs["cmp_ratio"]], dtype=torch.int32)
-
-    def fake_qli_metadata(**kwargs):
-        qli_calls.append(kwargs)
-        return torch.tensor([4], dtype=torch.int32)
-
-    monkeypatch.setattr(
-        kernels,
-        "sparse_attn_sharedkv_metadata",
-        fake_sparse_metadata,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        kernels,
-        "quant_lightning_indexer_metadata",
-        fake_qli_metadata,
-        raising=False,
-    )
+    sparse_calls, qli_calls = _patch_metadata_kernels(monkeypatch)
     compressed_metadata = SimpleNamespace(
         actual_seq_lengths_query=torch.tensor([0, 1], dtype=torch.int32),
         actual_seq_lengths_kv=torch.tensor([85], dtype=torch.int32),
@@ -591,6 +686,43 @@ def test_decode_precomputed_metadata_matches_cpp_contract(monkeypatch) -> None:
     assert compressed_metadata.precomputed_metadata_inputs[0] is compressed_metadata.actual_seq_lengths_query
 
 
+def test_a5_decode_precomputed_metadata_matches_cpp_contract(monkeypatch) -> None:
+    backend = _make_backend()
+    sparse_calls, qli_calls = _patch_metadata_kernels(monkeypatch, use_a5=True)
+    compressed_metadata = SimpleNamespace(
+        actual_seq_lengths_query=torch.tensor([0, 1], dtype=torch.int32),
+        actual_seq_lengths_kv=torch.tensor([85], dtype=torch.int32),
+        seq_lens_q=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([85], dtype=torch.int32),
+        max_query_len=1,
+        max_seq_len=85,
+    )
+    metadata = SimpleNamespace(
+        max_query_len=1,
+        max_seq_len=85,
+        q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+        kv_seq_lens_host=torch.tensor([85], dtype=torch.int32),
+    )
+
+    backend._build_precomputed_metadata(compressed_metadata, metadata)
+
+    assert [call["cmp_ratio"] for call in sparse_calls] == [1, 4, 128]
+    assert all(call["head_dim"] == 512 for call in sparse_calls)
+    assert all(call["cu_seqlens_q"].tolist() == [0, 1] for call in sparse_calls)
+    assert all(call["cu_seqlens_ori_kv"] is None for call in sparse_calls)
+    assert all(call["seqused_ori_kv"].tolist() == [85] for call in sparse_calls)
+    assert all(call["layout_kv"] == "PA_BBND" for call in sparse_calls)
+    assert sparse_calls[1]["seqused_cmp_kv"].tolist() == [21]
+    assert sparse_calls[1]["cmp_residual_kv"].tolist() == [1]
+    assert sparse_calls[1]["cmp_topk"] == 512
+    assert qli_calls[0]["seqused_k"].tolist() == [21]
+    assert qli_calls[0]["cmp_residual_k"].tolist() == [1]
+    assert qli_calls[0]["head_dim"] == 128
+    assert qli_calls[0]["quant_mode"] == 2
+    assert qli_calls[0]["layout_k"] == "PA_BBND"
+    assert compressed_metadata.precomputed_metadata_inputs[0] is compressed_metadata.actual_seq_lengths_query
+
+
 def test_dspark_native_decode_metadata_uses_expanded_window(monkeypatch) -> None:
     backend = CsaAttentionBackend(
         compress_ratios=[1],
@@ -607,20 +739,7 @@ def test_dspark_native_decode_metadata_uses_expanded_window(monkeypatch) -> None
         dspark_block_size=5,
         dspark_use_native_sas=True,
     )
-    sparse_calls: list[dict] = []
-
-    monkeypatch.setattr(
-        kernels,
-        "sparse_attn_sharedkv_metadata",
-        lambda **kwargs: sparse_calls.append(kwargs) or torch.tensor([kwargs["cmp_ratio"]]),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        kernels,
-        "quant_lightning_indexer_metadata",
-        lambda **_kwargs: torch.tensor([4]),
-        raising=False,
-    )
+    sparse_calls, _ = _patch_metadata_kernels(monkeypatch)
     compressed_metadata = SimpleNamespace(
         actual_seq_lengths_query=torch.tensor([0, 5], dtype=torch.int32),
         actual_seq_lengths_kv=torch.tensor([10], dtype=torch.int32),
@@ -746,18 +865,7 @@ def test_dspark_native_mixed_ratio_decode_uses_expanded_window(
         kv_seq_lens_host=torch.tensor([1], dtype=torch.int32),
     )
     calls: list[dict] = []
-    monkeypatch.setattr(
-        kernels,
-        "sparse_attn_sharedkv_metadata",
-        lambda **kwargs: torch.tensor([kwargs["cmp_ratio"]]),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        kernels,
-        "quant_lightning_indexer_metadata",
-        lambda **_kwargs: torch.tensor([4]),
-        raising=False,
-    )
+    _patch_metadata_kernels(monkeypatch)
     monkeypatch.setattr(
         csa_attention_module,
         "_sparse_attn_sharedkv",
@@ -978,18 +1086,7 @@ def test_cp_prefill_localization_clears_dspark_native_swa_indices(monkeypatch) -
         "_build_dsa_rope_metadata",
         lambda *_args: {1: (torch.zeros(2, 1), torch.zeros(2, 1))},
     )
-    monkeypatch.setattr(
-        kernels,
-        "sparse_attn_sharedkv_metadata",
-        lambda **kwargs: torch.tensor([kwargs["cmp_ratio"]]),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        kernels,
-        "quant_lightning_indexer_metadata",
-        lambda **_kwargs: torch.tensor([4]),
-        raising=False,
-    )
+    _patch_metadata_kernels(monkeypatch)
     metadata = SimpleNamespace(
         dsa_metadata=dsa,
         dp_execution_token_counts=(4,),
@@ -1113,18 +1210,7 @@ def test_prefill_and_dummy_decode_metadata_stay_in_sync_with_execute(
         return kwargs["q"].clone(), torch.empty(0)
 
     monkeypatch.setattr(csa_attention_module, "_sparse_attn_sharedkv", fake_sparse_attn)
-    monkeypatch.setattr(
-        kernels,
-        "sparse_attn_sharedkv_metadata",
-        lambda **kwargs: torch.tensor([kwargs["cmp_ratio"]]),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        kernels,
-        "quant_lightning_indexer_metadata",
-        lambda **_kwargs: torch.tensor([4]),
-        raising=False,
-    )
+    _patch_metadata_kernels(monkeypatch)
 
     def prepare_step(
         kv_len: int,

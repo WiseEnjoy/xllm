@@ -139,7 +139,7 @@ def _npu_chip_from_smi() -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
 
-    match = re.search(r"910[A-Za-z0-9]*", completed.stdout)
+    match = re.search(r"(?:910|950)[A-Za-z0-9_-]*", completed.stdout)
     if match is None:
         return None
     return match.group(0).lower()
@@ -162,7 +162,7 @@ def _npu_chip_from_acl() -> str | None:
         return None
     if not soc_name:
         return None
-    match = re.search(r"910[A-Za-z0-9]*", soc_name)
+    match = re.search(r"(?:910|950)[A-Za-z0-9_-]*", soc_name)
     if match is None:
         return None
     return match.group(0).lower()
