@@ -43,25 +43,33 @@ class DSparkMarkovHead(nn.Module):
 
 
 class DSparkConfidenceHead(nn.Module):
+    """Produce DSpark acceptance probabilities from target hidden states.
+
+    The projection and concatenated features use the model dtype, matching
+    the C++ runtime and checkpoint weights. The returned probabilities remain
+    FP32 so downstream confidence comparisons keep a stable range.
+    """
+
     def __init__(
         self,
         hidden_size: int,
         markov_rank: int,
         with_markov: bool,
+        dtype: torch.dtype,
         device: torch.device,
         bias: bool = True,
     ) -> None:
         super().__init__()
         self.with_markov = with_markov
         input_size = hidden_size + markov_rank if with_markov else hidden_size
-        self.proj = nn.Linear(input_size, 1, bias=bias, dtype=torch.float32, device=device)
+        self.proj = nn.Linear(input_size, 1, bias=bias, dtype=dtype, device=device)
 
     def forward(self, hidden: torch.Tensor, markov_embedding: torch.Tensor | None) -> torch.Tensor:
         if self.with_markov:
             if markov_embedding is None:
                 raise ValueError("DSpark confidence head requires Markov embeddings")
-            hidden = torch.cat((hidden, markov_embedding), dim=-1)
-        return torch.sigmoid(self.proj(hidden.float())).squeeze(-1).to(torch.float32)
+            hidden = torch.cat((hidden, markov_embedding.to(hidden.dtype)), dim=-1)
+        return torch.sigmoid(self.proj(hidden)).squeeze(-1).to(torch.float32)
 
 
 class DSparkForCausalLMBase(PyModelBase):
@@ -93,6 +101,7 @@ class DSparkForCausalLMBase(PyModelBase):
                 hidden_size,
                 markov_rank,
                 confidence_head_with_markov,
+                dtype,
                 device,
                 bias=confidence_head_bias,
             )
