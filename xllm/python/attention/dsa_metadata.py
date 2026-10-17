@@ -155,6 +155,7 @@ class DsaMetadata:
     # this window and supplies explicit SWA indices to the attention kernel.
     sparse_metadata_ori_win_left: int = -1
     explicit_swa_indices: torch.Tensor | None = None
+    draft_swa_topk_lengths: torch.Tensor | None = None
     hadamard: torch.Tensor | None = None
 
     # Keep AICPU metadata-builder inputs alive until all asynchronously
