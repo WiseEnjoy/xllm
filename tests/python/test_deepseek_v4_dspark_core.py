@@ -153,6 +153,7 @@ def test_dspark_confidence_head_supports_bias_free_checkpoints() -> None:
         hidden_size=4,
         markov_rank=2,
         with_markov=True,
+        dtype=torch.float32,
         device=torch.device("cpu"),
         bias=False,
     )
