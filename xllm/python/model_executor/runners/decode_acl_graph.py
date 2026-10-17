@@ -537,14 +537,6 @@ class DecodeAclGraphRunner(BaseRunner):
         batch_size = input_ids.numel()
         expanded_view = resolve_expanded_decode_metadata(metadata)
         is_expanded_spec_verify = expanded_view is not None
-        # The DSpark draft backend owns expanded draft rows, so its dedicated
-        # block-size configuration identifies the explicit-index graph path.
-        is_dspark_draft_expanded = (
-            self._is_spec_draft
-            and bool(getattr(self.attention_backend, "dspark_use_explicit_indices", False))
-            and int(getattr(self.attention_backend, "dspark_block_size", 0)) > 0
-            and not metadata.is_prefill
-        )
         if disable_verify_graph and is_expanded_spec_verify:
             return False
         # max_batch is a token-row bucket, while expanded-verify metadata
@@ -603,9 +595,7 @@ class DecodeAclGraphRunner(BaseRunner):
                         f"rank={self.dp_rank}, shape={tuple(input_ids.shape)}"
                     )
                 return False
-            local_non_decode = (metadata.is_prefill or metadata.is_chunked_prefill) and not (
-                is_expanded_spec_verify or is_dspark_draft_expanded
-            )
+            local_non_decode = (metadata.is_prefill or metadata.is_chunked_prefill) and not is_expanded_spec_verify
             if local_non_decode and not all_decode:
                 return False
             # DP ranks share one graph shape, so a missing or malformed
@@ -679,11 +669,7 @@ class DecodeAclGraphRunner(BaseRunner):
         if not self._eplv2_graph_admits(batch_size):
             return False
         ok = (
-            (
-                (not metadata.is_prefill and not metadata.is_chunked_prefill)
-                or is_expanded_spec_verify
-                or is_dspark_draft_expanded
-            )
+            ((not metadata.is_prefill and not metadata.is_chunked_prefill) or is_expanded_spec_verify)
             and self._has_compatible_decode_metadata(
                 input_ids,
                 metadata,
@@ -903,12 +889,6 @@ class DecodeAclGraphRunner(BaseRunner):
         is_expanded = (
             local_expanded if local_expanded is not None else resolve_expanded_decode_metadata(metadata) is not None
         )
-        is_dspark_draft_expanded = (
-            self._is_spec_draft
-            and bool(getattr(self.attention_backend, "dspark_use_explicit_indices", False))
-            and int(getattr(self.attention_backend, "dspark_block_size", 0)) > 0
-            and not metadata.is_prefill
-        )
         if not is_expanded and metadata.kv_cu_seq_lens is not None:
             if metadata.kv_cu_seq_lens.numel() not in (
                 batch_size,
@@ -934,9 +914,7 @@ class DecodeAclGraphRunner(BaseRunner):
         has_initial_state = getattr(metadata, "has_initial_state", None)
         if has_initial_state is not None:
             state_count = has_initial_state.numel()
-            if state_count != batch_size and not (
-                (is_expanded and state_count > 0 and batch_size % state_count == 0) or is_dspark_draft_expanded
-            ):
+            if state_count != batch_size and not (is_expanded and state_count > 0 and batch_size % state_count == 0):
                 self._reject_dp_all_decode(
                     dp_all_decode,
                     "DP decode has_initial_state does not match token rows: "
@@ -947,10 +925,7 @@ class DecodeAclGraphRunner(BaseRunner):
         if (
             linear_idx is not None
             and linear_idx.numel() != batch_size
-            and not (
-                (is_expanded and linear_idx.numel() > 0 and batch_size % linear_idx.numel() == 0)
-                or is_dspark_draft_expanded
-            )
+            and not (is_expanded and linear_idx.numel() > 0 and batch_size % linear_idx.numel() == 0)
         ):
             self._reject_dp_all_decode(
                 dp_all_decode,
@@ -989,7 +964,7 @@ class DecodeAclGraphRunner(BaseRunner):
         # batches were already normalized above (empty DP shard dummy), so this
         # only rejects genuinely malformed multi-manager exports.
         group_infos = getattr(self.attention_backend, "group_infos", None)
-        if group_infos is not None and not is_dspark_draft_expanded:
+        if group_infos is not None:
             source_tables = list(getattr(metadata, "multi_block_tables", ()) or ())
             if not source_tables or len(source_tables) != len(group_infos):
                 return False
