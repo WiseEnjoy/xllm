@@ -1355,6 +1355,7 @@ class DsaAttentionBackend(AttentionBackend):
                 layout_k="PA_BBND",
                 mask_mode=_MASK_MODE_RIGHT_DOWN_CAUSAL,
                 cmp_ratio=4,
+                device=str(self.device),
             )
         else:
             compressed_metadata.qli_metadata = kernels.quant_lightning_indexer_metadata(
