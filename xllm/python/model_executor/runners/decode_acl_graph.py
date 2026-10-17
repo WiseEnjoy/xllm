@@ -388,7 +388,8 @@ class DecodeAclGraphRunner(BaseRunner):
         a private graph. Plain decode stays width 1.
         """
         if local_expanded is None:
-            local_expanded = resolve_expanded_decode_metadata(metadata) is not None
+            local_expanded = self._is_expanded_verify(metadata, batch_size=batch_size)
+        expanded_view = resolve_expanded_decode_metadata(metadata)
         marked_spec_verify = bool(getattr(metadata, "is_spec_verify", False))
         spec_verify = marked_spec_verify or local_expanded
         local_width = 1
@@ -399,7 +400,14 @@ class DecodeAclGraphRunner(BaseRunner):
                 local_width = batch_size // seq_count
         if self.dp_size > 1:
             # Local expanded rows must not choose a width the empty rank cannot see.
-            if marked_spec_verify and self.num_decoding_tokens > 1:
+            shape_inferred_verify = (
+                not marked_spec_verify
+                and local_expanded
+                and expanded_view is None
+                and self.num_decoding_tokens > 1
+                and local_width == self.num_decoding_tokens
+            )
+            if (marked_spec_verify or shape_inferred_verify) and self.num_decoding_tokens > 1:
                 if local_width > 1 and local_width != self.num_decoding_tokens:
                     raise RuntimeError(
                         "DP spec-verify layout does not match num_decoding_tokens: "
@@ -444,6 +452,42 @@ class DecodeAclGraphRunner(BaseRunner):
                 admission_batch = batch_size // self._draft_query_width
         return is_expanded, verify_width, admission_batch
 
+    def _is_expanded_verify(
+        self,
+        metadata: AttentionMetadata,
+        expanded_view: object | None = None,
+        batch_size: int | None = None,
+    ) -> bool:
+        """Return whether a step uses the flattened verify-row graph layout.
+
+        DSpark target verification exports row-aligned paging and one
+        linear-state slot per logical sequence without building the typed
+        expanded view. Treat the explicit verify marker as the same layout.
+        """
+        if expanded_view is not None:
+            return True
+        if resolve_expanded_decode_metadata(metadata) is not None or (
+            bool(getattr(metadata, "is_spec_verify", False)) and self.num_decoding_tokens > 1
+        ):
+            return True
+        if batch_size is None or self.num_decoding_tokens <= 1:
+            return False
+        linear_idx = getattr(metadata, "linear_state_indices", None)
+        q_cu = getattr(metadata, "q_cu_seq_lens", None)
+        kv_cu = getattr(metadata, "kv_cu_seq_lens", None)
+        if linear_idx is None or q_cu is None or kv_cu is None:
+            return False
+        sequence_count = linear_idx.numel()
+        if sequence_count <= 0 or sequence_count >= batch_size:
+            return False
+        verify_width, remainder = divmod(batch_size, sequence_count)
+        return (
+            remainder == 0
+            and verify_width == self.num_decoding_tokens
+            and q_cu.numel() == batch_size + 1
+            and kv_cu.numel() == batch_size + 1
+        )
+
     def can_execute(
         self,
         input_ids: torch.Tensor,
@@ -451,8 +495,7 @@ class DecodeAclGraphRunner(BaseRunner):
         input_embedding: torch.Tensor | None = None,
     ) -> bool:
         metadata = self._normalize_dsa_metadata(metadata)
-        ok = self._can_execute_inner(input_ids, metadata, input_embedding)
-        return ok
+        return self._can_execute_inner(input_ids, metadata, input_embedding)
 
     def _normalize_dsa_metadata(
         self,
@@ -536,7 +579,7 @@ class DecodeAclGraphRunner(BaseRunner):
             return False
         batch_size = input_ids.numel()
         expanded_view = resolve_expanded_decode_metadata(metadata)
-        is_expanded_spec_verify = expanded_view is not None
+        is_expanded_spec_verify = self._is_expanded_verify(metadata, expanded_view, batch_size)
         if disable_verify_graph and is_expanded_spec_verify:
             return False
         # max_batch is a token-row bucket, while expanded-verify metadata
@@ -887,9 +930,14 @@ class DecodeAclGraphRunner(BaseRunner):
             return False
         batch_size = input_ids.numel()
         is_expanded = (
-            local_expanded if local_expanded is not None else resolve_expanded_decode_metadata(metadata) is not None
+            local_expanded
+            if local_expanded is not None
+            else self._is_expanded_verify(metadata, expanded_view, batch_size)
         )
-        if not is_expanded and metadata.kv_cu_seq_lens is not None:
+        # A fallback verify batch still carries row-aligned cumulative lengths.
+        # Only the typed expanded view owns sequence-group boundaries instead.
+        needs_row_aligned_cu = not is_expanded or expanded_view is None
+        if metadata.kv_cu_seq_lens is not None and needs_row_aligned_cu:
             if metadata.kv_cu_seq_lens.numel() not in (
                 batch_size,
                 batch_size + 1,
@@ -900,7 +948,7 @@ class DecodeAclGraphRunner(BaseRunner):
                     f"rank={self.dp_rank}, tokens={batch_size}, kv_cu={metadata.kv_cu_seq_lens.numel()}",
                 )
                 return False
-        if metadata.q_cu_seq_lens is not None and not is_expanded:
+        if metadata.q_cu_seq_lens is not None and needs_row_aligned_cu:
             if metadata.q_cu_seq_lens.numel() not in (
                 batch_size,
                 batch_size + 1,
@@ -1263,7 +1311,7 @@ class DecodeAclGraphRunner(BaseRunner):
         _, _, admission_batch = self._shared_graph_plan(
             metadata,
             batch_size,
-            local_expanded=resolve_expanded_decode_metadata(metadata) is not None,
+            local_expanded=self._is_expanded_verify(metadata, batch_size=batch_size),
         )
         if admission_batch is None or _decode_bucket(admission_batch) > self.max_batch:
             raise ValueError("decode batch exceeds ACL graph capacity")
@@ -1320,7 +1368,7 @@ class DecodeAclGraphRunner(BaseRunner):
         is_expanded, verify_width, admission_batch = self._shared_graph_plan(
             metadata,
             batch_size,
-            local_expanded=expanded_view is not None,
+            local_expanded=self._is_expanded_verify(metadata, expanded_view, batch_size),
         )
         if admission_batch is None or _decode_bucket(admission_batch) > self.max_batch:
             raise ValueError("decode batch exceeds ACL graph capacity")
@@ -1390,7 +1438,7 @@ class DecodeAclGraphRunner(BaseRunner):
             input_batch,
             verify_width=verify_width,
             kpool_query_lens=kpool_query_lens,
-            local_expanded=expanded_view is not None,
+            local_expanded=self._is_expanded_verify(metadata, expanded_view, batch_size),
         )
 
         prepare_context = ForwardContext(
@@ -2151,7 +2199,7 @@ class DecodeAclGraphRunner(BaseRunner):
             block_table.shape[0],
         )
         is_expanded = (
-            local_expanded if local_expanded is not None else resolve_expanded_decode_metadata(metadata) is not None
+            local_expanded if local_expanded is not None else self._is_expanded_verify(metadata, batch_size=batch_size)
         )
         cumulative_kv_seq_lens = self._cumulative_lengths(
             kv_seq_lens,
