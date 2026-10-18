@@ -1849,16 +1849,16 @@ class _StoppedAfterCaptureError(Exception):
     """Sentinel raised at the replay boundary, after a successful capture."""
 
 
-class _StopAtReplayStream:
-    """``self._stream`` stand-in that stops ``execute`` at the replay.
+class _SentinelGraph:
+    """Stub captured graph that stops ``execute`` at the replay boundary.
 
-    ``execute`` only reaches ``self._stream.wait_stream(...)`` after the first
-    capture has completed and been registered, so raising from ``wait_stream``
-    keeps the test device-free while still exercising the capture-then-register
+    ``execute`` only reaches ``entry.graph.replay()`` after the first capture
+    has completed and been registered, so raising from ``replay`` keeps the
+    test device-free while still exercising the capture-then-register
     ordering.
     """
 
-    def wait_stream(self, *args: object, **kwargs: object) -> None:
+    def replay(self) -> None:
         raise _StoppedAfterCaptureError
 
 
@@ -1872,12 +1872,11 @@ def _engram_execute_harness(
 
     Only ``_allocate_entry`` / ``_fill_entry`` / ``_capture`` and the backend
     ``prepare`` are stubbed; ``execute`` itself -- the gate call, the capture
-    call and the registration that follows it -- runs for real. ``_stream``
-    raises :class:`_StoppedAfterCaptureError` from ``wait_stream`` so a
-    successful capture stops right after registration, before the replay block
-    (no device needed); when ``capture_error`` is set the stubbed ``_capture``
-    raises it instead. ``torch.npu`` is stubbed to the single entry point used
-    on that path so the test does not require an NPU.
+    call and the registration that follows it -- runs for real. The stub
+    capture installs a :class:`_SentinelGraph` whose ``replay`` raises
+    :class:`_StoppedAfterCaptureError` so a successful capture stops right
+    after registration, at the replay boundary (no device needed); when
+    ``capture_error`` is set the stubbed ``_capture`` raises it instead.
     """
 
     class _EngramModel(nn.Module):
@@ -1904,7 +1903,10 @@ def _engram_execute_harness(
     model = _EngramModel()
     backend = SimpleNamespace(page_size=4, is_mla=False, prepare=lambda *args, **kwargs: None)
     runner = DecodeAclGraphRunner(model, backend, torch.device("cpu"), max_batch=8, max_model_len=8)
-    runner._stream = _StopAtReplayStream()
+    # Replay runs on the caller's current stream; the dedicated capture stream
+    # only exists on NPU. A truthy placeholder skips the lazy NPU stream
+    # creation (the stubbed _capture never dereferences it).
+    runner._stream = SimpleNamespace()
     graphs = _KeyRecordingDict()
     runner._graphs = graphs
 
@@ -1913,10 +1915,12 @@ def _engram_execute_harness(
             static_metadata=SimpleNamespace(),
             static_input_ids=input_ids,
             static_positions=positions,
+            static_input_embedding=None,
             execution_state=object(),
             execution_contexts={},
             eplb=None,
             graph=None,
+            graph_tasks=[],
         )
 
     capture_calls: list[Any] = []
@@ -1925,13 +1929,17 @@ def _engram_execute_harness(
         capture_calls.append(entry)
         if capture_error is not None:
             raise capture_error
+        entry.graph = _SentinelGraph()
+        entry.static_output = torch.zeros_like(entry.static_input_ids)
 
     monkeypatch.setattr(runner, "_allocate_entry", fake_allocate_entry)
     monkeypatch.setattr(runner, "_fill_entry", lambda *args, **kwargs: None)
+    # The eager pre-capture execution populates the persistent DSA metadata;
+    # stub it so the harness stays model- and device-free.
+    monkeypatch.setattr(runner, "_forward_static", lambda entry: None)
     monkeypatch.setattr(runner, "_capture", fake_capture)
-    # The only ``torch.npu`` call reached on this path is the replay-boundary
-    # ``current_stream`` lookup, right before ``_stream.wait_stream`` raises.
-    monkeypatch.setattr(torch, "npu", SimpleNamespace(current_stream=lambda: None), raising=False)
+    # The replay runs on the caller's current stream, so no ``torch.npu``
+    # entry point is reached on this path while ``graph_tasks`` is empty.
     return runner, model, capture_calls, graphs
 
 

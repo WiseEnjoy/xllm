@@ -203,6 +203,10 @@ class _StaticAttentionMetadata:
     # Token-capacity bound of the CSA2 committed-row buckets (0 = backend does
     # not bucket); consumed by the backend's capacity gathers.
     dsa_graph_token_capacity: int = 0
+    # KV-length domain bound (max model context) for ACL-graph DSA captures
+    # (0 = unset). The backend pins the capture-time baked max_seqlen ints to
+    # this bound so no replay's refreshed seqused can exceed them.
+    dsa_graph_kv_capacity: int = 0
 
 
 class _DecodeGraphEntry:
@@ -1005,16 +1009,18 @@ class DecodeAclGraphRunner(BaseRunner):
                 )
                 return False
         # V4.1 CSA2 multi-manager paging: graph replay refreshes every DSA
-        # manager's block table (_fill_dsa_block_tables raises without them),
-        # so a batch whose manager table count does not match the backend's
-        # group count must stay on the eager runner, whose CSA2 path has
-        # explicit table-less fallbacks (ring block 0 / plain window). Table-less
-        # batches were already normalized above (empty DP shard dummy), so this
-        # only rejects genuinely malformed multi-manager exports.
+        # manager's block table (_fill_dsa_block_tables raises without them).
+        # The refresh consumes the group-aligned PREFIX of the source tables:
+        # speculative inputs inherit the target's SWA/C4/C128 tables on top of
+        # their own manager tables (the eager CSA2 path clamps the same way),
+        # so only a batch with FEWER tables than backend groups must stay on
+        # the eager runner. Table-less batches were already normalized above
+        # (empty DP shard dummy), so this only rejects genuinely malformed
+        # multi-manager exports.
         group_infos = getattr(self.attention_backend, "group_infos", None)
         if group_infos is not None:
             source_tables = list(getattr(metadata, "multi_block_tables", ()) or ())
-            if not source_tables or len(source_tables) != len(group_infos):
+            if not source_tables or len(source_tables) < len(group_infos):
                 return False
         # V4.1 CSA2 committed-row capacity buckets: the captured graph's
         # gathers are sized by max_model_len, so a context beyond it (or a
@@ -1486,6 +1492,29 @@ class DecodeAclGraphRunner(BaseRunner):
 
         if first_capture:
             self._engram_first_capture_gate(staged=staged)
+            # Populate the persistent DSA metadata OUTSIDE the captured
+            # region first. The model's first forward builds it via
+            # ``prepare_dsa_metadata_for_forward``; letting that build run
+            # inside ``_capture`` would record the builder's transient H2D
+            # copies (host staging freed after the step) plus the AICPU
+            # metadata kernels, and every replay would re-run those copies
+            # against freed host memory -- clobbering the refreshed values
+            # and faulting in-graph kernels with device error 507011. One
+            # eager execution on the static tensors leaves
+            # ``static_metadata.dsa_metadata`` (and the attached RoPE tables)
+            # bound at stable addresses; the capture below then records only
+            # the layer ops reading them.
+            with forward_context(prepare_context):
+                self._forward_static(entry)
+                # The first forward above built the persistent DSA and landed
+                # the cmp seqused/residual execution buffers (see
+                # _get_graph_cmp_seqused). The capture below then records
+                # only the layer ops reading those address-stable tensors;
+                # the per-step refresh rewrites their content eagerly
+                # outside the graph.
+            # The capture stream must not race the eager build's H2D writes.
+            if self.device.type == "npu":
+                torch.npu.synchronize()
             self._capture(entry)
             if capture_metadata is not None:
                 # Capture may still read the persistent indices. Order real
@@ -1516,21 +1545,27 @@ class DecodeAclGraphRunner(BaseRunner):
             # the write is safe.
             self._graphs[graph_key] = entry
 
-        # Besides ordering input updates, this wait protects the output view
-        # returned by the previous replay.  The graph cannot overwrite its
-        # static output until consumers queued on the current stream finish.
-        self._stream.wait_stream(torch.npu.current_stream())
-        with torch.npu.stream(self._stream):
-            entry.graph.replay()
-            output = self._slice_output(entry.static_output, batch_size)
+        # Replay on the CURRENT (compute) stream. The dedicated capture stream
+        # stays for capture only (NPUGraph requires a non-default stream).
+        # Replaying on the compute stream serializes the graph's captured HCCL
+        # collectives with eagerly-enqueued HCCL (speculative draft forwards,
+        # prefill all-reduces, H2D fills) on ONE stream -- two streams sharing
+        # one HCCL communicator under concurrency corrupts its state (device
+        # error 507011).
+        entry.graph.replay()
+        output = self._slice_output(entry.static_output, batch_size)
 
-        with torch.npu.stream(self._update_stream):
-            self._update_stream.wait_event(self._replay_done_event)
-            self._update_graph_tasks(self._update_stream, entry.graph_tasks)
+        # A captured FIA task waits on its update event before execution. This
+        # lets replay run concurrently with the host-side updates for later
+        # layers while preventing the graph from observing stale parameters.
+        if entry.graph_tasks:
+            with torch.npu.stream(self._update_stream):
+                self._update_stream.wait_event(self._replay_done_event)
+                self._update_graph_tasks(self._update_stream, entry.graph_tasks)
 
-        self._replay_done_event.record(self._stream)
-
-        torch.npu.current_stream().wait_stream(self._stream)
+            # The next update must not overwrite task parameters until this
+            # replay has consumed them.
+            self._replay_done_event.record(torch.npu.current_stream())
         return output
 
     def _stage_engram_rows_outside_graph(
@@ -2019,6 +2054,7 @@ class DecodeAclGraphRunner(BaseRunner):
             ),
         )
         entry.static_metadata.q_cu_host_values = [0] * (padded_batch_size + 1)
+        entry.static_metadata.dsa_graph_kv_capacity = int(self.max_model_len)
         expanded_view = resolve_expanded_decode_metadata(metadata, block_size=self.attention_backend.page_size)
         local_expanded = expanded_view is not None
         group_expanded = verify_width > 1 or local_expanded
@@ -2402,7 +2438,17 @@ class DecodeAclGraphRunner(BaseRunner):
                     f"ACL graph DSA manager {manager_id} requires {source.shape[1]} "
                     f"columns, capacity is {target.shape[1]}"
                 )
-            self._copy_block_table(target[:batch_size, : source.shape[1]], source[:batch_size])
+            source_rows = source[:batch_size]
+            # Remap -1 stride padding to the reserved block 0 before the device
+            # transfer. The CANN compressor and QLI indexer kernels do not
+            # guard against negative block ids and compute invalid device
+            # addresses from them, corrupting the device when the captured
+            # graph replays (device error 507011). Block 0 holds garbage data
+            # at valid addresses and reads past kv_seq_lens are masked, so the
+            # output is unchanged. Unconditional clamp: no host readback of
+            # device tables (a min() probe would force a per-manager sync).
+            source_rows = source_rows.clamp_min(0)
+            self._copy_block_table(target[:batch_size, : source.shape[1]], source_rows)
 
     def _fill_graph_dsa_positions(
         self,
@@ -2539,7 +2585,17 @@ class DecodeAclGraphRunner(BaseRunner):
             eplb=getattr(entry, "eplb", None),
             execution_contexts=entry.execution_contexts,
         )
-        with forward_context(context), torch.npu.graph(entry.graph, stream=self._stream):
+        with (
+            forward_context(context),
+            torch.npu.graph(
+                entry.graph,
+                stream=self._stream,
+                # Match the C++ AclGraph capture mode: THREAD_LOCAL allows other
+                # threads (eager prefill, prepare H2D) to keep executing
+                # synchronous operations during lazy capture.
+                capture_error_mode="thread_local",
+            ),
+        ):
             entry.static_output = self._forward_static(entry)
         entry.graph_tasks = capture_context.tasks
 

@@ -2307,7 +2307,13 @@ class DeepseekV4Model(nn.Module):
             # ACL graph replay/warmup reuses the metadata built during the
             # first graph warmup call. RoPE tables and the DSA object keep
             # their stable addresses, which is what the captured graph needs.
-            pass
+            # The AICPU precomputed metadata is still rebuilt here so the
+            # metadata kernels are captured INSIDE the graph and re-run on
+            # every replay against the refreshed input views (see
+            # CsaAttentionBackend.prepare_dsa_metadata_for_forward).
+            prepare_dsa = getattr(backend, "prepare_dsa_metadata_for_forward", None)
+            if prepare_dsa is not None:
+                prepare_dsa(metadata)
         else:
             backend.reset_forward(metadata)
             metadata.dsa_graph_mode = graph_mode

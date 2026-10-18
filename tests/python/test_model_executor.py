@@ -1892,9 +1892,12 @@ class TestDecodeAclGraphSpeculativeMetadata:
         assert output.data_ptr() == static_output.data_ptr()
         output[0, 0] = -1
         assert static_output[0, 0].item() == -1
-        replay_stream.wait_stream.assert_called_once_with(current_stream)
-        current_stream.wait_stream.assert_called_once_with(replay_stream)
+        # The replay runs on the caller's current (compute) stream: captured
+        # HCCL collectives must serialize with eagerly-enqueued HCCL, two
+        # streams sharing one communicator corrupt its state (507011).
         graph.replay.assert_called_once_with()
+        replay_stream.wait_stream.assert_not_called()
+        current_stream.wait_stream.assert_not_called()
         refresh_dsa.assert_called_once_with(entry.static_metadata)
 
     def test_graph_token_mask_updates_in_place_for_reused_bucket(self) -> None:
