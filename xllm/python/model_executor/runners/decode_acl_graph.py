@@ -325,7 +325,11 @@ class DecodeAclGraphRunner(BaseRunner):
         self._graphs: dict[_GraphKey, _DecodeGraphEntry] = {}
         self._paged_kv_indices_buffer: torch.Tensor | None = None
         self._max_blocks_per_sequence: int = 0
-        self._pinned_block_table_staging: dict[tuple[str, torch.dtype, torch.Size], torch.Tensor] = {}
+        self._pinned_block_table_staging: dict[tuple[str, torch.dtype, torch.Size], list[torch.Tensor]] = {}
+        # Per-slot events for the reused pinned stages; the next host write to
+        # a slot waits on the copy enqueued through it (see _pinned_stage).
+        self._pinned_stage_events: dict[tuple[str, torch.dtype, torch.Size], list[torch.npu.Event | None]] = {}
+        self._pinned_stage_cursor: dict[tuple[str, torch.dtype, torch.Size], int] = {}
         self._stream: torch.npu.Stream | None = None
         self._update_stream: torch.npu.Stream | None = None
         self._replay_done_event: torch.npu.Event | None = None
@@ -2161,28 +2165,64 @@ class DecodeAclGraphRunner(BaseRunner):
             )
         return tuple(tables)
 
-    def _pinned_stage(self, source: torch.Tensor, kind: str) -> torch.Tensor:
-        """Return a reusable pinned CPU view for asynchronous graph refreshes."""
+    _PINNED_STAGE_SLOTS = 8
+
+    def _pinned_stage(
+        self, source: torch.Tensor, kind: str
+    ) -> tuple[torch.Tensor, tuple[str, torch.dtype, torch.Size] | None, int | None]:
+        """Return a reusable pinned CPU view for asynchronous graph refreshes.
+
+        Stages rotate over ``_PINNED_STAGE_SLOTS`` buffers, each carrying the
+        event of the last host-to-device copy enqueued through it. The next
+        host write to a slot first waits on that event: schedule overlap lets
+        the host prepare later steps while the device still executes earlier
+        ones, and without the guard the write could land in a slot whose
+        previous async copy has not run yet -- putting a later batch's block
+        table into this step's graph (nondeterministic cross-sequence KV
+        reads). The rotation depth only bounds how far the host may run ahead;
+        the per-slot event keeps the reuse correct at any depth.
+        """
         if source.device.type != "cpu" or source.is_pinned():
-            return source
+            return source, None, None
         key = (kind, source.dtype, source.shape)
-        staged = self._pinned_block_table_staging.get(key)
-        if staged is None:
+        ring = self._pinned_block_table_staging.get(key)
+        if ring is None:
             try:
-                staged = torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
-                self._pinned_block_table_staging[key] = staged
+                ring = [
+                    torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
+                    for _ in range(self._PINNED_STAGE_SLOTS)
+                ]
             except RuntimeError:
-                return source
+                return source, None, None
+            self._pinned_block_table_staging[key] = ring
+            self._pinned_stage_events[key] = [None] * len(ring)
+            self._pinned_stage_cursor[key] = -1
+        events = self._pinned_stage_events[key]
+        index = (self._pinned_stage_cursor[key] + 1) % len(ring)
+        pending = events[index]
+        if pending is not None:
+            pending.synchronize()
+        staged = ring[index]
         staged.copy_(source)
-        return staged
+        self._pinned_stage_cursor[key] = index
+        return staged, key, index
 
     def _copy_block_table(self, target: torch.Tensor, source: torch.Tensor) -> None:
         if target.device.type == source.device.type:
             target.copy_(source)
             return
-        staged = self._pinned_stage(source, "block_table")
-        non_blocking = staged.is_pinned() and target.device.type in ("cuda", "npu")
-        target.copy_(staged, non_blocking=non_blocking)
+        staged, stage_key, stage_index = self._pinned_stage(source, "block_table")
+        non_blocking = stage_key is not None and staged.is_pinned() and target.device.type in ("cuda", "npu")
+        if non_blocking:
+            target.copy_(staged, non_blocking=True)
+            events = self._pinned_stage_events[stage_key]
+            event = events[stage_index]
+            if event is None:
+                event = torch.npu.Event()
+                events[stage_index] = event
+            event.record()
+        else:
+            target.copy_(staged)
 
     def _fill_entry(
         self,
