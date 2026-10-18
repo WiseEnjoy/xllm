@@ -1292,20 +1292,11 @@ void DFlashWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   ForwardInput prepared_input = input;
   prepared_input.metadata_ready_event.reset();
   const bool use_linear_spec_verify = target_is_hybrid_recurrent_;
-#if defined(USE_NPU)
-  const bool use_graph_spec_verify = options_.enable_graph();
-#else
-  const bool use_graph_spec_verify = false;
-#endif
-  // ACL graph replay needs one typed expanded-metadata contract for every
-  // target. Shape inference alone cannot safely refresh row-aligned paging.
-  const bool use_expanded_spec_verify =
-      use_linear_spec_verify || use_graph_spec_verify;
-  prepared_input.input_params.is_spec_verify = use_expanded_spec_verify;
+  prepared_input.input_params.is_spec_verify = use_linear_spec_verify;
   SpeculativeWorkerImpl::prepare_validate_inputs(prepared_input,
                                                  validate_input);
   validate_input.input_params.embedding.input_embedding = torch::Tensor();
-  if (use_expanded_spec_verify) {
+  if (use_linear_spec_verify) {
     ModelInputParams& input_params = validate_input.input_params;
     std::vector<int32_t> accepted_prefix_lengths(
         input.input_params.meta.num_sequences, 1);
@@ -1321,24 +1312,21 @@ void DFlashWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
     input_params.num_accepted_tokens =
         torch::tensor(accepted_prefix_lengths,
                       validate_input.token_ids.options().dtype(torch::kInt32));
-    if (use_linear_spec_verify) {
-      if (!input_params.attention.host.q_seq_lens.empty()) {
-        std::vector<int32_t> q_cu_seq_lens;
-        q_cu_seq_lens.reserve(input_params.attention.host.q_seq_lens.size() +
-                              1);
-        q_cu_seq_lens.emplace_back(0);
-        for (int32_t q_len : input_params.attention.host.q_seq_lens) {
-          q_cu_seq_lens.emplace_back(q_cu_seq_lens.back() + q_len);
-        }
-        input_params.attention.host.q_cu_seq_lens = std::move(q_cu_seq_lens);
+    if (!input_params.attention.host.q_seq_lens.empty()) {
+      std::vector<int32_t> q_cu_seq_lens;
+      q_cu_seq_lens.reserve(input_params.attention.host.q_seq_lens.size() + 1);
+      q_cu_seq_lens.emplace_back(0);
+      for (int32_t q_len : input_params.attention.host.q_seq_lens) {
+        q_cu_seq_lens.emplace_back(q_cu_seq_lens.back() + q_len);
       }
-      // The generic builder materializes the device buffer before the hybrid
-      // cumulative lengths above are canonicalized.  Rebind it so GDN sees
-      // [0, q_len_0, ...] rather than the stale pre-verify host layout.
-      input_params.attention.rebuild_device_buffer(device_);
+      input_params.attention.host.q_cu_seq_lens = std::move(q_cu_seq_lens);
     }
+    // The generic builder materializes the device buffer before the hybrid
+    // cumulative lengths above are canonicalized.  Rebind it so GDN sees
+    // [0, q_len_0, ...] rather than the stale pre-verify host layout.
+    input_params.attention.rebuild_device_buffer(device_);
 #if defined(USE_NPU)
-    if (use_graph_spec_verify) {
+    if (options_.enable_graph()) {
       build_dflash_expanded_spec_verify_graph_input(
           input_params, device_.unwrap(), logical_block_size());
     }
