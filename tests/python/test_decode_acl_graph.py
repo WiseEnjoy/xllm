@@ -1934,8 +1934,9 @@ def _engram_execute_harness(
 
     monkeypatch.setattr(runner, "_allocate_entry", fake_allocate_entry)
     monkeypatch.setattr(runner, "_fill_entry", lambda *args, **kwargs: None)
-    # The eager pre-capture execution populates the persistent DSA metadata;
-    # stub it so the harness stays model- and device-free.
+    # The DSA pre-capture pass (when the backend declares the contract) runs
+    # the eager static forward; stub it so the harness stays model- and
+    # device-free.
     monkeypatch.setattr(runner, "_forward_static", lambda entry: None)
     monkeypatch.setattr(runner, "_capture", fake_capture)
     # The replay runs on the caller's current stream, so no ``torch.npu``
@@ -1995,6 +1996,62 @@ def test_acl_runner_execute_registers_only_after_successful_capture(
     graph_key = graphs.keys_written[0]
     assert runner._graphs.get(graph_key) is capture_calls[0]
     assert len(runner._graphs) == 1
+
+
+def test_acl_runner_first_capture_skips_dsa_prerun_without_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-DSA backends keep the historical capture path unchanged.
+
+    The eager pre-capture forward exists only to materialize the persistent
+    DSA metadata outside the captured region; a backend without
+    ``prepare_dsa_metadata_for_forward`` must not run it.
+    """
+
+    runner, model, capture_calls, graphs = _engram_execute_harness(monkeypatch, staged=True)
+    forward_calls: list[Any] = []
+    monkeypatch.setattr(runner, "_forward_static", lambda entry: forward_calls.append(entry))
+    input_ids, positions, metadata = _engram_execute_inputs()
+
+    with pytest.raises(_StoppedAfterCaptureError):
+        runner.execute(input_ids, positions, metadata)
+
+    assert forward_calls == [], "non-DSA backends must not run the pre-capture forward"
+    assert len(capture_calls) == 1
+
+
+def test_acl_runner_first_capture_runs_dsa_prerun_before_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DSA-contract backends get one eager static forward before the capture.
+
+    The pre-run binds the persistent DSA metadata at stable addresses; it
+    must complete before ``_capture`` records the region.
+    """
+
+    runner, model, capture_calls, graphs = _engram_execute_harness(monkeypatch, staged=True)
+    runner.attention_backend = SimpleNamespace(
+        page_size=4,
+        is_mla=False,
+        prepare=lambda *args, **kwargs: None,
+        prepare_dsa_metadata_for_forward=lambda metadata: None,
+    )
+    events: list[str] = []
+    monkeypatch.setattr(runner, "_forward_static", lambda entry: events.append("forward"))
+    harness_capture = runner._capture
+
+    def recording_capture(entry: Any) -> None:
+        events.append("capture")
+        harness_capture(entry)
+
+    monkeypatch.setattr(runner, "_capture", recording_capture)
+    input_ids, positions, metadata = _engram_execute_inputs()
+
+    with pytest.raises(_StoppedAfterCaptureError):
+        runner.execute(input_ids, positions, metadata)
+
+    assert events == ["forward", "capture"], "the DSA pre-run must precede the capture"
+    assert len(capture_calls) == 1
 
 
 def test_acl_runner_execute_leaves_no_entry_when_capture_raises(

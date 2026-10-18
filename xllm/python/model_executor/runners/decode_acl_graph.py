@@ -460,6 +460,17 @@ class DecodeAclGraphRunner(BaseRunner):
                 admission_batch = batch_size // self._draft_query_width
         return is_expanded, verify_width, admission_batch
 
+    @property
+    def _backend_uses_dsa_graph_contract(self) -> bool:
+        """Whether the backend materializes persistent DSA state per step.
+
+        DSA-family backends (DSV4 / V4.1 / MTP, all ``DsaAttentionBackend``
+        subclasses) build metadata that graph capture must not record; they
+        get the eager pre-capture pass in ``execute``. Every other backend
+        keeps the historical capture path unchanged.
+        """
+        return getattr(self.attention_backend, "prepare_dsa_metadata_for_forward", None) is not None
+
     def _is_expanded_verify(
         self,
         metadata: AttentionMetadata,
@@ -1496,29 +1507,31 @@ class DecodeAclGraphRunner(BaseRunner):
 
         if first_capture:
             self._engram_first_capture_gate(staged=staged)
-            # Populate the persistent DSA metadata OUTSIDE the captured
-            # region first. The model's first forward builds it via
-            # ``prepare_dsa_metadata_for_forward``; letting that build run
-            # inside ``_capture`` would record the builder's transient H2D
-            # copies (host staging freed after the step) plus the AICPU
-            # metadata kernels, and every replay would re-run those copies
-            # against freed host memory -- clobbering the refreshed values
-            # and faulting in-graph kernels with device error 507011. One
-            # eager execution on the static tensors leaves
-            # ``static_metadata.dsa_metadata`` (and the attached RoPE tables)
-            # bound at stable addresses; the capture below then records only
-            # the layer ops reading them.
-            with forward_context(prepare_context):
-                self._forward_static(entry)
-                # The first forward above built the persistent DSA and landed
-                # the cmp seqused/residual execution buffers (see
-                # _get_graph_cmp_seqused). The capture below then records
-                # only the layer ops reading those address-stable tensors;
-                # the per-step refresh rewrites their content eagerly
-                # outside the graph.
-            # The capture stream must not race the eager build's H2D writes.
-            if self.device.type == "npu":
-                torch.npu.synchronize()
+            if self._backend_uses_dsa_graph_contract:
+                # Populate the persistent DSA metadata OUTSIDE the captured
+                # region first. The model's first forward builds it via
+                # ``prepare_dsa_metadata_for_forward``; letting that build run
+                # inside ``_capture`` would record the builder's transient H2D
+                # copies (host staging freed after the step) plus the AICPU
+                # metadata kernels, and every replay would re-run those copies
+                # against freed host memory -- clobbering the refreshed values
+                # and faulting in-graph kernels with device error 507011. One
+                # eager execution on the static tensors leaves
+                # ``static_metadata.dsa_metadata`` (and the attached RoPE
+                # tables) bound at stable addresses; the capture below then
+                # records only the layer ops reading them.
+                with forward_context(prepare_context):
+                    self._forward_static(entry)
+                    # The first forward above built the persistent DSA and
+                    # landed the cmp seqused/residual execution buffers (see
+                    # _get_graph_cmp_seqused). The capture below then records
+                    # only the layer ops reading those address-stable tensors;
+                    # the per-step refresh rewrites their content eagerly
+                    # outside the graph.
+                # The capture stream must not race the eager build's H2D
+                # writes.
+                if self.device.type == "npu":
+                    torch.npu.synchronize()
             self._capture(entry)
             if capture_metadata is not None:
                 # Capture may still read the persistent indices. Order real
