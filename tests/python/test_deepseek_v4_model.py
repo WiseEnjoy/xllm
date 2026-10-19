@@ -282,8 +282,8 @@ def test_hyper_connection_shapes() -> None:
     # pure-Python unit-test context; only shape construction is verified here.
 
 
-def test_hyper_connection_weights_are_preconverted_once() -> None:
-    cfg = DeepseekV4Config.from_dict(_DSV4_CONFIG)
+def test_hyper_connection_weights_are_preconverted_once_for_mx_formats() -> None:
+    cfg = DeepseekV4Config.from_dict({**_DSV4_CONFIG, "weight_quant_method": "fp8"})
     hc = DeepseekV4HyperConnection(cfg, torch.float32, torch.device("cpu"))
 
     hc.process_weights_after_loading()
@@ -293,6 +293,18 @@ def test_hyper_connection_weights_are_preconverted_once() -> None:
     assert hc.hc_attn_fn.dtype == torch.bfloat16
     assert hc.hc_ffn_fn.dtype == torch.bfloat16
     assert (hc.hc_attn_fn.data_ptr(), hc.hc_ffn_fn.data_ptr()) == function_pointers
+
+
+def test_hyper_connection_weights_stay_float32_for_w8a8() -> None:
+    """W8A8 deployments keep the checkpoint's float32 registration so the
+    Python and C++ numerical paths stay aligned."""
+    cfg = DeepseekV4Config.from_dict(_DSV4_CONFIG)
+    hc = DeepseekV4HyperConnection(cfg, torch.float32, torch.device("cpu"))
+
+    hc.process_weights_after_loading()
+
+    assert hc.hc_attn_fn.dtype == torch.float32
+    assert hc.hc_ffn_fn.dtype == torch.float32
 
 
 def test_decoder_layer_builds() -> None:

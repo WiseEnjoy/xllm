@@ -23,7 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
-#include "xllm_ops_api.h"
+#include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
 namespace xllm::kernel::npu {
 

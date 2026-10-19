@@ -945,6 +945,54 @@ def test_dp_expanded_verify_and_dummy_rank_share_graph_decision() -> None:
         assert wide_runners[1].can_execute(torch.zeros(1, dtype=torch.int32), dummy)
 
 
+def test_dp_unmarked_shape_expanded_rows_raise_instead_of_diverging() -> None:
+    """DSpark-style verify rows carry no typed expanded view; only the
+    group-wide marker may promote them to the expanded graph under DP."""
+
+    def dspark_rows(rows: int, sequences: int) -> SimpleNamespace:
+        metadata = _dp_metadata((4, 1))
+        metadata.raw_dp_execution_token_counts = (4, 0)
+        metadata.linear_state_indices = torch.arange(sequences, dtype=torch.int32)
+        metadata.q_cu_seq_lens = torch.arange(rows + 1, dtype=torch.int32)
+        metadata.kv_cu_seq_lens = torch.arange(rows + 1, dtype=torch.int32)
+        return metadata
+
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=8,
+            max_model_len=16,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=2,
+        )
+        for rank in range(2)
+    ]
+
+    # Marked busy and idle ranks share one expanded plan: the DSV4/DSpark
+    # production flow once the step type is marked group-wide.
+    busy = dspark_rows(4, 2)
+    busy.is_spec_verify = True
+    empty = dspark_rows(1, 1)
+    empty.is_spec_verify = True
+    busy_plan = runners[0]._shared_graph_plan(busy, 4)
+    empty_plan = runners[1]._shared_graph_plan(empty, 1)
+    assert busy_plan == empty_plan == (True, 2, 2)
+
+    # Unmarked expanded-looking rows used to be shape-inferred into a private
+    # expanded graph on the busy rank only (the idle rank captured width 1
+    # and the plans diverged); now they are a loud contract error.
+    unmarked = dspark_rows(4, 2)
+    with pytest.raises(RuntimeError, match="group-wide spec verify"):
+        runners[0]._shared_graph_plan(unmarked, 4)
+    # The idle rank's unmarked dummy row cannot see the busy layout and stays
+    # width 1.
+    assert runners[1]._shared_graph_plan(dspark_rows(1, 1), 1) == (False, 1, 4)
+
+
 def test_dp_plain_decode_with_empty_rank_keeps_width_one() -> None:
     attention_backend = SimpleNamespace(page_size=4, is_mla=False)
     runners = [

@@ -256,6 +256,14 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
   // Fixed once the target finishes loading; the hybrid spec-verify gates and
   // the adaptive-pruning guard read this instead of re-scanning layer_types.
   bool target_is_hybrid_recurrent_ = false;
+  // The single source of truth for whether a target validate step must be
+  // marked as the expanded spec-verify layout. Every path that builds a
+  // target validate input -- the real prepare_validate_inputs flow AND the
+  // graph-warmup flow -- must consult this SAME predicate: the ACL graph
+  // plan under DP consumes only the group-wide ``is_spec_verify`` marker,
+  // so a warmup that marks a different step type than the real flow makes
+  // busy and idle ranks capture different graph keys.
+  bool target_uses_expanded_spec_verify() const;
   // Preformatted labels keep per-position acceptance telemetry allocation-free
   // on the decode hot path.
   std::vector<std::string> speculative_position_labels_;

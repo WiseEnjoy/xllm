@@ -85,12 +85,32 @@ def _assert_positions_match_reference(
         total_tokens = sum(min(q_len, kv_len) for q_len, kv_len in zip(q_lens, kv_seq_lens))
     metadata = _metadata(total_tokens)
     builder = DsaMetadataBuilder(caches_info=[], group_infos=[])
-
     builder._build_positions(metadata, kv_seq_lens, q_lens, enable_graph)
     expected_c4, expected_c128 = _reference_positions(total_tokens, kv_seq_lens, q_lens, enable_graph)
 
     torch.testing.assert_close(metadata.c4_pad_positions, expected_c4)
     torch.testing.assert_close(metadata.c128_pad_positions, expected_c128)
+
+
+def test_swa_group_missing_table_rows_keep_per_sequence_output_offsets() -> None:
+    """A batch sequence without a block-table row must not shift the gathered
+    tokens of the sequences before it."""
+    builder = DsaMetadataBuilder(caches_info=[], group_infos=[])
+    _, slots = builder._process_swa_group(
+        torch.tensor([[3]], dtype=torch.int32),
+        4,
+        [2, 2],
+        [1, 1],
+        2,
+        2,
+        2,
+        None,
+    )
+    # Sequence 0's only query token (block 3, offset 1) must land at output
+    # index 0; sequence 1 has no block-table row, so its output offset keeps
+    # the -1 padding. The old cursor advanced past missing rows before the
+    # gathered tokens were written, shifting the real token to index 1.
+    assert slots.tolist() == [13, -1]
 
 
 def test_decode_positions_match_sequence_loop() -> None:

@@ -397,7 +397,6 @@ class DecodeAclGraphRunner(BaseRunner):
         """
         if local_expanded is None:
             local_expanded = self._is_expanded_verify(metadata, batch_size=batch_size)
-        expanded_view = resolve_expanded_decode_metadata(metadata)
         marked_spec_verify = bool(getattr(metadata, "is_spec_verify", False))
         spec_verify = marked_spec_verify or local_expanded
         local_width = 1
@@ -407,15 +406,13 @@ class DecodeAclGraphRunner(BaseRunner):
             if batch_size % seq_count == 0:
                 local_width = batch_size // seq_count
         if self.dp_size > 1:
-            # Local expanded rows must not choose a width the empty rank cannot see.
-            shape_inferred_verify = (
-                not marked_spec_verify
-                and local_expanded
-                and expanded_view is None
-                and self.num_decoding_tokens > 1
-                and local_width == self.num_decoding_tokens
-            )
-            if (marked_spec_verify or shape_inferred_verify) and self.num_decoding_tokens > 1:
+            # Local expanded rows must not choose a width the empty rank
+            # cannot see: under DP the width comes ONLY from the explicitly
+            # marked step type (``is_spec_verify``) plus num_decoding_tokens,
+            # both group-wide, so an empty rank and a busy rank share one
+            # graph key. An unmarked local expanded layout is a contract
+            # violation and raises instead of capturing a private graph.
+            if marked_spec_verify and self.num_decoding_tokens > 1:
                 if local_width > 1 and local_width != self.num_decoding_tokens:
                     raise RuntimeError(
                         "DP spec-verify layout does not match num_decoding_tokens: "

@@ -21,6 +21,7 @@ limitations under the License.
 #include <algorithm>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -144,9 +145,20 @@ void build_dflash_expanded_spec_verify_graph_input(
   const auto& q_seq_lens = input_params.attention.host.q_seq_lens;
   const auto& kv_seq_lens = input_params.attention.host.kv_seq_lens;
   // Graph warmup exercises verify with placeholder metadata. Only promote a
-  // replay contract when the caller has supplied real paging metadata.
+  // replay contract when the caller has supplied real paging metadata. A
+  // real batch missing its paging metadata is an upstream bug that would
+  // otherwise silently produce an incomplete graph input, so surface every
+  // skip once instead of staying quiet.
   if (q_seq_lens.empty() || kv_seq_lens.empty() ||
       !input_params.attention.device.block_tables.defined()) {
+    static std::once_flag skip_logged;
+    std::call_once(skip_logged, [] {
+      LOG(WARNING)
+          << "dflash expanded spec-verify graph input skipped: attention "
+             "host seq lens or device block tables are missing. Expected "
+             "only for graph warmup placeholder metadata; a real batch "
+             "reaching here cannot build its replay contract.";
+    });
     return;
   }
   CHECK_EQ(q_seq_lens.size(), kv_seq_lens.size());
@@ -590,10 +602,16 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
           *draft_impl_, query_input, *prepare_stream_, *compute_stream_);
 
   ForwardInput validate_input = input;
-  // Idle decode joins the busy ranks' target validate. Mark the same spec
-  // verify flag so every rank captures one expanded graph instead of a
-  // separate width-1 graph on the dummy row.
-  validate_input.input_params.is_spec_verify = target_is_hybrid_recurrent_;
+  // Idle decode joins the busy ranks' target validate. Mark the SAME
+  // expanded spec-verify predicate the real validate flow uses, and only on
+  // steps that actually run speculative decode (the decision reads the
+  // group-wide DP token structures, so busy and idle ranks agree): every
+  // rank then captures one expanded graph instead of a separate width-1
+  // graph on the dummy row, and plain-decode EMPTY steps stay unmarked like
+  // their busy peers.
+  validate_input.input_params.is_spec_verify =
+      target_uses_expanded_spec_verify() &&
+      should_run_speculative_decode(validate_input.input_params);
   // DSpark's N-wide draft geometry must be rescaled to (N+1) for the target's
   // anchor + drafts forward.
   scale_speculative_parallel_token_counts(
@@ -1286,15 +1304,36 @@ void DFlashWorkerImpl::update_decode_step_input(
   input.device_tensors_ready = false;
 }
 
+bool DFlashWorkerImpl::target_uses_expanded_spec_verify() const {
+#if defined(USE_NPU)
+  // Graph-mode target validate runs the expanded row layout on NPU; the
+  // graph runner needs the group-wide marker to admit it. Hybrid-recurrent
+  // targets are always marked (their chunked layout IS the spec-verify
+  // contract). Non-NPU builds keep the hybrid-only behavior.
+  return target_is_hybrid_recurrent_ || options_.enable_graph();
+#else
+  return target_is_hybrid_recurrent_;
+#endif
+}
+
 void DFlashWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
                                                ForwardInput& validate_input) {
   c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
   ForwardInput prepared_input = input;
   prepared_input.metadata_ready_event.reset();
   const bool use_linear_spec_verify = target_is_hybrid_recurrent_;
+  // The base builder consumes ``is_spec_verify`` to pick the validate row
+  // layout: chunked one-row-per-sequence verify for hybrid-recurrent
+  // targets, N+1 expanded decode rows otherwise. DSV4 needs the expanded
+  // layout, so the flag must stay clear while the base builds the rows and
+  // is marked afterwards (see target_uses_expanded_spec_verify) -- the ACL
+  // graph plan reads only this group-wide marker to pick one shared graph
+  // key for busy and idle DP ranks.
   prepared_input.input_params.is_spec_verify = use_linear_spec_verify;
   SpeculativeWorkerImpl::prepare_validate_inputs(prepared_input,
                                                  validate_input);
+  validate_input.input_params.is_spec_verify =
+      target_uses_expanded_spec_verify();
   validate_input.input_params.embedding.input_embedding = torch::Tensor();
   if (use_linear_spec_verify) {
     ModelInputParams& input_params = validate_input.input_params;

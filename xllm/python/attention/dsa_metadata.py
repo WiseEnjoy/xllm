@@ -772,15 +772,20 @@ class DsaMetadataBuilder:
             rows = int(raw_bt.size(0))
             seq_ids: list[int] = []
             positions: list[int] = []
+            out_indices: list[int] = []
             for seq in range(batch_size):
                 ctx_len = int(ctx_lens[seq])
                 q_len = max(0, min(int(q_lens[seq]), ctx_len))
-                if seq >= rows:
-                    write_idx += q_len
-                    continue
-                q_start = ctx_len - q_len
-                seq_ids.extend([seq] * q_len)
-                positions.extend(range(q_start, q_start + q_len))
+                if seq < rows:
+                    q_start = ctx_len - q_len
+                    seq_ids.extend([seq] * q_len)
+                    positions.extend(range(q_start, q_start + q_len))
+                    out_indices.extend(range(write_idx, write_idx + q_len))
+                # Sequences whose block-table rows are missing keep their -1
+                # padding at their own output offset; every sequence advances
+                # the cursor either way so gathered tokens land at the output
+                # index their (seq, position) occupies.
+                write_idx += q_len
             # Vectorized equivalent of the per-position ``slot_for_position``
             # loop (cpp:466-572): one batched gather instead of one
             # ``.item()`` device sync per query token.
@@ -791,8 +796,7 @@ class DsaMetadataBuilder:
             )
             for i, block_id in enumerate(block_ids):
                 if block_id >= 0:
-                    slots_list[write_idx + i] = block_id * block_size + positions[i] % block_size
-            write_idx += len(positions)
+                    slots_list[out_indices[i]] = block_id * block_size + positions[i] % block_size
         out_slots = torch.tensor(slots_list, dtype=torch.int32, device=raw_bt.device)
 
         # Rebuild the read-side block table with the SWA ring semantics.

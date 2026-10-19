@@ -250,10 +250,6 @@ class DsaAttentionBackend(AttentionBackend):
         self._swa_window_layer_specs: list[tuple[int, int]] | None = None
         self._swa_window_sources: torch.Tensor | None = None
         self._swa_window_row_map: list[int] = []
-        # Graph-decode cmp seqused/residual: persistent per-ratio tensors the
-        # per-step refresh rewrites eagerly; the captured forward binds them
-        # instead of deriving in-graph (see _get_graph_cmp_seqused).
-        self._graph_cmp_seqused: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for layer_id, layer_caches in enumerate(self.caches_info):
             for cache_id, cache_info in enumerate(layer_caches):
                 if cache_info.cache_type == DSA_CACHE_SLIDING_WINDOW:
@@ -550,34 +546,6 @@ class DsaAttentionBackend(AttentionBackend):
             copy_into_execution_buffer(key_res, residual),
         )
 
-    def sanitize_dsa_metadata_unwritten_tail(self, metadata: AttentionMetadata | None = None) -> None:
-        """Zero the unwritten tail of the persistent AICPU metadata tensors.
-
-        The ``sparse_flash_mla`` kernel reads T4 metadata slots that the
-        ``sparse_flash_mla_metadata`` kernel never writes. Those slots hold
-        the ``torch::empty`` allocator garbage of the build that allocated
-        the tensor, and garbage with float bit patterns makes the attention
-        kernel walk out of bounds on replay (device error 507011). The
-        metadata content is value-independent (structure only -- verified
-        empirically from 100 to 16000 tokens), so one extra eager build
-        identifies the kernel-written slots: they agree across two builds
-        whose outputs landed on different garbage. Disagreeing slots are
-        unwritten and get zeroed once, here at capture time; nothing inside
-        the graph ever rewrites them.
-        """
-        metadata = self._metadata if metadata is None else metadata
-        if metadata is None or metadata.dsa_metadata is None:
-            return
-        persistent = metadata.dsa_metadata
-        refreshed = self._build_dsa_metadata_for_forward(metadata, include_precomputed=True)
-        for field in ("c1_metadata", "c4_metadata", "c128_metadata", "qli_metadata"):
-            dst = getattr(persistent, field, None)
-            src = getattr(refreshed, field, None)
-            if dst is None or src is None or dst.shape != src.shape or dst.dtype != src.dtype:
-                continue
-            mask = torch.eq(dst, src)
-            dst.copy_(torch.where(mask, dst, torch.zeros_like(dst)))
-
     def refresh_dsa_metadata_for_graph_replay(
         self,
         metadata: AttentionMetadata | None = None,
@@ -597,7 +565,7 @@ class DsaAttentionBackend(AttentionBackend):
             metadata,
             include_precomputed=True,
         )
-        self._copy_graph_dsa_metadata(persistent, refreshed, copy_precomputed=True)
+        self._copy_graph_dsa_metadata(persistent, refreshed)
         # Rewrite the persistent cmp seqused/residual buffers the captured
         # forward binds (see _get_graph_cmp_seqused). The derivations run
         # eagerly here -- fresh kernel launches every step, never captured --
@@ -627,12 +595,23 @@ class DsaAttentionBackend(AttentionBackend):
         # window sources read the current slots, leaving the newest tokens'
         # real cache slots unwritten (uninitialized memory in the SWA
         # window, exploding rows and RMSNorm-overflow zero logits).
-        for _guard in _graph_slot_guard_cache:
-            _g_sm, _g_rows, _g_dev, _g_slots, _g_safe, _g_mask = _guard
-            _g_fresh = _g_sm.reshape(-1).to(device=_g_dev, dtype=torch.long)[:_g_rows]
-            _g_slots.copy_(_g_fresh)
-            _g_safe.copy_(_g_fresh.clamp_min(0))
-            _g_mask.copy_(_g_fresh.ge(0).unsqueeze(1))
+        # Only this entry's guards are rewritten: each graph entry owns the
+        # guards it captured (see _slot_guard_tensors), so a replay never
+        # pays for -- or depends on -- another entry's or another backend's
+        # guards.
+        _guard_caches = []
+        if _exec_state is not None:
+            _entry_guards = _exec_state.persistent_buffers.get(_SLOT_GUARD_STATE_KEY)
+            if _entry_guards:
+                _guard_caches.append(_entry_guards)
+        _guard_caches.append(_graph_slot_guard_cache)
+        for _guard_cache in _guard_caches:
+            for _guard in _guard_cache:
+                _g_sm, _g_rows, _g_dev, _g_slots, _g_safe, _g_mask = _guard
+                _g_fresh = _g_sm.reshape(-1).to(device=_g_dev, dtype=torch.long)[:_g_rows]
+                _g_slots.copy_(_g_fresh)
+                _g_safe.copy_(_g_fresh.clamp_min(0))
+                _g_mask.copy_(_g_fresh.ge(0).unsqueeze(1))
         # Rewrite the cached qli_v2 tuple's seqused_k/residual_k in place so
         # the in-graph indexer's walk depth stays consistent with the
         # attention's cmp seqused buffers (a stale tuple walks a shallower
@@ -643,6 +622,27 @@ class DsaAttentionBackend(AttentionBackend):
             if _qli_t is not None and len(_qli_t) == 4:
                 _qli_t[1].copy_(persistent.actual_seq_lengths_kv // 4, non_blocking=True)
                 _qli_t[2].copy_(persistent.actual_seq_lengths_kv % 4, non_blocking=True)
+        # Rewrite the cached QLI expanded RoPE in place. The indexer's partial
+        # rotary consumes the repeat_interleave'd full-width cos/sin, and the
+        # capture hit this cache (keyed on the persistent tables' identity,
+        # stable because graph capture binds the persistent metadata instead
+        # of rebuilding it), so the expansion op itself never entered the
+        # graph: without this rewrite every replay would rotate the indexer
+        # query with the pre-run positions' rope, silently degrading the
+        # sparse block selection as sequences grow past the capture depth.
+        _qli_rope = getattr(persistent, "qli_expanded_rope", None)
+        _cos_table = getattr(persistent, "cos_table", None)
+        _sin_table = getattr(persistent, "sin_table", None)
+        if _qli_rope and _cos_table is not None and _sin_table is not None:
+            _cos_v = _cos_table.reshape(-1, _cos_table.size(-1)) if _cos_table.dim() > 2 else _cos_table
+            _sin_v = _sin_table.reshape(-1, _sin_table.size(-1)) if _sin_table.dim() > 2 else _sin_table
+            for _rope_key, (_cos_exp, _sin_exp) in _qli_rope.items():
+                _fresh_cos = _cos_v.to(_rope_key[2]).repeat_interleave(2, dim=-1)
+                _fresh_sin = _sin_v.to(_rope_key[2]).repeat_interleave(2, dim=-1)
+                if _cos_exp.shape != _fresh_cos.shape or _sin_exp.shape != _fresh_sin.shape:
+                    continue
+                _cos_exp.copy_(_fresh_cos, non_blocking=True)
+                _sin_exp.copy_(_fresh_sin, non_blocking=True)
         # The graph window compact's clamped window length and its seqused
         # arg are built once (identity-keyed on the persistent kv lens), but
         # the captured valid-mask op and the attention kernel read them live,
@@ -666,8 +666,6 @@ class DsaAttentionBackend(AttentionBackend):
         cls,
         persistent: DsaMetadata,
         refreshed: DsaMetadata,
-        *,
-        copy_precomputed: bool = True,
     ) -> None:
         """Copy replay values into the tensors retained by ACL graph capture."""
         tensor_fields = (
@@ -690,27 +688,23 @@ class DsaAttentionBackend(AttentionBackend):
             "c4_input_sin",
             "c128_input_cos",
             "c128_input_sin",
+            "c1_metadata",
+            "c4_metadata",
+            "c128_metadata",
+            "qli_metadata",
         )
-        if copy_precomputed:
-            tensor_fields += (
-                "c1_metadata",
-                "c4_metadata",
-                "c128_metadata",
-                "qli_metadata",
-            )
         for field_name in tensor_fields:
             cls._copy_graph_tensor(
                 getattr(persistent, field_name, None),
                 getattr(refreshed, field_name, None),
                 field_name,
             )
-        if copy_precomputed:
-            cls._copy_graph_tensor(
-                getattr(persistent, "explicit_swa_indices", None),
-                getattr(refreshed, "explicit_swa_indices", None),
-                "explicit_swa_indices",
-                pad_value=-1,
-            )
+        cls._copy_graph_tensor(
+            getattr(persistent, "explicit_swa_indices", None),
+            getattr(refreshed, "explicit_swa_indices", None),
+            "explicit_swa_indices",
+            pad_value=-1,
+        )
 
         # Each layer grid aliases one manager tensor. Copy managers only;
         # copying the grid would repeat every H2D transfer once per layer.
@@ -738,8 +732,7 @@ class DsaAttentionBackend(AttentionBackend):
         persistent.max_seq_len = refreshed.max_seq_len
         persistent.sparse_metadata_ori_win_left = getattr(refreshed, "sparse_metadata_ori_win_left", -1)
         persistent.is_acl_graph = refreshed.is_acl_graph
-        if copy_precomputed:
-            persistent.precomputed_metadata_inputs = refreshed.precomputed_metadata_inputs
+        persistent.precomputed_metadata_inputs = refreshed.precomputed_metadata_inputs
         # The capture-time capacity bound is re-derived from the same static
         # entry metadata, so this is a no-op unless the entry changed buckets.
         persistent.graph_token_capacity = int(getattr(refreshed, "graph_token_capacity", 0) or 0)
@@ -1428,7 +1421,6 @@ class DsaAttentionBackend(AttentionBackend):
         cu_seqlens_ori_kv_override: torch.Tensor | None = None,
         max_query_len_override: int | None = None,
         max_seq_len_override: int | None = None,
-        persistent: bool = False,
     ) -> None:
         """Build the AICPU tiling metadata for each compress ratio present.
 
@@ -1568,13 +1560,6 @@ class DsaAttentionBackend(AttentionBackend):
                     has_ori_kv=True,
                     has_cmp_kv=has_cmp,
                 )
-            if persistent:
-                # Land the kernel output in an execution-state persistent
-                # buffer: the captured graph binds this address while the
-                # in-graph kernel plus this captured ``copy_`` recompute the
-                # content from the refreshed seqused views on every replay
-                # (the 950 production recipe).
-                sparse_metadata = copy_into_execution_buffer(("dsa_sfm_meta", ratio), sparse_metadata)
             if ratio == 1:
                 compressed_metadata.c1_metadata = sparse_metadata
             elif ratio == 4:
@@ -1616,10 +1601,6 @@ class DsaAttentionBackend(AttentionBackend):
                 cmp_ratio=4,
                 device=str(self.device),
             )
-            if persistent:
-                compressed_metadata.qli_metadata = copy_into_execution_buffer(
-                    ("dsa_qli_meta",), compressed_metadata.qli_metadata
-                )
         else:
             compressed_metadata.qli_metadata = kernels.quant_lightning_indexer_metadata(
                 num_heads_q=max(self.index_n_heads, 1),
@@ -2098,13 +2079,20 @@ def _get_layer_cache_tensor(
 
 _SLOT_GUARD_CACHE_MAX = 16
 _slot_guard_cache: list[tuple[torch.Tensor, int, torch.device, torch.Tensor, torch.Tensor, torch.Tensor]] = []
-# Guards bound by a captured ACL graph live here and are never evicted: the
-# replayed scatter reads their addresses directly, so freeing them (which the
-# recycling cache above does once eager forwards -- draft steps, eager
-# fallbacks -- push ``_SLOT_GUARD_CACHE_MAX`` fresh entries) hands the device
-# memory to unrelated allocations and faults the replayed scatter with device
-# error 507011.
+# Fallback registry for guards derived under a graph forward that carries no
+# execution state. In production every graph forward (pre-run, warmup and
+# capture) carries its graph entry's execution state, and the guard is pinned
+# onto THAT entry (see _slot_guard_tensors): the entry dies with its graph and
+# releases the tensors, and a replay refreshes only its own guards. The
+# replayed scatter reads the guard addresses directly, so freeing graph-bound
+# guards (which the recycling cache above does once eager forwards push
+# ``_SLOT_GUARD_CACHE_MAX`` fresh entries) hands the device memory to
+# unrelated allocations and faults the replayed scatter with device error
+# 507011.
 _graph_slot_guard_cache: list[tuple[torch.Tensor, int, torch.device, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+# Key under which a graph entry's execution state owns its slot guards.
+_SLOT_GUARD_STATE_KEY = ("dsv4_slot_guards",)
 
 
 def _slot_guard_tensors(
@@ -2115,16 +2103,25 @@ def _slot_guard_tensors(
     """Reuse index guards for the same slot mapping within recent forwards.
 
     Graph-decode forwards (pre-run, warmup and capture all carry the entry's
-    execution state) pin every guard they touch: the capture may bind tensors
-    first derived during the eager pre-run, so a cache hit under a graph
-    forward promotes the entry into the non-evicting graph registry.
+    execution state) pin every guard they touch onto that graph entry: the
+    capture may bind tensors first derived during the eager pre-run, so a
+    cache hit under a graph forward promotes the entry onto the capturing
+    entry's non-evicting registry.
     """
     graph_forward = in_acl_graph()
-    for cache in (_slot_guard_cache, _graph_slot_guard_cache):
+    entry_guards = None
+    if graph_forward:
+        _state = get_forward_context_or_none()
+        _exec_state = getattr(_state, "execution_state", None) if _state is not None else None
+        if _exec_state is not None:
+            entry_guards = _exec_state.persistent_buffers.setdefault(_SLOT_GUARD_STATE_KEY, [])
+    for cache in (_slot_guard_cache, _graph_slot_guard_cache, entry_guards):
+        if cache is None:
+            continue
         for index, entry in enumerate(cache):
             if entry[0] is slot_mapping and entry[1] == update_rows and entry[2] == device:
-                if graph_forward and cache is _slot_guard_cache:
-                    _graph_slot_guard_cache.append(cache.pop(index))
+                if cache is _slot_guard_cache and entry_guards is not None:
+                    entry_guards.append(cache.pop(index))
                 return entry[3], entry[4], entry[5]
 
     slots = slot_mapping.reshape(-1).to(torch.long).to(device)
@@ -2132,7 +2129,9 @@ def _slot_guard_tensors(
     safe_slots = slots_slice.clamp_min(0)
     valid_mask = slots_slice.ge(0).unsqueeze(1)
     entry = (slot_mapping, update_rows, device, slots_slice, safe_slots, valid_mask)
-    if graph_forward:
+    if entry_guards is not None:
+        entry_guards.append(entry)
+    elif graph_forward:
         _graph_slot_guard_cache.append(entry)
     else:
         _slot_guard_cache.append(entry)

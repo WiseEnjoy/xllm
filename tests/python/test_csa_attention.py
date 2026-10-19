@@ -1397,6 +1397,95 @@ def test_graph_dsa_refresh_preserves_tensor_addresses() -> None:
     assert persistent.max_seq_len == 7
 
 
+def test_graph_replay_refreshes_qli_expanded_rope_in_place() -> None:
+    """The QLI indexer's expanded RoPE cache outlives the eager pre-run.
+
+    Graph capture binds the cached expansion's address (the capture hit the
+    identity-keyed cache), so the expansion op never enters the graph: the
+    replay refresh must rewrite the cached content from the refreshed base
+    tables or every replay rotates the indexer query with the pre-run
+    positions.
+    """
+    backend = csa_attention_module.DsaAttentionBackend(
+        compress_ratios=[4],
+        window_size=4,
+        n_layers=1,
+        num_heads=1,
+        attn_head_dim=4,
+        index_topk=4,
+        index_n_heads=1,
+        index_head_dim=4,
+        rope_head_dim=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    def make_dsa(kv_len: int, rope_value: int) -> SimpleNamespace:
+        dsa = backend._builder.build(
+            multi_block_tables=[
+                torch.tensor([[1, 2]], dtype=torch.int32),
+                torch.tensor([[1, 2]], dtype=torch.int32),
+            ],
+            kv_seq_lens=[kv_len],
+            q_seq_lens=[1],
+            positions=torch.tensor([kv_len - 1]),
+            dsa_cos_sin=None,
+            is_prefill=False,
+            is_chunked_prefill=False,
+            new_cache_slots=None,
+            enable_graph=True,
+            graph_block_table_capacity_cols=2,
+        )
+        pair = (
+            torch.full((1, 1), float(rope_value)),
+            torch.full((1, 1), float(rope_value)),
+        )
+        dsa.input_rope_by_ratio = {4: pair}
+        dsa.cos_table, dsa.sin_table = pair
+        return dsa
+
+    persistent, refreshed = make_dsa(7, 1), make_dsa(8, 7)
+    expanded = (
+        persistent.cos_table.repeat_interleave(2, dim=-1),
+        persistent.sin_table.repeat_interleave(2, dim=-1),
+    )
+    rope_key = (id(persistent.cos_table), id(persistent.sin_table), torch.float32)
+    persistent.qli_expanded_rope[rope_key] = expanded
+    persistent.qli_v2_metadata = (
+        persistent.seq_lens_q,
+        persistent.actual_seq_lengths_kv // 4,
+        persistent.actual_seq_lengths_kv % 4,
+        persistent.actual_seq_lengths_query,
+    )
+    metadata = SimpleNamespace(dsa_metadata=persistent)
+    backend._build_dsa_metadata_for_forward = lambda *args, **kwargs: refreshed
+    state = AclGraphExecutionState(persistent_buffers={})
+    context = ForwardContext(
+        attention_backend=backend,
+        device=torch.device("cpu"),
+        metadata=metadata,
+        layer_caches=[],
+        execution_state=state,
+    )
+
+    with forward_context(context):
+        # Pin the entry-owned slot guard the same way the captured forward
+        # does, then refresh.
+        csa_attention_module._slot_guard_tensors(persistent.manager_slot_mappings[0], 1, torch.device("cpu"))
+        backend.refresh_dsa_metadata_for_graph_replay(metadata)
+        guards = csa_attention_module._slot_guard_tensors(persistent.manager_slot_mappings[0], 1, torch.device("cpu"))
+
+    assert persistent.cos_table.tolist() == [[7.0]]
+    assert expanded[0].tolist() == [[7.0, 7.0]]
+    assert expanded[1].tolist() == [[7.0, 7.0]]
+    assert expanded[0].data_ptr() == persistent.qli_expanded_rope[rope_key][0].data_ptr()
+    assert guards[1].tolist() == persistent.manager_slot_mappings[0].clamp_min(0).tolist()
+    # The guard lives on this entry's execution state, not the module-wide
+    # fallback registry.
+    entry_guards = state.persistent_buffers.get(csa_attention_module._SLOT_GUARD_STATE_KEY)
+    assert entry_guards is not None and len(entry_guards) == 1
+
+
 def test_graph_dsa_build_uses_stable_host_length_values(monkeypatch) -> None:
     backend = _make_backend()
     monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)

@@ -139,7 +139,10 @@ def _npu_chip_from_smi() -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
 
-    match = re.search(r"(?:910|950)[A-Za-z0-9_-]*", completed.stdout)
+    # The lookbehind keeps a longer run of digits (e.g. a serial like
+    # "190950") from matching the chip id mid-number; "Ascend910B2C" still
+    # matches because letters may precede the id.
+    match = re.search(r"(?<![0-9])(?:910|950)[A-Za-z0-9_-]*", completed.stdout)
     if match is None:
         return None
     return match.group(0).lower()
@@ -162,7 +165,8 @@ def _npu_chip_from_acl() -> str | None:
         return None
     if not soc_name:
         return None
-    match = re.search(r"(?:910|950)[A-Za-z0-9_-]*", soc_name)
+    # Same digit-lookbehind rule as _npu_chip_from_smi above.
+    match = re.search(r"(?<![0-9])(?:910|950)[A-Za-z0-9_-]*", soc_name)
     if match is None:
         return None
     return match.group(0).lower()

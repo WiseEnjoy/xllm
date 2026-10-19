@@ -33,7 +33,6 @@ linear / MLP / MoE / YaRN-RoPE / weight-loader primitives from
 
 from __future__ import annotations
 
-import os
 import threading
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, ClassVar, Sequence
@@ -597,6 +596,7 @@ class DeepseekV4HyperConnection(nn.Module):
         self.hc_eps = cfg.hc_eps
         self.norm_eps = cfg.rms_norm_eps
         self.sinkhorn_iters = cfg.hc_sinkhorn_iters
+        self.uses_mx_formats = cfg.uses_mx_formats
         hidden = cfg.hidden_size
         # hc_mult is a fixed model constant; NOT TP-sharded (C++ matches).
         self.hc_mult_local = cfg.hc_mult
@@ -618,8 +618,15 @@ class DeepseekV4HyperConnection(nn.Module):
             )
 
     def process_weights_after_loading(self) -> None:
-        """Convert mixed-residual weights once to the kernel's BF16 path."""
+        """Convert mixed-residual weights once to the kernel's BF16 path.
+
+        MXFP (A5) deployments run the fused NPU hc kernels in BF16; W8A8
+        deployments keep the checkpoint's float32 registration so the Python
+        and C++ numerical paths stay aligned.
+        """
         if getattr(self, "_hc_fn_preconverted", False):
+            return
+        if not self.uses_mx_formats:
             return
         for part in ("attn", "ffn"):
             parameter = getattr(self, f"hc_{part}_fn")
@@ -1472,9 +1479,6 @@ class DeepseekV4MoE(nn.Module):
                 raise RuntimeError("DeepSeek-V4 MegaMoe requires MoE TP == 1")
         self._megamoe_enabled = cfg.enable_mega_moe
         self._megamoe_state: tuple[Any, Any] | None = None
-        self._megamoe_prequant = (
-            cfg.enable_mega_moe and cfg.uses_mx_formats and os.environ.get("XLLM_MEGAMOE_PREQUANT", "0") == "1"
-        )
         # DSV4 Flash checkpoints use W4A8_DYNAMIC routed experts.  The packed
         # storage shape is discovered from the checkpoint in load_weights;
         # keep expert tensors empty until then to avoid allocating the W8A8
@@ -1668,6 +1672,22 @@ class DeepseekV4MoE(nn.Module):
         # ranks enter MegaMoe initialization in the same order.
         warm = torch.zeros(1, device=device)
         runtime.moe_ep_all_reduce(warm)
+        if self.ep_size > 1:
+            # One-shot symmetry guard (init time, never the hot path): every
+            # EP rank routes to MegaMoe from its local row count against this
+            # capacity, so a capacity disagreement means ranks would split
+            # between the MegaMoe collective and the grouped-expert all-reduce
+            # on the first full batch. Fail loudly here instead of hanging
+            # HCCL there.
+            probe = torch.full((1,), float(self._megamoe_max_rows), device=device)
+            runtime.moe_ep_all_reduce(probe)
+            expected = float(self._megamoe_max_rows) * self.ep_size
+            if probe.item() != expected:
+                raise RuntimeError(
+                    "MegaMoe capacity mismatch across the EP group: local "
+                    f"max_rows={self._megamoe_max_rows}, all-reduced sum="
+                    f"{probe.item()}, expected {expected} when every rank agrees"
+                )
         comm_name = runtime.moe_ep_hccl_comm_name()
         if not comm_name:
             raise RuntimeError("Native MoE EP group has no HCCL communicator name")
@@ -1678,30 +1698,42 @@ class DeepseekV4MoE(nn.Module):
             self.topk,
             self.cfg.hidden_size,
             self.cfg.moe_intermediate_size,
-            self._megamoe_prequant,
         )
         cache_key = (comm_name, signature)
         cached = DeepseekV4MoE._megamoe_buffers.get(cache_key)
         if cached is None:
             get_symm_buffer_for_mega_moe, mega_moe = self._load_megamoe_glue()
-            group = _NativeMoeEpGroup(self.ep_rank, self.ep_size, comm_name)
-            # The vendor glue expects a torch.distributed group, but the
-            # native C++ group is deliberately reused to avoid creating a
-            # duplicate HCCL communicator. It only reads rank and world size,
-            # so answer those calls for the native group adapter.
+            _native_group = _NativeMoeEpGroup(self.ep_rank, self.ep_size, comm_name)
+            # The vendor glue resolves rank/world size through the process
+            # global torch.distributed functions with the group argument.
+            # Patch them to answer ONLY for our native-group adapter object;
+            # every other call (no group, any other group) is forwarded to
+            # the real implementation untouched, so concurrent callers never
+            # observe this model's EP rank.
             real_get_rank = torch.distributed.get_rank
             real_get_world_size = torch.distributed.get_world_size
-            torch.distributed.get_rank = lambda group: self.ep_rank
-            torch.distributed.get_world_size = lambda group: self.ep_size
+
+            def _get_rank(group=None):
+                if group is _native_group:
+                    return self.ep_rank
+                return real_get_rank(group)
+
+            def _get_world_size(group=None):
+                if group is _native_group:
+                    return self.ep_size
+                return real_get_world_size(group)
+
+            torch.distributed.get_rank = _get_rank
+            torch.distributed.get_world_size = _get_world_size
             try:
                 sym_buffer = get_symm_buffer_for_mega_moe(
-                    group,
+                    _native_group,
                     num_experts=self.num_total_experts,
                     num_max_tokens_per_rank=self._megamoe_max_rows,
                     num_topk=self.topk,
                     hidden=self.cfg.hidden_size,
                     intermediate_hidden=self.cfg.moe_intermediate_size,
-                    dispatch_quant_mode=0 if self._megamoe_prequant else 4,
+                    dispatch_quant_mode=4,
                     dispatch_quant_out_dtype=torch.float8_e4m3fn,
                 )
             finally:
@@ -1724,35 +1756,6 @@ class DeepseekV4MoE(nn.Module):
             raise RuntimeError("DeepSeek-V4 MegaMoe is not initialized")
 
         mega_moe, sym_buffer = self._megamoe_state
-        if self._megamoe_prequant:
-            # Quantize each token once and let dispatch consume that result,
-            # instead of re-quantizing the expanded token-by-expert view.
-            x_quant, x_scale = torch_npu.npu_dynamic_mx_quant(
-                hidden,
-                dst_type=torch.float8_e4m3fn,
-                scale_alg=0,
-                round_mode="rint",
-            )
-            x_scale = x_scale.view(torch.uint8).reshape(hidden.size(0), -1).view(torch.float8_e8m0fnu)
-            hidden = x_quant
-
-            routed, _ = mega_moe(
-                hidden,
-                topk_idx.to(torch.int32),
-                topk_weights.to(torch.bfloat16),
-                [self._megamoe_w13],
-                [self._megamoe_w2],
-                sym_buffer,
-                l1_weights_sf=[self._megamoe_w13_sf],
-                l2_weights_sf=[self._megamoe_w2_sf],
-                scales=x_scale,
-                activation="swiglu",
-                activation_clamp=self.cfg.swiglu_limit,
-                weight1_type=torch_npu.float4_e2m1fn_x2,
-                weight2_type=torch_npu.float4_e2m1fn_x2,
-            )
-            return routed
-
         routed, _ = mega_moe(
             hidden,
             topk_idx.to(torch.int32),
@@ -1770,6 +1773,17 @@ class DeepseekV4MoE(nn.Module):
         return routed
 
     def _should_use_mega_moe(self, hidden: torch.Tensor) -> bool:
+        """Route to MegaMoe only while every EP rank makes the same choice.
+
+        INVARIANT: the row count this decision reads must be identical across
+        the EP group. It holds today because dp_size == 1 shares one batch
+        across EP ranks, and dp_size > 1 forwards run on the dense all-gathered
+        ``padded_tokens`` so every rank sees the same row count. If a future
+        scheduler makes token sets per-rank heterogeneous inside an EP group,
+        this local decision would split the group across the MegaMoe collective
+        and the grouped-expert all-reduce and hang HCCL -- guard such a change
+        with a group-wide decision, not this method.
+        """
         return self._megamoe_enabled and hidden.shape[0] <= self._megamoe_max_rows
 
     def forward(self, hidden: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
@@ -2319,10 +2333,12 @@ class DeepseekV4Model(nn.Module):
             # ACL graph replay/warmup reuses the metadata built during the
             # first graph warmup call. RoPE tables and the DSA object keep
             # their stable addresses, which is what the captured graph needs.
-            # The AICPU precomputed metadata is still rebuilt here so the
-            # metadata kernels are captured INSIDE the graph and re-run on
-            # every replay against the refreshed input views (see
-            # CsaAttentionBackend.prepare_dsa_metadata_for_forward).
+            # The AICPU metadata kernels are NOT rebuilt here: capture must
+            # not relaunch them inside the captured region (value-locked
+            # AICPU state faults with device error 507011 -- see
+            # CsaAttentionBackend.prepare_dsa_metadata_for_forward). Instead
+            # every replay refreshes the persistent tensors out-of-graph via
+            # CsaAttentionBackend.refresh_dsa_metadata_for_graph_replay.
             prepare_dsa = getattr(backend, "prepare_dsa_metadata_for_forward", None)
             if prepare_dsa is not None:
                 prepare_dsa(metadata)
