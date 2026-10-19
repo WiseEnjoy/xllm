@@ -148,7 +148,14 @@ void build_dflash_expanded_spec_verify_graph_input(
   // replay contract when the caller has supplied real paging metadata. A
   // real batch missing its paging metadata is an upstream bug that would
   // otherwise silently produce an incomplete graph input, so surface the
-  // skip on a bounded, escalating cadence instead of staying quiet.
+  // skip on a bounded, escalating cadence instead of staying quiet. A local
+  // CHECK was rejected: warmup placeholders present the same empty counts,
+  // so no occurrence threshold can separate the tolerated warmup from a
+  // real-batch bug without crashing the warmup itself. The fatal exposure
+  // lives at the consumer instead -- the graph persistent-param binding
+  // CHECKs that the expanded seq lens are defined, so a real batch that
+  // skipped fails loudly at contract bind rather than replaying stale
+  // inputs (see acl_graph_persistent_param.cpp).
   if (q_seq_lens.empty() || kv_seq_lens.empty() ||
       !input_params.attention.device.block_tables.defined()) {
     static std::atomic<int64_t> skip_count{0};

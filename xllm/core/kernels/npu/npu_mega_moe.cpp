@@ -243,15 +243,20 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
   // aclnnMegaMoe takes a single activation parameter; a fixed-size stack
   // array replaces the per-call std::vector temporary that heap-allocated on
   // every launch. The shared_ptr releases the aclFloatArray exactly once at
-  // scope exit. Lifetime is safe without binding to a stream/event because
-  // cmd.Run() executes its custom handler synchronously (torch_npu logs
+  // scope exit. Lifetime is safe without binding to a stream/event: both
+  // host-side readers run inside this scope and neither outlives Run. The
+  // executor returned by aclnnMegaMoeGetWorkspaceSize may retain the raw
+  // param pointers until the handler's op_api_func freezes them into kernel
+  // args inside cmd.Run() (torch_npu logs
   // "ExecFunc: Op %s Run with customHandler, ret = %d." only when the
-  // handler's return value is gathered inside Run): both host-side readers,
-  // aclnnMegaMoeGetWorkspaceSize and the handler's aclnnMegaMoe launch, run
-  // inside this scope, and the enqueued stream task never re-reads the host
-  // array. This covers the throw paths (at::empty, cmd.Run) where the
-  // previous raw pointer leaked. The array is declared above the holder and
-  // outlives it.
+  // handler's return value is gathered inside Run), and the array stays
+  // alive across that whole window -- whether CANN deep-copies the array
+  // while building the workspace or reads it at op_api_func, both complete
+  // before the holder is destroyed. Once the kernel args are frozen, the
+  // enqueued stream task executes from task context and performs no host
+  // re-read of the array. This covers the throw paths (at::empty, cmd.Run)
+  // where the previous raw pointer leaked. The array is declared above the
+  // holder and outlives it.
   const float activation_params_values[] = {activation_clamp};
   const std::shared_ptr<aclFloatArray> activation_params_acl(
       create_float_array_func(
