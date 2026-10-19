@@ -19,9 +19,9 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
 #include <iterator>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -167,18 +167,31 @@ void build_dflash_expanded_spec_verify_graph_input(
   // Graph warmup exercises verify with placeholder metadata. Only promote a
   // replay contract when the caller has supplied real paging metadata. A
   // real batch missing its paging metadata is an upstream bug that would
-  // otherwise silently produce an incomplete graph input, so surface every
-  // skip once instead of staying quiet.
+  // otherwise silently produce an incomplete graph input, so surface the
+  // skip on a bounded, escalating cadence instead of staying quiet.
   if (q_seq_lens.empty() || kv_seq_lens.empty() ||
       !input_params.attention.device.block_tables.defined()) {
-    static std::once_flag skip_logged;
-    std::call_once(skip_logged, [] {
-      LOG(WARNING)
-          << "dflash expanded spec-verify graph input skipped: attention "
-             "host seq lens or device block tables are missing. Expected "
-             "only for graph warmup placeholder metadata; a real batch "
-             "reaching here cannot build its replay contract.";
-    });
+    static std::atomic<int64_t> skip_count{0};
+    const int64_t occurrence =
+        skip_count.fetch_add(1, std::memory_order_relaxed);
+    // Graph warmup exercises verify with placeholder metadata, so the first
+    // skip is expected; a recurring skip means a persistent upstream bug.
+    // Keep it visible without flooding the hot path: emit on the first and
+    // every 1000th occurrence, then escalate from warning to error once the
+    // condition has persisted past 10000 occurrences.
+    if (occurrence == 0 || (occurrence + 1) % 1000 == 0) {
+      const std::string message =
+          "dflash expanded spec-verify graph input skipped: attention host "
+          "seq lens or device block tables are missing. Expected only for "
+          "graph warmup placeholder metadata; a real batch reaching here "
+          "cannot build its replay contract. occurrence=" +
+          std::to_string(occurrence + 1);
+      if (occurrence < 10000) {
+        LOG(WARNING) << message;
+      } else {
+        LOG(ERROR) << message;
+      }
+    }
     return;
   }
   CHECK_EQ(q_seq_lens.size(), kv_seq_lens.size());

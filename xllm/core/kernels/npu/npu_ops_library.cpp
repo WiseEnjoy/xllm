@@ -963,7 +963,6 @@ TORCH_LIBRARY(xllm_ops, m) {
       "Tensor? cu_seqlens_k, Tensor? seqused_q, Tensor? seqused_k, "
       "Tensor? cmp_residual_k, Tensor? block_table, "
       "Tensor? output_idx_offset, Tensor? metadata, "
-      "int num_heads_q, int num_heads_k, int head_dim, "
       "int topk, int quant_mode, int max_seqlen_q, "
       "str layout_q, str layout_k, int mask_mode, int cmp_ratio, "
       "int return_value) -> (Tensor, Tensor)");
