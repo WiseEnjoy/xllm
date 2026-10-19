@@ -173,7 +173,9 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
                            char* comm_alg,
                            int64_t num_max_tokens_per_rank,
                            char* activation,
-                           float activation_clamp,
+                           const std::vector<float>& activation_params,
+                           int64_t topo_type,
+                           int64_t rank_num_per_server,
                            torch::Tensor& y,
                            torch::Tensor& expert_token_nums) {
   static const auto get_workspace_size_func_addr =
@@ -186,9 +188,17 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
       aclnn::detail::get_op_api_func_addr("UnInitHugeMemThreadLocal");
   static const auto release_mem_addr =
       aclnn::detail::get_op_api_func_addr("ReleaseHugeMem");
-  CHECK(get_workspace_size_func_addr != nullptr && op_api_func_addr != nullptr)
+  static const auto create_float_array_addr =
+      aclnn::detail::get_op_api_func_addr("aclCreateFloatArray");
+  static const auto destroy_float_array_addr =
+      aclnn::detail::get_op_api_func_addr("aclDestroyFloatArray");
+  CHECK(get_workspace_size_func_addr != nullptr &&
+        op_api_func_addr != nullptr && create_float_array_addr != nullptr &&
+        destroy_float_array_addr != nullptr)
       << "aclnnMegaMoe is not available in "
       << aclnn::detail::get_op_api_lib_name();
+  CHECK(!activation_params.empty() && activation_params.data() != nullptr)
+      << "MegaMoe activationParams must not be empty.";
 
   auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);
   uint64_t workspace_size = 0;
@@ -214,6 +224,17 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
   aclTensorList* weight2 = create_acl_tensor_list(weight2_views);
   aclTensorList* weight_scales1 = create_acl_tensor_list(scale1_views);
   aclTensorList* weight_scales2 = create_acl_tensor_list(scale2_views);
+  auto create_float_array_func =
+      reinterpret_cast<aclFloatArray* (*)(const float*, uint64_t)>(
+          create_float_array_addr);
+  auto destroy_float_array_func =
+      reinterpret_cast<int (*)(const aclFloatArray*)>(destroy_float_array_addr);
+  aclFloatArray* activation_params_acl =
+      create_float_array_func(activation_params.data(),
+                              static_cast<uint64_t>(activation_params.size()));
+  CHECK(activation_params_acl != nullptr)
+      << "Failed to create aclnnMegaMoe activationParams, detail:"
+      << aclGetRecentErrMsg();
 
   using GetWorkspaceSizeFn = int (*)(const aclTensor*,
                                      const aclTensor*,
@@ -226,6 +247,15 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
                                      const aclTensorList*,
                                      const aclTensorList*,
                                      const aclTensor*,
+                                     const aclTensor*,
+                                     const aclTensorList*,
+                                     const aclTensorList*,
+                                     const aclTensorList*,
+                                     const aclTensorList*,
+                                     const aclTensorList*,
+                                     const aclTensorList*,
+                                     const aclTensor*,
+                                     int64_t,
                                      int64_t,
                                      int64_t,
                                      int64_t,
@@ -236,42 +266,64 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
                                      const char*,
                                      int64_t,
                                      const char*,
-                                     float,
+                                     const aclFloatArray*,
+                                     int64_t,
+                                     int64_t,
+                                     int64_t,
+                                     int64_t,
                                      aclTensor*,
                                      aclTensor*,
                                      uint64_t*,
                                      aclOpExecutor**);
   auto get_workspace_size_func =
       reinterpret_cast<GetWorkspaceSizeFn>(get_workspace_size_func_addr);
-  const int workspace_status = get_workspace_size_func(context_acl,
-                                                       x_acl,
-                                                       topk_ids_acl,
-                                                       topk_weights_acl,
-                                                       weight1,
-                                                       weight2,
-                                                       weight_scales1,
-                                                       weight_scales2,
-                                                       /*bias1=*/nullptr,
-                                                       /*bias2=*/nullptr,
-                                                       mask_acl,
-                                                       moe_expert_num,
-                                                       ep_world_size,
-                                                       ccl_buffer_size,
-                                                       max_recv_token_num,
-                                                       dispatch_quant_mode,
-                                                       dispatch_quant_out_dtype,
-                                                       combine_quant_mode,
-                                                       comm_alg,
-                                                       num_max_tokens_per_rank,
-                                                       activation,
-                                                       activation_clamp,
-                                                       y_acl,
-                                                       expert_token_nums_acl,
-                                                       &workspace_size,
-                                                       &executor);
-  CHECK(workspace_status == 0)
-      << "call aclnnMegaMoeGetWorkspaceSize failed, detail:"
-      << aclGetRecentErrMsg();
+  const int workspace_status =
+      get_workspace_size_func(context_acl,
+                              x_acl,
+                              topk_ids_acl,
+                              topk_weights_acl,
+                              weight1,
+                              weight2,
+                              weight_scales1,
+                              weight_scales2,
+                              /*bias1=*/nullptr,
+                              /*bias2=*/nullptr,
+                              mask_acl,
+                              /*scales_optional=*/nullptr,
+                              /*shared_weight1=*/nullptr,
+                              /*shared_weight2=*/nullptr,
+                              /*shared_weight_scales1=*/nullptr,
+                              /*shared_weight_scales2=*/nullptr,
+                              /*shared_bias1=*/nullptr,
+                              /*shared_bias2=*/nullptr,
+                              /*mask_buffer=*/nullptr,
+                              moe_expert_num,
+                              ep_world_size,
+                              ccl_buffer_size,
+                              max_recv_token_num,
+                              dispatch_quant_mode,
+                              dispatch_quant_out_dtype,
+                              /*shared_expert_quant_out_dtype=*/
+                              dispatch_quant_out_dtype,
+                              combine_quant_mode,
+                              comm_alg,
+                              num_max_tokens_per_rank,
+                              activation,
+                              activation_params_acl,
+                              topo_type,
+                              rank_num_per_server,
+                              /*topk_weights_type=*/0,
+                              /*combine_comm_mode=*/0,
+                              y_acl,
+                              expert_token_nums_acl,
+                              &workspace_size,
+                              &executor);
+  if (workspace_status != 0) {
+    destroy_float_array_func(activation_params_acl);
+    CHECK(workspace_status == 0)
+        << "call aclnnMegaMoeGetWorkspaceSize failed, detail:"
+        << aclGetRecentErrMsg();
+  }
 
   void* workspace_addr = nullptr;
   at::Tensor workspace_tensor;
@@ -291,6 +343,7 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
         op_api_func(workspace_addr, workspace_size, executor, acl_stream);
     CHECK(api_ret == 0) << "call aclnnMegaMoe failed, detail:"
                         << aclGetRecentErrMsg();
+    destroy_float_array_func(activation_params_acl);
     release_acl_tensors({context_acl,
                          x_acl,
                          topk_ids_acl,
@@ -558,7 +611,9 @@ std::tuple<torch::Tensor, torch::Tensor> apply_npu_mega_moe(
                           comm_alg_ptr,
                           num_max_tokens_per_rank,
                           activation_ptr,
-                          activation_clamp,
+                          std::vector<float>{activation_clamp},
+                          topo_type,
+                          rank_num_per_server,
                           y,
                           expert_token_nums);
     return std::make_tuple(y, expert_token_nums);
