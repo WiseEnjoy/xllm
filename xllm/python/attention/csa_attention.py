@@ -59,6 +59,7 @@ from xllm.python.platform import current_platform
 if TYPE_CHECKING:
     from xllm.python.attention.backend import AttentionMetadata
     from xllm.python.layers.attention import Attention
+    from xllm.python.model_executor.forward_context import AclGraphExecutionState
 
 # Official DeepSeek-V4 layer type names. Compression ratios are the runtime
 # representation used by the C++ cache metadata contract.
@@ -732,26 +733,45 @@ class DsaAttentionBackend(AttentionBackend):
         # _get_graph_cmp_seqused.)
         refreshed = self._build_dsa_metadata_for_forward(metadata)
         self._copy_graph_dsa_metadata(persistent, refreshed)
+        execution_state = getattr(get_forward_context_or_none(), "execution_state", None)
+        self._refresh_graph_cmp_buffers(persistent, execution_state)
+        self._refresh_slot_guard_snapshots(execution_state)
+        self._refresh_qli_v2_seqused(persistent, execution_state)
+        self._refresh_qli_expanded_rope(persistent)
+        self._refresh_graph_window_states(persistent)
+
+    def _refresh_graph_cmp_buffers(
+        self,
+        persistent: DsaMetadata,
+        execution_state: AclGraphExecutionState | None,
+    ) -> None:
+        """Rewrite the persistent cmp seqused/residual buffers each step."""
         # Rewrite the persistent cmp seqused/residual buffers the captured
         # forward binds (see _get_graph_cmp_seqused). The derivations run
         # eagerly here -- fresh kernel launches every step, never captured --
         # so the replayed attention kernels read the refreshed values through
         # the buffer copy instead of through re-executed in-graph ops.
-        execution_state = getattr(get_forward_context_or_none(), "execution_state", None)
-        if execution_state is not None:
-            for buffer_key in list(execution_state.persistent_buffers):
-                if not (
-                    isinstance(buffer_key, tuple)
-                    and len(buffer_key) == 2
-                    and buffer_key[0] in ("dsv4_cmp_seqused", "dsv4_cmp_residual")
-                ):
-                    continue
-                compress_ratio = buffer_key[1]
-                if buffer_key[0] == "dsv4_cmp_seqused":
-                    fresh_cmp_value = persistent.actual_seq_lengths_kv // compress_ratio
-                else:
-                    fresh_cmp_value = persistent.actual_seq_lengths_kv % compress_ratio
-                copy_into_execution_buffer(buffer_key, fresh_cmp_value)
+        if execution_state is None:
+            return
+        for buffer_key in list(execution_state.persistent_buffers):
+            if not (
+                isinstance(buffer_key, tuple)
+                and len(buffer_key) == 2
+                and buffer_key[0] in ("dsv4_cmp_seqused", "dsv4_cmp_residual")
+            ):
+                continue
+            compress_ratio = buffer_key[1]
+            if buffer_key[0] == "dsv4_cmp_seqused":
+                fresh_cmp_value = persistent.actual_seq_lengths_kv // compress_ratio
+            else:
+                fresh_cmp_value = persistent.actual_seq_lengths_kv % compress_ratio
+            copy_into_execution_buffer(buffer_key, fresh_cmp_value)
+
+    def _refresh_slot_guard_snapshots(
+        self,
+        execution_state: AclGraphExecutionState | None,
+    ) -> None:
+        """Rewrite the slot-guard snapshots bound by the captured scatters."""
         # Rewrite the slot-guard snapshots bound by the captured KV scatters.
         # _slot_guard_tensors derives long/device copies plus a clamp-min
         # view once per (slot_mapping, update_rows) and the captured
@@ -779,16 +799,27 @@ class DsaAttentionBackend(AttentionBackend):
                 slots.copy_(fresh_slot_mapping)
                 safe_slots.copy_(fresh_slot_mapping.clamp_min(0))
                 mask.copy_(fresh_slot_mapping.ge(0).unsqueeze(1))
+
+    def _refresh_qli_v2_seqused(
+        self,
+        persistent: DsaMetadata,
+        execution_state: AclGraphExecutionState | None,
+    ) -> None:
+        """Rewrite the cached qli_v2 tuple's seqused_k/residual_k in place."""
         # Rewrite the cached qli_v2 tuple's seqused_k/residual_k in place so
         # the in-graph indexer's walk depth stays consistent with the
         # attention's cmp seqused buffers (a stale tuple walks a shallower
         # index cache than the refreshed attention expects and faults with
         # device error 507011 on the first value-changing replay).
-        if execution_state is not None:
-            qli_v2_metadata = getattr(persistent, "qli_v2_metadata", None)
-            if qli_v2_metadata is not None and len(qli_v2_metadata) == 4:
-                qli_v2_metadata[1].copy_(persistent.actual_seq_lengths_kv // 4, non_blocking=True)
-                qli_v2_metadata[2].copy_(persistent.actual_seq_lengths_kv % 4, non_blocking=True)
+        if execution_state is None:
+            return
+        qli_v2_metadata = getattr(persistent, "qli_v2_metadata", None)
+        if qli_v2_metadata is not None and len(qli_v2_metadata) == 4:
+            qli_v2_metadata[1].copy_(persistent.actual_seq_lengths_kv // 4, non_blocking=True)
+            qli_v2_metadata[2].copy_(persistent.actual_seq_lengths_kv % 4, non_blocking=True)
+
+    def _refresh_qli_expanded_rope(self, persistent: DsaMetadata) -> None:
+        """Rewrite the cached QLI expanded RoPE entries in place."""
         # Rewrite the cached QLI expanded RoPE in place. The indexer's partial
         # rotary consumes the repeat_interleave'd full-width cos/sin, and the
         # capture hit this cache (keyed on the persistent tables' identity,
@@ -823,6 +854,9 @@ class DsaAttentionBackend(AttentionBackend):
                     continue
                 cached_cos.copy_(fresh_cos, non_blocking=True)
                 cached_sin.copy_(fresh_sin, non_blocking=True)
+
+    def _refresh_graph_window_states(self, persistent: DsaMetadata) -> None:
+        """Rewrite the graph window compact's clamped length and seqused args."""
         # The graph window compact's clamped window length and its seqused
         # arg are built once (identity-keyed on the persistent kv lens), but
         # the captured valid-mask op and the attention kernel read them live,
@@ -1178,8 +1212,11 @@ class DsaAttentionBackend(AttentionBackend):
             cos, sin = self._slice_cos_sin_cache(cos_sin_cache)
             pair = (cos, sin)
         compressed_metadata.layer_id = layer_id
-        # Keep the request-shaped views selected above. Materializing them
-        # duplicates the half-width RoPE tables on every layer and forward.
+        # Keep the request-shaped pair selected above without materializing:
+        # both sources copy their halves contiguous by construction (build_pair
+        # and the slice fallback), so no stride handling is needed here, and
+        # identity-keyed consumers (see _refresh_qli_expanded_rope) rely on
+        # selecting the same live tensors on every layer and forward.
         compressed_metadata.cos_table = pair[0]
         compressed_metadata.sin_table = pair[1]
 
@@ -1201,9 +1238,13 @@ class DsaAttentionBackend(AttentionBackend):
         metadata = self._metadata if metadata is None else metadata
         css = getattr(metadata, "dsa_cos_sin", None) if metadata is not None else None
         if compressed_metadata.cos_table is None and css is not None and css.numel() > 0:
-            cos, sin = css.chunk(2, dim=-1)
-            compressed_metadata.cos_table = cos
-            compressed_metadata.sin_table = sin
+            # Chunk views are non-contiguous; downstream partial-rope kernels
+            # receive the tables without stride handling, so materialize both
+            # halves here (this fallback only; the canonical path above is
+            # contiguous by construction).
+            compressed_metadata.cos_table, compressed_metadata.sin_table = (
+                tensor.contiguous() for tensor in css.chunk(2, dim=-1)
+            )
         csa_cos_sin = getattr(metadata, "dsa_c4_cos_sin", None) if metadata is not None else None
         if csa_cos_sin is not None and compressed_metadata.c4_pad_positions.numel() > 0:
             csa_indices = compressed_metadata.c4_pad_positions.clamp_min(0).long().to(csa_cos_sin.device)
@@ -2272,6 +2313,15 @@ def _build_prefill_pa_nd_kv(
 
     Builds a temporary PA_ND format KV cache from the current forward's kv
     tensor, for full prefill attention (no paged cache needed).
+
+    ``use_zero_based_blocks=True`` packs WITHOUT the block-0 padding row: the
+    returned block table addresses real data from id 0 upward, a behavior
+    change consumers must match. Only zero-based kernels (the
+    sparse_flash_mla family selected by :meth:`_uses_a5_sparse_kernels`) may
+    consume the result; kernels that reserve block 0 as padding
+    (sparse_attn_sharedkv) require ``False``. The table and the packed rows
+    are cross-checked below so the addressing mode cannot silently disagree
+    with the pack layout.
     """
     if kv is None or cu_seqlens is None or cu_seqlens.numel() <= 1 or block_size <= 0:
         return torch.empty(0), torch.empty(0)
@@ -2332,6 +2382,17 @@ def _build_prefill_pa_nd_kv(
             target[q_len - copy_len : q_len].copy_(kv[q_start : q_start + copy_len])
         next_block += blocks
 
+    # Guard the table/packed-row contract for both addressing modes on the
+    # CPU list (no device sync): a block id at or past the packed row count
+    # means the table and the block_base padding choice disagree, which would
+    # send the attention kernel to a padding row (1-based ids into a
+    # zero-based pack) or off the end of the pack.
+    max_block = max(table_data, default=0)
+    if max_block >= total_blocks + block_base:
+        raise RuntimeError(
+            f"PA_ND block table id {max_block} outside packed rows "
+            f"{total_blocks + block_base} (block_base={block_base})"
+        )
     table = torch.tensor(table_data, dtype=torch.int32, device=kv.device).view(batch_size, table_cols)
     return packed_kv, table
 
@@ -2359,6 +2420,15 @@ _slot_guard_cache: list[tuple[torch.Tensor, int, torch.device, torch.Tensor, tor
 # ``_SLOT_GUARD_CACHE_MAX`` fresh entries) hands the device memory to
 # unrelated allocations and faults the replayed scatter with device error
 # 507011.
+#
+# Both registries reuse entries keyed by tensor identity plus (update_rows,
+# device) (see _slot_guard_tensors): an entry stored for another backend's
+# slot mapping can be retained under cache pressure but can never be returned
+# for an unrelated forward, so the module-level sharing across the DSA
+# backends bounds cache occupancy only, never correctness. Evicting an eager
+# entry is safe while a forward still holds it: the forward keeps its own
+# references, and the caching allocator reclaims the freed storage only in
+# stream order.
 _graph_slot_guard_cache: list[tuple[torch.Tensor, int, torch.device, torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
 # Key under which a graph entry's execution state owns its slot guards.
