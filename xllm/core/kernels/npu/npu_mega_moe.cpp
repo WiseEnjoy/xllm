@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -179,7 +180,7 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
                            char* comm_alg,
                            int64_t num_max_tokens_per_rank,
                            char* activation,
-                           const std::vector<float>& activation_params,
+                           float activation_clamp,
                            int64_t topo_type,
                            int64_t rank_num_per_server,
                            torch::Tensor& y,
@@ -203,8 +204,6 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
         destroy_float_array_addr != nullptr)
       << "aclnnMegaMoe is not available in "
       << aclnn::detail::get_op_api_lib_name();
-  CHECK(!activation_params.empty() && activation_params.data() != nullptr)
-      << "MegaMoe activationParams must not be empty.";
 
   auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);
   uint64_t workspace_size = 0;
@@ -226,6 +225,12 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
   aclTensor* y_acl = aclnn::detail::convert_type(y);
   aclTensor* expert_token_nums_acl =
       aclnn::detail::convert_type(expert_token_nums);
+  // weight1/weight2 are required op inputs: an empty view list would reach
+  // the aclnn C layer as a null tensor list and dereference there. The scale
+  // slots stay optional through the same helper -- A16W16 legitimately
+  // passes no scales or shared experts.
+  CHECK(!weight1_views.empty() && !weight2_views.empty())
+      << "MegaMoe expert weights must not be empty.";
   aclTensorList* weight1 = create_acl_tensor_list(weight1_views);
   aclTensorList* weight2 = create_acl_tensor_list(weight2_views);
   aclTensorList* weight_scales1 = create_acl_tensor_list(scale1_views);
@@ -235,10 +240,24 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
           create_float_array_addr);
   auto destroy_float_array_func =
       reinterpret_cast<int (*)(const aclFloatArray*)>(destroy_float_array_addr);
-  aclFloatArray* activation_params_acl =
-      create_float_array_func(activation_params.data(),
-                              static_cast<uint64_t>(activation_params.size()));
-  CHECK(activation_params_acl != nullptr)
+  // aclnnMegaMoe takes a single activation parameter; a fixed-size stack
+  // array replaces the per-call std::vector temporary that heap-allocated on
+  // every launch. The shared_ptr releases the aclFloatArray exactly once at
+  // scope exit -- after the custom handler inside cmd.Run() consumed it --
+  // covering the throw paths (at::empty, cmd.Run) where the previous raw
+  // pointer leaked. The array is declared above the holder and outlives it.
+  const float activation_params_values[] = {activation_clamp};
+  const std::shared_ptr<aclFloatArray> activation_params_acl(
+      create_float_array_func(
+          activation_params_values,
+          static_cast<uint64_t>(sizeof(activation_params_values) /
+                                sizeof(float))),
+      [destroy_float_array_func](aclFloatArray* array) {
+        if (array != nullptr) {
+          destroy_float_array_func(array);
+        }
+      });
+  CHECK(activation_params_acl.get() != nullptr)
       << "Failed to create aclnnMegaMoe activationParams, detail:"
       << aclGetRecentErrMsg();
 
@@ -327,7 +346,7 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
                               comm_alg,
                               num_max_tokens_per_rank,
                               activation,
-                              activation_params_acl,
+                              activation_params_acl.get(),
                               topo_type,
                               rank_num_per_server,
                               /*topk_weights_type=*/0,
@@ -336,12 +355,8 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
                               expert_token_nums_acl,
                               &workspace_size,
                               &executor);
-  if (workspace_status != 0) {
-    destroy_float_array_func(activation_params_acl);
-    CHECK(workspace_status == 0)
-        << "call aclnnMegaMoeGetWorkspaceSize failed, detail:"
-        << aclGetRecentErrMsg();
-  }
+  CHECK(workspace_status == 0) << "call aclnnMegaMoeGetWorkspaceSize failed,"
+                               << " detail:" << aclGetRecentErrMsg();
 
   void* workspace_addr = nullptr;
   at::Tensor workspace_tensor;
@@ -361,7 +376,6 @@ void launch_aclnn_mega_moe(const torch::Tensor& context,
         op_api_func(workspace_addr, workspace_size, executor, acl_stream);
     CHECK(api_ret == 0) << "call aclnnMegaMoe failed, detail:"
                         << aclGetRecentErrMsg();
-    destroy_float_array_func(activation_params_acl);
     release_acl_tensors({context_acl,
                          x_acl,
                          topk_ids_acl,
@@ -629,7 +643,7 @@ std::tuple<torch::Tensor, torch::Tensor> apply_npu_mega_moe(
                           comm_alg_ptr,
                           num_max_tokens_per_rank,
                           activation_ptr,
-                          std::vector<float>{activation_clamp},
+                          activation_clamp,
                           topo_type,
                           rank_num_per_server,
                           y,
@@ -674,7 +688,7 @@ std::tuple<torch::Tensor, torch::Tensor> apply_npu_mega_moe(
                         comm_alg_ptr,
                         num_max_tokens_per_rank,
                         activation_ptr,
-                        std::vector<float>{activation_clamp},
+                        activation_clamp,
                         topo_type,
                         rank_num_per_server,
                         y,
