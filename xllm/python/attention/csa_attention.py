@@ -2041,6 +2041,10 @@ class DsaAttentionBackend(AttentionBackend):
         # tensors are host-built by the caller and moved at most once per
         # device -- an H2D copy that never stalls the device (no D2H, no
         # .item()), and a no-op when the table itself is host-resident.
+        # torch.remainder keeps block_pos in [0, width) even when token is
+        # negative (floor div followed by python-style mod), so the gather
+        # never sees a negative index; the valid mask below still filters
+        # padding rows whose stored block id is negative.
         block_pos = torch.div(token, block_size, rounding_mode="floor").remainder(table_width)
         block_id = block_table[:n_seqs].gather(1, block_pos).to(torch.int64)
         source = block_id.clamp(min=0) * block_size + token.remainder(block_size)
@@ -2230,6 +2234,11 @@ class DsaAttentionBackend(AttentionBackend):
         if ori_bt.size(0) < n_seqs:
             raise ValueError(f"SWA block table has {ori_bt.size(0)} rows, but {n_seqs} sequences are active")
 
+        # Deliberate host sync: this eager path needs the per-seq kv lengths
+        # for window arithmetic on the host (one small [batch] D2H per step).
+        # Production decode runs the graph path, which builds the same window
+        # source indices fully on-device (see _build_swa_window_source_indices)
+        # and never syncs.
         kv_cpu = seq_kv.detach().to("cpu", torch.int64)
         window_lens = kv_cpu.clamp(max=window)
         token = kv_cpu.unsqueeze(1) - window_lens.unsqueeze(1) + torch.arange(window)
