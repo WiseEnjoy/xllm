@@ -737,20 +737,21 @@ class DsaAttentionBackend(AttentionBackend):
         # eagerly here -- fresh kernel launches every step, never captured --
         # so the replayed attention kernels read the refreshed values through
         # the buffer copy instead of through re-executed in-graph ops.
-        _state = get_forward_context_or_none()
-        _exec_state = getattr(_state, "execution_state", None) if _state is not None else None
-        if _exec_state is not None:
-            for _key in list(_exec_state.persistent_buffers):
+        execution_state = getattr(get_forward_context_or_none(), "execution_state", None)
+        if execution_state is not None:
+            for buffer_key in list(execution_state.persistent_buffers):
                 if not (
-                    isinstance(_key, tuple) and len(_key) == 2 and _key[0] in ("dsv4_cmp_seqused", "dsv4_cmp_residual")
+                    isinstance(buffer_key, tuple)
+                    and len(buffer_key) == 2
+                    and buffer_key[0] in ("dsv4_cmp_seqused", "dsv4_cmp_residual")
                 ):
                     continue
-                _ratio = _key[1]
-                if _key[0] == "dsv4_cmp_seqused":
-                    _src = persistent.actual_seq_lengths_kv // _ratio
+                compress_ratio = buffer_key[1]
+                if buffer_key[0] == "dsv4_cmp_seqused":
+                    fresh_cmp_value = persistent.actual_seq_lengths_kv // compress_ratio
                 else:
-                    _src = persistent.actual_seq_lengths_kv % _ratio
-                copy_into_execution_buffer(_key, _src)
+                    fresh_cmp_value = persistent.actual_seq_lengths_kv % compress_ratio
+                copy_into_execution_buffer(buffer_key, fresh_cmp_value)
         # Rewrite the slot-guard snapshots bound by the captured KV scatters.
         # _slot_guard_tensors derives long/device copies plus a clamp-min
         # view once per (slot_mapping, update_rows) and the captured
@@ -765,29 +766,29 @@ class DsaAttentionBackend(AttentionBackend):
         # guards it captured (see _slot_guard_tensors), so a replay never
         # pays for -- or depends on -- another entry's or another backend's
         # guards.
-        _guard_caches = []
-        if _exec_state is not None:
-            _entry_guards = _exec_state.persistent_buffers.get(_SLOT_GUARD_STATE_KEY)
-            if _entry_guards:
-                _guard_caches.append(_entry_guards)
-        _guard_caches.append(_graph_slot_guard_cache)
-        for _guard_cache in _guard_caches:
-            for _guard in _guard_cache:
-                _g_sm, _g_rows, _g_dev, _g_slots, _g_safe, _g_mask = _guard
-                _g_fresh = _g_sm.reshape(-1).to(device=_g_dev, dtype=torch.long)[:_g_rows]
-                _g_slots.copy_(_g_fresh)
-                _g_safe.copy_(_g_fresh.clamp_min(0))
-                _g_mask.copy_(_g_fresh.ge(0).unsqueeze(1))
+        guard_caches = []
+        if execution_state is not None:
+            entry_guards = execution_state.persistent_buffers.get(_SLOT_GUARD_STATE_KEY)
+            if entry_guards:
+                guard_caches.append(entry_guards)
+        guard_caches.append(_graph_slot_guard_cache)
+        for guard_cache in guard_caches:
+            for guard in guard_cache:
+                slot_mapping, update_rows, device, slots, safe_slots, mask = guard
+                fresh_slot_mapping = slot_mapping.reshape(-1).to(device=device, dtype=torch.long)[:update_rows]
+                slots.copy_(fresh_slot_mapping)
+                safe_slots.copy_(fresh_slot_mapping.clamp_min(0))
+                mask.copy_(fresh_slot_mapping.ge(0).unsqueeze(1))
         # Rewrite the cached qli_v2 tuple's seqused_k/residual_k in place so
         # the in-graph indexer's walk depth stays consistent with the
         # attention's cmp seqused buffers (a stale tuple walks a shallower
         # index cache than the refreshed attention expects and faults with
         # device error 507011 on the first value-changing replay).
-        if _exec_state is not None:
-            _qli_t = getattr(persistent, "qli_v2_metadata", None)
-            if _qli_t is not None and len(_qli_t) == 4:
-                _qli_t[1].copy_(persistent.actual_seq_lengths_kv // 4, non_blocking=True)
-                _qli_t[2].copy_(persistent.actual_seq_lengths_kv % 4, non_blocking=True)
+        if execution_state is not None:
+            qli_v2_metadata = getattr(persistent, "qli_v2_metadata", None)
+            if qli_v2_metadata is not None and len(qli_v2_metadata) == 4:
+                qli_v2_metadata[1].copy_(persistent.actual_seq_lengths_kv // 4, non_blocking=True)
+                qli_v2_metadata[2].copy_(persistent.actual_seq_lengths_kv % 4, non_blocking=True)
         # Rewrite the cached QLI expanded RoPE in place. The indexer's partial
         # rotary consumes the repeat_interleave'd full-width cos/sin, and the
         # capture hit this cache (keyed on the persistent tables' identity,
@@ -796,19 +797,19 @@ class DsaAttentionBackend(AttentionBackend):
         # graph: without this rewrite every replay would rotate the indexer
         # query with the pre-run positions' rope, silently degrading the
         # sparse block selection as sequences grow past the capture depth.
-        _qli_rope = getattr(persistent, "qli_expanded_rope", None)
-        _cos_table = getattr(persistent, "cos_table", None)
-        _sin_table = getattr(persistent, "sin_table", None)
-        if _qli_rope and _cos_table is not None and _sin_table is not None:
-            _cos_v = _cos_table.reshape(-1, _cos_table.size(-1)) if _cos_table.dim() > 2 else _cos_table
-            _sin_v = _sin_table.reshape(-1, _sin_table.size(-1)) if _sin_table.dim() > 2 else _sin_table
-            for _rope_key, (_cos_exp, _sin_exp) in _qli_rope.items():
-                _fresh_cos = _cos_v.to(_rope_key[2]).repeat_interleave(2, dim=-1)
-                _fresh_sin = _sin_v.to(_rope_key[2]).repeat_interleave(2, dim=-1)
-                if _cos_exp.shape != _fresh_cos.shape or _sin_exp.shape != _fresh_sin.shape:
+        qli_expanded_rope = getattr(persistent, "qli_expanded_rope", None)
+        cos_table = getattr(persistent, "cos_table", None)
+        sin_table = getattr(persistent, "sin_table", None)
+        if qli_expanded_rope and cos_table is not None and sin_table is not None:
+            cos_rows = cos_table.reshape(-1, cos_table.size(-1)) if cos_table.dim() > 2 else cos_table
+            sin_rows = sin_table.reshape(-1, sin_table.size(-1)) if sin_table.dim() > 2 else sin_table
+            for rope_key, (cached_cos, cached_sin) in qli_expanded_rope.items():
+                fresh_cos = cos_rows.to(rope_key[2]).repeat_interleave(2, dim=-1)
+                fresh_sin = sin_rows.to(rope_key[2]).repeat_interleave(2, dim=-1)
+                if cached_cos.shape != fresh_cos.shape or cached_sin.shape != fresh_sin.shape:
                     continue
-                _cos_exp.copy_(_fresh_cos, non_blocking=True)
-                _sin_exp.copy_(_fresh_sin, non_blocking=True)
+                cached_cos.copy_(fresh_cos, non_blocking=True)
+                cached_sin.copy_(fresh_sin, non_blocking=True)
         # The graph window compact's clamped window length and its seqused
         # arg are built once (identity-keyed on the persistent kv lens), but
         # the captured valid-mask op and the attention kernel read them live,
@@ -819,12 +820,12 @@ class DsaAttentionBackend(AttentionBackend):
         # attention for every replay. Each graph entry owns its own state in
         # the registry; only the state whose key is this entry's persistent
         # kv-lens tensor is rewritten.
-        for _win_state in getattr(self, "_graph_window_states", None) or []:
-            if _win_state[0] is not persistent.actual_seq_lengths_kv:
+        for window_state in getattr(self, "_graph_window_states", None) or []:
+            if window_state[0] is not persistent.actual_seq_lengths_kv:
                 continue
-            _fresh_lens = persistent.actual_seq_lengths_kv.to(torch.int64).clamp(min=0, max=self.window_size)
-            _win_state[5].copy_(_fresh_lens, non_blocking=True)
-            _win_state[6].copy_(_fresh_lens.to(torch.int32), non_blocking=True)
+            fresh_seq_lens = persistent.actual_seq_lengths_kv.to(torch.int64).clamp(min=0, max=self.window_size)
+            window_state[5].copy_(fresh_seq_lens, non_blocking=True)
+            window_state[6].copy_(fresh_seq_lens.to(torch.int32), non_blocking=True)
             break
 
     @classmethod
@@ -1934,12 +1935,16 @@ class DsaAttentionBackend(AttentionBackend):
                     layer_tensors[index] = device_tensor
                 elif tensor.device != self.device:
                     layer_tensors[index] = tensor.to(self.device)
-        if not use_a5 or host_cache is None or device_cache is None:
-            return
-        for host_tensor, device_tensor in zip(managers, device_managers):
-            if host_tensor.device.type == "cpu" and host_tensor.numel() > 0:
-                device_cache[id(host_tensor)] = device_tensor
-                host_cache[device_tensor.data_ptr()] = host_tensor
+        if use_a5 and host_cache is not None and device_cache is not None:
+            for host_tensor, device_tensor in zip(managers, device_managers):
+                if host_tensor.device.type == "cpu" and host_tensor.numel() > 0:
+                    device_cache[id(host_tensor)] = device_tensor
+                    host_cache[device_tensor.data_ptr()] = host_tensor
+        # Keep the metadata list aliasing the exact tensors the grids bound
+        # above: graph refresh rewrites managers in place through this list,
+        # and on host-built tables the list must carry the device copies the
+        # captured grids read, not detached host tensors.
+        managers[:] = device_managers
 
     def _build_swa_window_layer_specs(self) -> list[tuple[int, int]]:
         """Resolve the SWA cache index and manager group for each layer."""
