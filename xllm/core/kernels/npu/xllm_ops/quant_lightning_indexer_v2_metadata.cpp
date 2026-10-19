@@ -29,6 +29,12 @@ namespace {
 
 torch::Tensor get_optional_tensor(const std::optional<torch::Tensor>& tensor,
                                   const torch::Device& device) {
+  // Absent optionals become a defined empty int32 tensor on purpose for
+  // aclnnQuantLightningIndexerV2Metadata: this op was A/B-tested with
+  // present zero-size inputs. The main launcher
+  // (quant_lightning_indexer_v2.cpp) keeps undefined tensors as null
+  // optional inputs for its own op; both paths are EXEC_NPU_CMD-safe with
+  // their own sentinel, so the helpers are intentionally not unified.
   if (tensor.has_value()) {
     return *tensor;
   }

@@ -30,6 +30,14 @@ namespace xllm::kernel::npu {
 namespace {
 
 torch::Tensor get_optional_tensor(const std::optional<torch::Tensor>& tensor) {
+  // Absent optionals stay undefined on purpose: EXEC_NPU_CMD maps a
+  // non-defined tensor to a null aclnn input pointer, which the op treats
+  // as an absent optional argument. This sentinel was A/B-tested with this
+  // op; do not swap in torch::empty({0}) here -- that is a present,
+  // zero-size input and follows a different kernel path. The T4 metadata
+  // builder (quant_lightning_indexer_v2_metadata.cpp) uses an empty int32
+  // tensor for its distinct op on purpose; the two helpers are
+  // intentionally not unified.
   return tensor.has_value() ? *tensor : torch::Tensor();
 }
 
