@@ -462,6 +462,7 @@ class ModelExecutor:
                 num_decoding_tokens=num_decoding_tokens,
                 enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False) and not glm_eplv2),
                 is_spec_draft=is_spec_draft,
+                spec_verify_rows=1 if is_spec_draft else num_decoding_tokens,
                 draft_query_width=int(config.get("draft_query_width", 1) or 1),
                 **eplv2_graph_kwargs,
             )

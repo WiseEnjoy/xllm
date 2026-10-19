@@ -474,6 +474,31 @@ void set_dsv4_compressed_counts(const Dsv4KVCacheEstimateCost& cache_cost,
   }
 }
 
+int64_t dsv4_compressed_floor_unit_count(
+    const Dsv4KVCacheEstimateCost& cache_cost,
+    const KVCacheEstimateOptions& options) {
+  const int64_t max_seqs =
+      std::max(options.max_seqs_per_batch, static_cast<int64_t>(1));
+  int64_t floor_unit_count = 0;
+  if (cache_cost.n_c4_layers > 0) {
+    // C4 admission has the stricter per-sequence requirement of the two DSV4
+    // compressed managers. The floor keeps the pool above what a full batch
+    // of max_seqs sequences needs at window saturation: each running
+    // sequence holds a compressed checkpoint that is re-allocated in bursts
+    // while neighbors trim, and bursts of up to 8 units per sequence were
+    // observed on Ascend950 before full batches stopped allocating (see the
+    // full-batch floor cases in kv_cache_estimation_test.cpp). The 8x
+    // multiplier is that validated empirical margin, not a derived hard
+    // bound. Only ratios 4 and 128 contribute, so V4.1 (c1/c2 managers) is
+    // not constrained by this floor.
+    floor_unit_count = std::max(floor_unit_count, 8 * max_seqs + 8);
+  }
+  if (cache_cost.n_c128_layers > 0) {
+    floor_unit_count = std::max(floor_unit_count, 2 * max_seqs + 2);
+  }
+  return floor_unit_count;
+}
+
 Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
     const ModelArgs& model_args,
     const KVCacheEstimateOptions& options) {
@@ -733,6 +758,17 @@ void init_dsv4_counts(const ModelArgs& model_args,
   // Keep SWA at the operational minimum calculated above. Prefix-cache entries
   // share this pool; any remaining memory is reserved for compressed history.
   if (cache_cost.token_unit_bytes > 0 && token_mem > 0) {
+    const int64_t floor_unit_count =
+        dsv4_compressed_floor_unit_count(cache_cost, options);
+    CHECK_GE(token_mem, floor_unit_count * cache_cost.token_unit_bytes)
+        << "DSV4 compressed cache does not cover the floor required for a "
+           "full batch, max_seqs="
+        << std::max(options.max_seqs_per_batch, static_cast<int64_t>(1))
+        << ", required_bytes="
+        << readable_size(floor_unit_count * cache_cost.token_unit_bytes)
+        << ", available_bytes=" << readable_size(token_mem)
+        << "; lower max_seqs_per_batch (or --max-num-seqs) to shrink the "
+           "required floor";
     const int64_t token_unit_count = token_mem / cache_cost.token_unit_bytes;
     set_dsv4_compressed_counts(cache_cost, token_unit_count, kv_cache_cap);
   }

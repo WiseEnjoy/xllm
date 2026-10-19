@@ -143,6 +143,7 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
   // dispatch/combine kernels take this rank as ``ep_rank_id``; an absent group
   // reads as the single-replica rank 0 and must not raise.
   int64_t moe_ep_rank();
+  std::string moe_ep_hccl_comm_name();
   void eplb_batch_isend_irecv(const pybind11::list& operation_types,
                               const pybind11::list& tensors,
                               const pybind11::list& remote_ranks);

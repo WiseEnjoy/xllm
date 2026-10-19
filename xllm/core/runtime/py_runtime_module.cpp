@@ -107,6 +107,13 @@ void register_xllm_runtime_module(py::module_& m) {
   // The C++ side owns the MoE EP process group on the V4-family Python path
   // (they manage their own TP/moe_tp/EP splits), so expose its HCCL
   // communicator name for the MC2 guard. An empty string means unavailable.
+  m.def("moe_ep_hccl_comm_name", []() {
+    PyCausalLM* py_causal_lm = PyCausalLM::active_instance();
+    if (py_causal_lm != nullptr) {
+      return py_causal_lm->moe_ep_hccl_comm_name();
+    }
+    return std::string();
+  });
   m.def("moe_ep_comm_name", []() {
     PyCausalLM* py_causal_lm = PyCausalLM::active_instance();
     if (py_causal_lm == nullptr) {

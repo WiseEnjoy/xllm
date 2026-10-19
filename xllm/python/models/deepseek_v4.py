@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, ClassVar, Sequence
 
 import torch
 import torch.nn as nn
@@ -75,6 +75,7 @@ from xllm.python.models.deepseek_v32 import (
     _tp_rank_from_device,
 )
 from xllm.python.models.weight_utils import W8A8WeightLoader
+from xllm.python.platform import current_platform
 
 # MXFP8/MXFP4 modules are only reachable for FP8 checkpoints; the guarded
 # import keeps W8A8-only deployments (older CANN without the MX dtypes, or
@@ -359,6 +360,10 @@ class DeepseekV4Config:
     dp_rank: int = 0
     layers_to_capture: tuple[int, ...] = ()
     num_speculative_tokens: int = 0
+    # Runtime flags are forwarded by PyCausalLM on NPU. MegaMoe is enabled
+    # only for MXFP4 routed experts and expert-parallel execution.
+    enable_mega_moe: bool = False
+    megamoe_max_tokens_per_rank: int = 512
 
     @classmethod
     def from_dict(cls, d: dict) -> DeepseekV4Config:
@@ -455,6 +460,8 @@ class DeepseekV4Config:
             dp_rank=int(d.get("dp_rank", 0)),
             layers_to_capture=tuple(int(layer_id) for layer_id in d.get("layers_to_capture", [])),
             num_speculative_tokens=int(d.get("num_speculative_tokens", 0)),
+            enable_mega_moe=bool(_pick(d, "enable_mega_moe", default=False)),
+            megamoe_max_tokens_per_rank=int(_pick(d, "megamoe_max_tokens_per_rank", default=512)),
         )
 
     def head_split(self) -> tuple[int, int]:
@@ -589,6 +596,7 @@ class DeepseekV4HyperConnection(nn.Module):
         self.hc_eps = cfg.hc_eps
         self.norm_eps = cfg.rms_norm_eps
         self.sinkhorn_iters = cfg.hc_sinkhorn_iters
+        self.uses_mx_formats = cfg.uses_mx_formats
         hidden = cfg.hidden_size
         # hc_mult is a fixed model constant; NOT TP-sharded (C++ matches).
         self.hc_mult_local = cfg.hc_mult
@@ -608,6 +616,22 @@ class DeepseekV4HyperConnection(nn.Module):
                 f"hc_{part}_scale",
                 nn.Parameter(torch.empty(3, dtype=torch.float32, device=device)),
             )
+
+    def process_weights_after_loading(self) -> None:
+        """Convert mixed-residual weights once to the kernel's BF16 path.
+
+        MXFP (A5) deployments run the fused NPU hc kernels in BF16; W8A8
+        deployments keep the checkpoint's float32 registration so the Python
+        and C++ numerical paths stay aligned.
+        """
+        if getattr(self, "_hc_fn_preconverted", False):
+            return
+        if not self.uses_mx_formats:
+            return
+        for part in ("attn", "ffn"):
+            parameter = getattr(self, f"hc_{part}_fn")
+            parameter.data = parameter.data.to(torch.bfloat16)
+        self._hc_fn_preconverted = True
 
     def hc_pre(
         self,
@@ -868,6 +892,8 @@ class DeepseekV4Attention(Attention):
         hidden: torch.Tensor,
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         wait_for_layer_load(self.layer_id)
         num_tokens = hidden.shape[0]
@@ -910,7 +936,8 @@ class DeepseekV4Attention(Attention):
 
         # The compact Python cache stores half-width per-token cos/sin; expand
         # it to the C++ interleaved [M, rope_head_dim] kernel layout.
-        cos, sin = _expand_half_rope_cos_sin(cos_sin_cache.index_select(0, positions.long()))
+        if cos is None or sin is None:
+            cos, sin = _expand_half_rope_cos_sin(cos_sin_cache.index_select(0, positions.long()))
         _k.npu_inplace_partial_rotary_mul(q, cos, sin, self.nope_head_dim, self.rope_head_dim)
 
         if cp_ctx is not None and cp_ctx.enabled() and dsa is not None:
@@ -1146,8 +1173,15 @@ class DeepseekV4Indexer(nn.Module):
             # the global DeepseekYarnRotaryEmbedding cache (the attention main path
             # uses _interleave_rope_with which consumes half-dim).
             if cos_sel.size(-1) * 2 == self.rope_dim:
-                cos_sel = cos_sel.repeat_interleave(2, dim=-1).contiguous()
-                sin_sel = sin_sel.repeat_interleave(2, dim=-1).contiguous()
+                rope_key = (id(cos_v), id(sin_v), q_idx.dtype)
+                expanded_rope = dsa.qli_expanded_rope.get(rope_key)
+                if expanded_rope is None:
+                    expanded_rope = (
+                        cos_sel.repeat_interleave(2, dim=-1).contiguous(),
+                        sin_sel.repeat_interleave(2, dim=-1).contiguous(),
+                    )
+                    dsa.qli_expanded_rope[rope_key] = expanded_rope
+                cos_sel, sin_sel = expanded_rope
             elif cos_sel.size(-1) != self.rope_dim:
                 raise RuntimeError(f"QRoPE cos/sin dim mismatch: cos={cos_sel.shape}, rope_dim={self.rope_dim}")
             # In-place partial RoPE: modifies q_idx[...rope_start_dim:rope_dim]
@@ -1208,19 +1242,58 @@ class DeepseekV4Indexer(nn.Module):
                 raise RuntimeError(f"QLI {name} must be defined and non-empty")
             if tensor.device != device:
                 raise RuntimeError(f"QLI {name} must be on {device}, got {tensor.device}")
-        topk = kernels.quant_lightning_indexer(
-            q_quant,
-            index_cache,
-            weights.to(torch.float16),
-            q_scale,
-            key_dequant_scale,
-            qli_metadata,
-            query_seq_lens,
-            key_seq_lens,
-            block_table,
-            self.topk,
-            cmp_ratio=4,
-        )
+        if current_platform.get_ascend_soc_generation() == "a5":
+            cmp_ratio = 4
+            qli_v2_metadata = dsa.qli_v2_metadata
+            if qli_v2_metadata is None:
+                qli_v2_metadata = (
+                    dsa.seq_lens_q.to(torch.int32),
+                    (key_seq_lens // cmp_ratio).to(torch.int32),
+                    (key_seq_lens % cmp_ratio).to(torch.int32),
+                    dsa.actual_seq_lengths_query.to(torch.int32),
+                )
+                dsa.qli_v2_metadata = qli_v2_metadata
+            seqused_q, seqused_k, cmp_residual_k, cu_seq_lens_q = qli_v2_metadata
+            topk, _ = kernels.quant_lightning_indexer_v2(
+                q_quant,
+                index_cache,
+                weights.to(torch.float16),
+                q_scale,
+                key_dequant_scale,
+                cu_seq_lens_q,
+                None,
+                seqused_q,
+                seqused_k,
+                cmp_residual_k,
+                block_table,
+                None,
+                qli_metadata,
+                self.n_head,
+                1,
+                self.head_dim,
+                self.topk,
+                2,
+                max_seqlen_q=-1,
+                layout_q="TND",
+                layout_k="PA_BBND",
+                mask_mode=3,
+                cmp_ratio=cmp_ratio,
+                return_value=0,
+            )
+        else:
+            topk = kernels.quant_lightning_indexer(
+                q_quant,
+                index_cache,
+                weights.to(torch.float16),
+                q_scale,
+                key_dequant_scale,
+                qli_metadata,
+                query_seq_lens,
+                key_seq_lens,
+                block_table,
+                self.topk,
+                cmp_ratio=4,
+            )
         return topk
 
     def _get_hadamard(self, device: torch.device) -> torch.Tensor:
@@ -1318,6 +1391,28 @@ def _silu_for_execution(gate: torch.Tensor) -> torch.Tensor:
     return torch_npu.npu_silu(gate)
 
 
+class _MegaMoeBackend:
+    """Minimal HCCL backend interface expected by the MegaMoe glue."""
+
+    def __init__(self, comm_name: str) -> None:
+        self._comm_name = comm_name
+
+    def get_hccl_comm_name(self, rank: int, init_comm: bool = False) -> str:
+        return self._comm_name
+
+
+class _NativeMoeEpGroup:
+    """Expose the native C++ MoE EP group through the vendor glue interface."""
+
+    def __init__(self, rank: int, world_size: int, comm_name: str) -> None:
+        self._rank = rank
+        self._world_size = world_size
+        self._backend = _MegaMoeBackend(comm_name)
+
+    def _get_backend(self, device: torch.device) -> _MegaMoeBackend:
+        return self._backend
+
+
 class DeepseekV4MoE(nn.Module):
     """DeepSeek-V4 MoE with hash routing.
 
@@ -1331,6 +1426,21 @@ class DeepseekV4MoE(nn.Module):
     # subclass that can carry the grouped-clamped fused activation
     # (``deepseek_v41.DeepseekV41SharedMLP``).
     _SHARED_MLP_CLS = DeepseekV3MLP
+    # (EP communicator name, topology/shape signature) -> (vendor callable,
+    # symmetric buffer). The state is process-global because every MoE layer
+    # of one model has the same topology and can share one communication
+    # context. The signature keeps a second model with a different topology
+    # on the same communicator (for example a draft model sharing the EP
+    # group) from reusing an incompatible buffer.
+    _megamoe_buffers: ClassVar[dict[tuple[str, tuple[Any, ...]], tuple[Any, Any]]] = {}
+
+    def _load_megamoe_runtime(self) -> Any:
+        """Load native collectives for the currently active C++ model."""
+        try:
+            import xllm_runtime
+        except ImportError as exc:
+            raise RuntimeError("DeepSeek-V4 MegaMoe requires native runtime collectives") from exc
+        return xllm_runtime
 
     def __init__(self, cfg: DeepseekV4Config, layer_id: int, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
@@ -1358,6 +1468,21 @@ class DeepseekV4MoE(nn.Module):
         self.start_expert_id = ep_rank * self.num_experts_per_rank
         inter_local = cfg.moe_intermediate_size // self.moe_tp_size
         self.inter_local = inter_local
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
+        # The fused dispatch/GEMM/combine operator owns expert-parallel routing
+        # and replaces the routed-expert EP all-reduce. Keep an explicit row
+        # cap because its symmetric buffer is allocated once per communicator.
+        self._megamoe_max_rows = max(1, int(cfg.megamoe_max_tokens_per_rank))
+        if cfg.enable_mega_moe:
+            if not cfg.uses_mx_formats:
+                raise RuntimeError("DeepSeek-V4 MegaMoe requires the official FP8 checkpoint format")
+            if ep_size <= 1:
+                raise RuntimeError("DeepSeek-V4 MegaMoe requires expert parallelism")
+            if self.moe_tp_size != 1:
+                raise RuntimeError("DeepSeek-V4 MegaMoe requires MoE TP == 1")
+        self._megamoe_enabled = cfg.enable_mega_moe
+        self._megamoe_state: tuple[Any, Any] | None = None
         # DSV4 Flash checkpoints use W4A8_DYNAMIC routed experts.  The packed
         # storage shape is discovered from the checkpoint in load_weights;
         # keep expert tensors empty until then to avoid allocating the W8A8
@@ -1470,6 +1595,10 @@ class DeepseekV4MoE(nn.Module):
             self.experts_w2.data = kernels.prepare_weight_mxfp4(self.experts_w2.data)
             self.experts_w13_scale = kernels.prepare_scale_mxfp4(self.experts_w13_scale)
             self.experts_w2_scale = kernels.prepare_scale_mxfp4(self.experts_w2_scale)
+            if self._megamoe_enabled:
+                self._megamoe_w13, self._megamoe_w2, self._megamoe_w13_sf, self._megamoe_w2_sf = (
+                    self._prepare_megamoe_weight_views()
+                )
         elif self.w4a8_dynamic:
             # Match FusedMoEImpl::preprocess_w4a8_dynamic_weights.  Ascend
             # stores each W4 output pair in one int8 row; after transpose the
@@ -1516,6 +1645,150 @@ class DeepseekV4MoE(nn.Module):
             self.experts_w2_scale.data = self.experts_w2_scale.data.squeeze(-1).contiguous()
         self.shared_experts.gate_up_proj.process_weights_after_loading()
         self.shared_experts.down_proj.process_weights_after_loading()
+
+    def _prepare_megamoe_weight_views(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Expose MXFP4 expert weights in the MegaMoe layout without copying."""
+        if not self.uses_mx_formats:
+            raise RuntimeError("MegaMoe weight views are only available for MXFP4 experts")
+
+        return (
+            self.experts_w13.data.transpose(1, 2),
+            self.experts_w2.data.transpose(1, 2),
+            self.experts_w13_scale.transpose(-3, -2).view(torch.float8_e8m0fnu),
+            self.experts_w2_scale.transpose(-3, -2).view(torch.float8_e8m0fnu),
+        )
+
+    def _load_megamoe_glue(self) -> tuple[Any, Any]:
+        """Load the vendor Python wrapper for the fused MegaMoe operator."""
+        from cann_ops_transformer.ops.mc2.mega_moe import (
+            get_symm_buffer_for_mega_moe,
+            mega_moe,
+        )
+
+        return get_symm_buffer_for_mega_moe, mega_moe
+
+    def _init_megamoe(self, device: torch.device) -> None:
+        """Create one symmetric communication buffer for the native EP group."""
+        runtime = self._load_megamoe_runtime()
+
+        # A freshly created HCCL communicator may not have a usable name until
+        # it has run one collective. The warm all-reduce also makes all EP
+        # ranks enter MegaMoe initialization in the same order.
+        warm = torch.zeros(1, device=device)
+        runtime.moe_ep_all_reduce(warm)
+        if self.ep_size > 1:
+            # One-shot symmetry guard (init time, never the hot path): every
+            # EP rank routes to MegaMoe from its local row count against this
+            # capacity, so a capacity disagreement means ranks would split
+            # between the MegaMoe collective and the grouped-expert all-reduce
+            # on the first full batch. Fail loudly here instead of hanging
+            # HCCL there.
+            probe = torch.full((1,), float(self._megamoe_max_rows), device=device)
+            runtime.moe_ep_all_reduce(probe)
+            expected = float(self._megamoe_max_rows) * self.ep_size
+            if probe.item() != expected:
+                raise RuntimeError(
+                    "MegaMoe capacity mismatch across the EP group: local "
+                    f"max_rows={self._megamoe_max_rows}, all-reduced sum="
+                    f"{probe.item()}, expected {expected} when every rank agrees"
+                )
+        comm_name = runtime.moe_ep_hccl_comm_name()
+        if not comm_name:
+            raise RuntimeError("Native MoE EP group has no HCCL communicator name")
+
+        signature = (
+            self.num_total_experts,
+            self._megamoe_max_rows,
+            self.topk,
+            self.cfg.hidden_size,
+            self.cfg.moe_intermediate_size,
+        )
+        cache_key = (comm_name, signature)
+        cached = DeepseekV4MoE._megamoe_buffers.get(cache_key)
+        if cached is None:
+            get_symm_buffer_for_mega_moe, mega_moe = self._load_megamoe_glue()
+            _native_group = _NativeMoeEpGroup(self.ep_rank, self.ep_size, comm_name)
+            # The vendor glue resolves rank/world size through the process
+            # global torch.distributed functions with the group argument.
+            # Patch them to answer ONLY for our native-group adapter object;
+            # every other call (no group, any other group) is forwarded to
+            # the real implementation untouched, so concurrent callers never
+            # observe this model's EP rank.
+            real_get_rank = torch.distributed.get_rank
+            real_get_world_size = torch.distributed.get_world_size
+
+            def _get_rank(group=None):
+                if group is _native_group:
+                    return self.ep_rank
+                return real_get_rank(group)
+
+            def _get_world_size(group=None):
+                if group is _native_group:
+                    return self.ep_size
+                return real_get_world_size(group)
+
+            torch.distributed.get_rank = _get_rank
+            torch.distributed.get_world_size = _get_world_size
+            try:
+                sym_buffer = get_symm_buffer_for_mega_moe(
+                    _native_group,
+                    num_experts=self.num_total_experts,
+                    num_max_tokens_per_rank=self._megamoe_max_rows,
+                    num_topk=self.topk,
+                    hidden=self.cfg.hidden_size,
+                    intermediate_hidden=self.cfg.moe_intermediate_size,
+                    dispatch_quant_mode=4,
+                    dispatch_quant_out_dtype=torch.float8_e4m3fn,
+                )
+            finally:
+                torch.distributed.get_rank = real_get_rank
+                torch.distributed.get_world_size = real_get_world_size
+            cached = (mega_moe, sym_buffer)
+            DeepseekV4MoE._megamoe_buffers[cache_key] = cached
+        self._megamoe_state = cached
+
+    def _megamoe_routed(
+        self,
+        hidden: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run routed experts through the fused MegaMoe operator."""
+        if torch_npu is None:
+            raise RuntimeError("DeepSeek-V4 MegaMoe requires torch_npu")
+        if self._megamoe_state is None:
+            raise RuntimeError("DeepSeek-V4 MegaMoe is not initialized")
+
+        mega_moe, sym_buffer = self._megamoe_state
+        routed, _ = mega_moe(
+            hidden,
+            topk_idx.to(torch.int32),
+            topk_weights.to(torch.bfloat16),
+            [self._megamoe_w13],
+            [self._megamoe_w2],
+            sym_buffer,
+            l1_weights_sf=[self._megamoe_w13_sf],
+            l2_weights_sf=[self._megamoe_w2_sf],
+            activation="swiglu",
+            activation_clamp=self.cfg.swiglu_limit,
+            weight1_type=torch_npu.float4_e2m1fn_x2,
+            weight2_type=torch_npu.float4_e2m1fn_x2,
+        )
+        return routed
+
+    def _should_use_mega_moe(self, hidden: torch.Tensor) -> bool:
+        """Route to MegaMoe only while every EP rank makes the same choice.
+
+        INVARIANT: the row count this decision reads must be identical across
+        the EP group. It holds today because dp_size == 1 shares one batch
+        across EP ranks, and dp_size > 1 forwards run on the dense all-gathered
+        ``padded_tokens`` so every rank sees the same row count. If a future
+        scheduler makes token sets per-rank heterogeneous inside an EP group,
+        this local decision would split the group across the MegaMoe collective
+        and the grouped-expert all-reduce and hang HCCL -- guard such a change
+        with a group-wide decision, not this method.
+        """
+        return self._megamoe_enabled and hidden.shape[0] <= self._megamoe_max_rows
 
     def _gate_logits(
         self,
@@ -1674,28 +1947,38 @@ class DeepseekV4MoE(nn.Module):
                 out_flag=False,
             )
 
-        # 2) EP: zero out non-local expert weights (C++ fused_moe.cpp:843-850).
+        # 2) MegaMoe consumes the global router output and dispatches tokens to
+        # experts across the EP group. Batches wider than the symmetric buffer
+        # stay on the grouped path.
+        use_megamoe = self._should_use_mega_moe(hidden)
+        if use_megamoe and self._megamoe_state is None:
+            self._init_megamoe(hidden.device)
+
+        # 3) EP: zero out non-local expert weights (C++ fused_moe.cpp:843-850).
         ep_size = self.cfg.ep_size if self.cfg.ep_size > 0 else self.cfg.tp_size
-        if ep_size > 1:
+        if ep_size > 1 and not use_megamoe:
             topk_weights = self._ep_local_masked_weights(topk_weights, topk_idx)
 
-        # 3) Expert computation with pre-selected routing (EP-sharded).
+        # 4) Expert computation with pre-selected routing (EP-sharded).
         if self.uses_mx_formats:
-            # Official FP8: packed-fp4 experts with ue8m0 antiquant scales and
-            # MXFP8 activations, dispatched through the MXFP4 grouped MoE op.
-            routed_out = kernels.moe_with_selected_experts_mxfp4(
-                hidden,
-                topk_weights,
-                topk_idx.to(torch.int32),
-                self.experts_w13.data,
-                self.experts_w2.data,
-                self.experts_w13_scale,
-                self.experts_w2_scale,
-                self.num_total_experts,
-                self.start_expert_id,
-                self.num_experts_per_rank,
-                self.cfg.swiglu_limit,
-            )
+            if use_megamoe:
+                routed_out = self._megamoe_routed(hidden, topk_weights, topk_idx)
+            else:
+                # Official FP8: packed-fp4 experts with ue8m0 antiquant scales
+                # and MXFP8 activations, dispatched through the grouped MoE op.
+                routed_out = kernels.moe_with_selected_experts_mxfp4(
+                    hidden,
+                    topk_weights,
+                    topk_idx.to(torch.int32),
+                    self.experts_w13.data,
+                    self.experts_w2.data,
+                    self.experts_w13_scale,
+                    self.experts_w2_scale,
+                    self.num_total_experts,
+                    self.start_expert_id,
+                    self.num_experts_per_rank,
+                    self.cfg.swiglu_limit,
+                )
         elif self.w4a8_dynamic:
             # W4A8_DYNAMIC uses the same two grouped GEMMs as C++
             # forward_expert: W4 GMM1 -> SwiGLU -> dynamic int8 -> W4 GMM2.
@@ -1789,7 +2072,7 @@ class DeepseekV4MoE(nn.Module):
             shared_gate = torch.sigmoid(self.shared_expert_gate(hidden))
             shared_out = shared_gate * shared_out
 
-        output = self._reduce_moe_outputs(routed_out, shared_out)
+        output = self._reduce_moe_outputs(routed_out, shared_out, use_megamoe=use_megamoe)
         if need_slice:
             # ``all_gather`` uses a dense rank-major layout: each rank owns
             # ``padded_tokens`` rows, including its fake row for an empty DP
@@ -1809,7 +2092,9 @@ class DeepseekV4MoE(nn.Module):
         """
         return self.shared_experts(hidden)
 
-    def _reduce_moe_outputs(self, routed_out: torch.Tensor, shared_out: torch.Tensor) -> torch.Tensor:
+    def _reduce_moe_outputs(
+        self, routed_out: torch.Tensor, shared_out: torch.Tensor, *, use_megamoe: bool = False
+    ) -> torch.Tensor:
         """Reduce routed/shared results in the C++ ``FusedMoEImpl`` order.
 
         With both MoE TP and EP enabled, routed and shared outputs are partial
@@ -1826,7 +2111,8 @@ class DeepseekV4MoE(nn.Module):
         if ep_size > 1:
             if self.moe_tp_size > 1:
                 distributed.moe_tp_all_reduce(routed_out)
-            distributed.moe_ep_all_reduce(routed_out)
+            if not use_megamoe:
+                distributed.moe_ep_all_reduce(routed_out)
             if self.moe_tp_size > 1:
                 distributed.moe_tp_all_reduce(shared_out)
             return routed_out + shared_out
@@ -1919,6 +2205,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Match DeepseekV4DecoderLayerImpl::forward exactly: HyperConnection
         # selects the 2D sub-input first, then RMSNorm is applied to that input.
@@ -1930,7 +2218,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc.hc_attn_base,
         )
         attn_input = self.input_layernorm(attn_input)
-        attn_output = self.self_attn(attn_input, positions, cos_sin_cache)
+        attn_output = self.self_attn(attn_input, positions, cos_sin_cache, cos=cos, sin=sin)
         hidden = self.hc.hc_post(attn_output, residual_attn, post_attn, comb_attn)
 
         residual_ffn = hidden
@@ -2103,7 +2391,15 @@ class DeepseekV4Model(nn.Module):
             # ACL graph replay/warmup reuses the metadata built during the
             # first graph warmup call. RoPE tables and the DSA object keep
             # their stable addresses, which is what the captured graph needs.
-            pass
+            # The AICPU metadata kernels are NOT rebuilt here: capture must
+            # not relaunch them inside the captured region (value-locked
+            # AICPU state faults with device error 507011 -- see
+            # CsaAttentionBackend.prepare_dsa_metadata_for_forward). Instead
+            # every replay refreshes the persistent tensors out-of-graph via
+            # CsaAttentionBackend.refresh_dsa_metadata_for_graph_replay.
+            prepare_dsa = getattr(backend, "prepare_dsa_metadata_for_forward", None)
+            if prepare_dsa is not None:
+                prepare_dsa(metadata)
         else:
             backend.reset_forward(metadata)
             metadata.dsa_graph_mode = graph_mode
@@ -2173,6 +2469,19 @@ class DeepseekV4Model(nn.Module):
         aux_hidden_buffer = self.aux_hidden_capture.create_buffer(hidden)
         hidden = hidden.unsqueeze(1).expand(-1, self.cfg.hc_mult, -1).contiguous()
         residual: torch.Tensor | None = None
+        # Every layer in a compression-ratio group reads the same RoPE rows.
+        # Expand each distinct table once and pass those kernel-ready tables to
+        # the layers instead of repeating the gather and interleave per layer.
+        expanded_rope_tables: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        def _expanded_rope(table: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            table_key = id(table)
+            expanded = expanded_rope_tables.get(table_key)
+            if expanded is None:
+                expanded = _expand_half_rope_cos_sin(table.index_select(0, positions))
+                expanded_rope_tables[table_key] = expanded
+            return expanded
+
         for layer_id, layer in enumerate(self.layers):
             compress_ratio = self.cfg.compress_ratios[layer_id] if layer_id < len(self.cfg.compress_ratios) else 1
             if compress_ratio == 4:
@@ -2188,6 +2497,7 @@ class DeepseekV4Model(nn.Module):
             if select_layer_rope is None:
                 raise RuntimeError("DeepSeek-V4 requires select_dsa_layer_rope")
             select_layer_rope(layer_id, layer_cos_sin_cache, metadata)
+            layer_cos, layer_sin = _expanded_rope(layer_cos_sin_cache)
             if cp_ctx is not None and cp_ctx.enabled():
                 kv_cos, kv_sin = cp_ctx.global_rope(compress_ratio)
                 dsa = getattr(metadata, "dsa_metadata", None)
@@ -2201,6 +2511,8 @@ class DeepseekV4Model(nn.Module):
                 positions,
                 layer_cos_sin_cache,
                 input_ids,
+                cos=layer_cos,
+                sin=layer_sin,
             )
             self.aux_hidden_capture.capture_layer(layer_id, hidden, None, aux_hidden_buffer)
             record_layer_event(layer_id)
@@ -2482,6 +2794,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
                     f"DeepSeek-V4 attention compressor weights not found under {attention_prefix}",
                 )
             attn.process_weights_after_loading()
+            self.model.layers[i].hc.process_weights_after_loading()
             # MoE / dense MLP weights. MoE layers use hash routing
             # (gate.weight + gate.tid2eid) and per-expert w1/w2/w3, while dense
             # layers use the fused W8A8 MLP loader below.
