@@ -471,7 +471,6 @@ class DsaAttentionBackend(AttentionBackend):
         *,
         group_limit: int | None = None,
         inplace_target: DsaMetadata | None = None,
-        include_precomputed: bool = True,
     ) -> DsaMetadata:
         """Build one request's complete DSA metadata without publishing it.
 
@@ -595,8 +594,7 @@ class DsaAttentionBackend(AttentionBackend):
         if getattr(metadata, "dsa_cos_sin", None) is not None and metadata.dsa_cos_sin.numel() > 0:
             compressed_metadata.input_rope_by_ratio = self._build_dsa_rope_metadata(compressed_metadata, metadata)
         self._move_metadata_to_device(compressed_metadata)
-        if include_precomputed:
-            self._build_precomputed_metadata(compressed_metadata, metadata)
+        self._build_precomputed_metadata(compressed_metadata, metadata)
         if inplace_target is not None:
             # Record the value-derived fields the builder actually aliased, so
             # the replay copy can assert shape/alias for them instead of copying.
@@ -727,10 +725,7 @@ class DsaAttentionBackend(AttentionBackend):
         # capture-time depth. The copy lands the fresh build at the address
         # the graph bound. (The cmp seqused/residual stay off-graph -- see
         # _get_graph_cmp_seqused.)
-        refreshed = self._build_dsa_metadata_for_forward(
-            metadata,
-            include_precomputed=True,
-        )
+        refreshed = self._build_dsa_metadata_for_forward(metadata)
         self._copy_graph_dsa_metadata(persistent, refreshed)
         # Rewrite the persistent cmp seqused/residual buffers the captured
         # forward binds (see _get_graph_cmp_seqused). The derivations run
@@ -1970,7 +1965,7 @@ class DsaAttentionBackend(AttentionBackend):
         token: torch.Tensor,
         valid: torch.Tensor,
     ) -> torch.Tensor:
-        """Build SWA manager source indices on the host."""
+        """Build SWA manager source indices where the block table lives."""
         if block_table.dim() != 2:
             raise ValueError("SWA graph block table must have shape [batch, blocks]")
         n_seqs = max(len(kv_seq_lens), 1)
@@ -1983,15 +1978,17 @@ class DsaAttentionBackend(AttentionBackend):
 
         table_width = int(block_table.size(1))
         if table_width <= 0:
-            return torch.full((n_seqs, self.window_size), -1, dtype=torch.int64)
+            return torch.full((n_seqs, self.window_size), -1, dtype=torch.int64, device=block_table.device)
+        # Derive everything on the table's device with one indexed read per
+        # (sequence, window position). The previous host gather synced the
+        # device every refresh step to pull the table's leading columns
+        # (up to the full padded width), stalling the schedule-overlap loop;
+        # gather itself reads exactly the window's columns instead.
+        device = block_table.device
+        token = token.to(device)
+        valid = valid.to(device)
         block_pos = torch.div(token, block_size, rounding_mode="floor").remainder(table_width)
-        # Only the leading block-table columns the window can touch are
-        # pulled to the host; the graph-stable table is padded to the full
-        # graph capacity (thousands of columns) and a full pull would stall
-        # the per-step refresh on a large device-to-host sync.
-        needed_cols = min(table_width, int(block_pos.max().item()) + 1 if block_pos.numel() else 1)
-        host_table = block_table[:n_seqs, :needed_cols].detach().cpu().to(torch.int64)
-        block_id = host_table.gather(1, block_pos)
+        block_id = block_table[:n_seqs].gather(1, block_pos).to(torch.int64)
         source = block_id.clamp(min=0) * block_size + token.remainder(block_size)
         return torch.where(
             valid & block_id.ge(0),
@@ -2046,7 +2043,9 @@ class DsaAttentionBackend(AttentionBackend):
             self._swa_window_sources = None
             return None
 
-        sources = torch.stack(source_rows).to(self.device)
+        # Rows may come from host- or device-resident tables; normalize
+        # before stacking so a mixed batch cannot fail the stack.
+        sources = torch.stack([row.to(self.device) for row in source_rows])
         context = get_forward_context_or_none()
         if context is None or context.execution_state is None:
             # Protocol-level metadata tests have no executor context. The

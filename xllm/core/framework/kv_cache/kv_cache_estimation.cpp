@@ -474,6 +474,16 @@ void set_dsv4_compressed_counts(const Dsv4KVCacheEstimateCost& cache_cost,
   }
 }
 
+// Floor of compressed units so a full batch of max_seqs sequences stays
+// admissible at window saturation. Each running sequence holds a compressed
+// checkpoint that is re-allocated in bursts while neighbors trim; bursts of
+// up to 8 units per sequence were observed on Ascend950 before full batches
+// stopped allocating (see the full-batch floor cases in
+// kv_cache_estimation_test.cpp). The multipliers below (8x for C4, 2x for
+// C128) are that validated empirical margin, not derived hard bounds. C4
+// admission has the stricter per-sequence requirement of the two DSV4
+// compressed managers; only ratios 4 and 128 contribute, so V4.1 (c1/c2
+// managers) is not constrained by this floor.
 int64_t dsv4_compressed_floor_unit_count(
     const Dsv4KVCacheEstimateCost& cache_cost,
     const KVCacheEstimateOptions& options) {
@@ -481,16 +491,6 @@ int64_t dsv4_compressed_floor_unit_count(
       std::max(options.max_seqs_per_batch, static_cast<int64_t>(1));
   int64_t floor_unit_count = 0;
   if (cache_cost.n_c4_layers > 0) {
-    // C4 admission has the stricter per-sequence requirement of the two DSV4
-    // compressed managers. The floor keeps the pool above what a full batch
-    // of max_seqs sequences needs at window saturation: each running
-    // sequence holds a compressed checkpoint that is re-allocated in bursts
-    // while neighbors trim, and bursts of up to 8 units per sequence were
-    // observed on Ascend950 before full batches stopped allocating (see the
-    // full-batch floor cases in kv_cache_estimation_test.cpp). The 8x
-    // multiplier is that validated empirical margin, not a derived hard
-    // bound. Only ratios 4 and 128 contribute, so V4.1 (c1/c2 managers) is
-    // not constrained by this floor.
     floor_unit_count = std::max(floor_unit_count, 8 * max_seqs + 8);
   }
   if (cache_cost.n_c128_layers > 0) {
