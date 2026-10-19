@@ -287,6 +287,62 @@ def test_graph_window_sources_keep_stable_address_on_refresh() -> None:
     assert second[0, 2].tolist() == [-1, -1, -1, -1]
 
 
+def test_graph_window_sources_build_without_forward_context() -> None:
+    """No-executor-context callers still initialize and refresh sources."""
+    backend = CsaAttentionBackend(
+        compress_ratios=[1],
+        window_size=4,
+        n_layers=1,
+        num_heads=2,
+        attn_head_dim=4,
+        index_topk=1,
+        index_n_heads=2,
+        index_head_dim=4,
+        rope_head_dim=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    block_table = torch.tensor([[0, 1], [2, 3], [0, -1]], dtype=torch.int32)
+    compressed_metadata = SimpleNamespace(block_tables=[[block_table]])
+    ori_kv = torch.arange(40, dtype=torch.float32).reshape(5, 4, 1, 2)
+    ori_bt = torch.tensor([[0, 1], [2, 3], [0, -1]], dtype=torch.int32)
+    seq_kv = torch.tensor([4, 3, 0], dtype=torch.int32)
+
+    sources = backend._build_swa_window_sources(compressed_metadata, [4, 3, 0])
+    assert sources is not None
+    assert backend._swa_window_sources is sources
+    assert sources[0, 0].tolist() == [0, 1, 2, 3]
+    assert sources[0, 2].tolist() == [-1, -1, -1, -1]
+
+    graph_kv, graph_bt, graph_lens = backend._graph_window_compact(ori_kv, seq_kv, layer_id=0)
+    eager_kv, eager_bt, eager_lens = backend._decode_window_compact_eager(ori_kv, ori_bt, seq_kv)
+    torch.testing.assert_close(graph_kv, eager_kv)
+    assert graph_bt.tolist() == eager_bt.tolist()
+    assert graph_lens.tolist() == eager_lens.tolist()
+
+
+def test_graph_window_compact_fails_fast_without_built_sources() -> None:
+    """A never-built source table fails loudly instead of degrading silently."""
+    backend = CsaAttentionBackend(
+        compress_ratios=[1],
+        window_size=4,
+        n_layers=1,
+        num_heads=2,
+        attn_head_dim=4,
+        index_topk=1,
+        index_n_heads=2,
+        index_head_dim=4,
+        rope_head_dim=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    ori_kv = torch.arange(40, dtype=torch.float32).reshape(5, 4, 1, 2)
+    seq_kv = torch.tensor([4, 3, 0], dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="ACL graph SWA source indices were not captured"):
+        backend._graph_window_compact(ori_kv, seq_kv, layer_id=0)
+
+
 def test_a5_graph_execute_uses_window_compact(monkeypatch) -> None:
     monkeypatch.setattr(csa_attention_module, "_uses_a5_sparse_kernels", lambda: True)
     backend = CsaAttentionBackend(
