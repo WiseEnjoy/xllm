@@ -1415,10 +1415,13 @@ class DeepseekV4MoE(nn.Module):
     FusedMoEImpl::forward_with_selected_experts.
     """
 
-    # EP communicator name -> (vendor callable, symmetric buffer). The state
-    # is process-global because every MoE layer has the same topology and can
-    # share one communication context.
-    _megamoe_buffers: ClassVar[dict[str, tuple[Any, Any]]] = {}
+    # (EP communicator name, topology/shape signature) -> (vendor callable,
+    # symmetric buffer). The state is process-global because every MoE layer
+    # of one model has the same topology and can share one communication
+    # context. The signature keeps a second model with a different topology
+    # on the same communicator (for example a draft model sharing the EP
+    # group) from reusing an incompatible buffer.
+    _megamoe_buffers: ClassVar[dict[tuple[str, tuple[Any, ...]], tuple[Any, Any]]] = {}
 
     def _load_megamoe_runtime(self) -> Any:
         """Load native collectives for the currently active C++ model."""
@@ -1669,7 +1672,16 @@ class DeepseekV4MoE(nn.Module):
         if not comm_name:
             raise RuntimeError("Native MoE EP group has no HCCL communicator name")
 
-        cached = DeepseekV4MoE._megamoe_buffers.get(comm_name)
+        signature = (
+            self.num_total_experts,
+            self._megamoe_max_rows,
+            self.topk,
+            self.cfg.hidden_size,
+            self.cfg.moe_intermediate_size,
+            self._megamoe_prequant,
+        )
+        cache_key = (comm_name, signature)
+        cached = DeepseekV4MoE._megamoe_buffers.get(cache_key)
         if cached is None:
             get_symm_buffer_for_mega_moe, mega_moe = self._load_megamoe_glue()
             group = _NativeMoeEpGroup(self.ep_rank, self.ep_size, comm_name)
@@ -1696,7 +1708,7 @@ class DeepseekV4MoE(nn.Module):
                 torch.distributed.get_rank = real_get_rank
                 torch.distributed.get_world_size = real_get_world_size
             cached = (mega_moe, sym_buffer)
-            DeepseekV4MoE._megamoe_buffers[comm_name] = cached
+            DeepseekV4MoE._megamoe_buffers[cache_key] = cached
         self._megamoe_state = cached
 
     def _megamoe_routed(

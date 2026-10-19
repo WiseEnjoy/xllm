@@ -213,6 +213,42 @@ def test_megamoe_reuses_symmetric_buffer_by_communicator(monkeypatch: pytest.Mon
     assert torch.distributed.get_world_size is get_world_size
 
 
+def test_megamoe_buffer_cache_separates_topologies_sharing_a_communicator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second model with a different topology on the same EP communicator
+    must get its own symmetric buffer, never the first model's entry."""
+
+    DeepseekV4MoE._megamoe_buffers.clear()
+    sym_buffers = [SimpleNamespace(), SimpleNamespace()]
+    get_symm_buffer = MagicMock(side_effect=sym_buffers)
+    mega_moe = MagicMock()
+    runtime = SimpleNamespace(
+        moe_ep_all_reduce=MagicMock(),
+        moe_ep_hccl_comm_name=MagicMock(return_value="ep-comm"),
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", MagicMock(return_value=0))
+    monkeypatch.setattr(torch.distributed, "get_world_size", MagicMock(return_value=4))
+
+    first = _moe()
+    second = _moe(n_routed_experts=16)
+    for moe in (first, second):
+        monkeypatch.setattr(moe, "_load_megamoe_runtime", lambda: runtime)
+        monkeypatch.setattr(moe, "_load_megamoe_glue", lambda: (get_symm_buffer, mega_moe))
+        moe._init_megamoe(torch.device("cpu"))
+
+    assert len(DeepseekV4MoE._megamoe_buffers) == 2
+    assert get_symm_buffer.call_count == 2
+    assert first._megamoe_state[1] is sym_buffers[0]
+    assert second._megamoe_state[1] is sym_buffers[1]
+
+    # Re-initializing the first topology still reuses its own buffer.
+    first._megamoe_state = None
+    first._init_megamoe(torch.device("cpu"))
+    assert get_symm_buffer.call_count == 2
+    assert first._megamoe_state[1] is sym_buffers[0]
+
+
 def test_megamoe_combine_skips_expert_parallel_reduce(monkeypatch: pytest.MonkeyPatch) -> None:
     moe = _moe()
     moe.moe_tp_size = 2

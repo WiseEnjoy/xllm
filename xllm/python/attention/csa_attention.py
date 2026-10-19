@@ -205,6 +205,13 @@ class DsaAttentionBackend(AttentionBackend):
     layer's compression ratio.
     """
 
+    # Whether graph-mode metadata prep must build the SWA window-source
+    # indices outside the capture. The captured V4 sparse kernels consume
+    # those indices; Csa2AttentionBackend (V4.1) computes its window logic
+    # in-forward and overrides this to False, so the shared A5 graph branch
+    # never drags it into the V4-only window-source state.
+    graph_uses_swa_window_sources: bool = True
+
     def __init__(
         self,
         compress_ratios: list[int],
@@ -409,7 +416,7 @@ class DsaAttentionBackend(AttentionBackend):
             enable_graph=enable_graph,
             graph_block_table_capacity_cols=graph_capacity_cols,
         )
-        if enable_graph and _uses_a5_sparse_kernels():
+        if enable_graph and _uses_a5_sparse_kernels() and self.graph_uses_swa_window_sources:
             self._build_swa_window_sources(compressed_metadata, kv_seq_lens)
         if enable_graph and self._builder.outputs_have_padding:
             # Remap padding-lane -1 block-table entries to the reserved

@@ -353,6 +353,75 @@ def test_a5_graph_execute_uses_window_compact(monkeypatch) -> None:
     assert calls[0]["ori_kv"][0, 2, 0].tolist() == [7.0, 7.0, 7.0, 7.0]
 
 
+def test_csa2_backend_skips_v4_swa_window_source_prep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shared A5 graph branch must not drag Csa2 into V4 window sources.
+
+    Regression: the base class built SWA window sources under A5 + graph mode
+    unconditionally. ``Csa2AttentionBackend`` does not run the base
+    constructor, so the V4-only ``_swa_window_layer_specs`` state was missing
+    and V4.1 graph mode on A5 died with AttributeError during the first
+    metadata build.
+    """
+
+    from xllm.python.attention.csa2_attention import Csa2AttentionBackend
+
+    backend = Csa2AttentionBackend(
+        compress_ratios=[1, 4],
+        window_size=4,
+        n_layers=2,
+        num_heads=2,
+        attn_head_dim=64,
+        index_topk=2,
+        index_n_heads=2,
+        index_head_dim=64,
+        rope_head_dim=64,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        kv_source_layer_ids=[0],
+        index_source_layer_ids=[0],
+        candidate_source_layer_id=0,
+        candidate_topk_blocks=2,
+        candidate_block_size=4,
+        acl_graph_enabled=True,
+    )
+    # The capability contract cuts both ways: the V4 backend declares the
+    # consumption, Csa2 opts out because its captured forward computes the
+    # window logic in-graph.
+    assert backend.graph_uses_swa_window_sources is False
+    assert csa_attention_module.CsaAttentionBackend.graph_uses_swa_window_sources is True
+
+    monkeypatch.setattr(csa_attention_module, "_uses_a5_sparse_kernels", lambda: True)
+    window_calls: list[Any] = []
+    monkeypatch.setattr(
+        backend,
+        "_build_swa_window_sources",
+        lambda *args, **kwargs: window_calls.append(args),
+    )
+    metadata = SimpleNamespace(
+        multi_block_tables=[
+            torch.tensor([[10]], dtype=torch.int32),
+            torch.tensor([[20]], dtype=torch.int32),
+        ],
+        kv_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+        q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+        new_cache_slots_host_values=[1280],
+        is_prefill=False,
+        is_chunked_prefill=False,
+        is_dummy=False,
+        dsa_positions=torch.tensor([0], dtype=torch.int64),
+        dsa_cos_sin=None,
+        dsa_graph_block_table_cols=0,
+        dsa_graph_mode=True,
+    )
+
+    # Must not raise (the pre-fix AttributeError) and must skip the V4 prep.
+    dsa = backend._build_dsa_metadata_for_forward(metadata)
+
+    assert window_calls == []
+    assert dsa is not None
+    assert dsa.is_acl_graph is True
+
+
 def test_dspark_native_sas_window_matches_cpp_contract() -> None:
     assert _deepseek_v4_ori_window_left(128, 5, False) == 127
     assert _deepseek_v4_ori_window_left(128, 0, True) == 127

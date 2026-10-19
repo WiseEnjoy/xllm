@@ -387,6 +387,13 @@ class Csa2AttentionBackend(DsaAttentionBackend):
     admission; :attr:`acl_graph_enabled` gates the startup capacity check.
     """
 
+    # The captured CSA2 forward computes its window logic in-graph from the
+    # refreshed metadata; it must not build (or inherit the state for) the
+    # V4 backend's out-of-graph SWA window-source indices. This backend does
+    # not run the base constructor, so the base's A5 graph branch would
+    # otherwise crash on the missing V4-only window-source state.
+    graph_uses_swa_window_sources = False
+
     def __init__(
         self,
         compress_ratios: list[int],
