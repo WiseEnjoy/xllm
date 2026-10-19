@@ -657,8 +657,8 @@ std::tuple<torch::Tensor, torch::Tensor> apply_npu_mega_moe(
   // installed (shared-expert) aclnnMegaMoe signature every parameter after
   // xActiveMask would silently misalign. A16W16 carries no scales and no
   // shared experts; the launcher forwards those as null optional slots.
-  TORCH_CHECK(!bias1.has_value() && !bias2.has_value(),
-              "MegaMoe A16W16 path does not accept expert bias.");
+  CHECK(!bias1.has_value() && !bias2.has_value())
+      << "MegaMoe A16W16 path does not accept expert bias.";
   std::vector<aclTensor*> w1_views;
   std::vector<aclTensor*> w2_views;
   w1_views.reserve(weight1.size());

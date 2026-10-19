@@ -1697,6 +1697,110 @@ def test_graph_replay_refreshes_qli_expanded_rope_in_place() -> None:
     assert entry_guards is not None and len(entry_guards) == 1
 
 
+def test_graph_replay_refreshes_qli_expanded_rope_per_ratio_source() -> None:
+    """Every QLI expansion refreshes from the ratio pair it was built from.
+
+    ``select_dsa_layer_rope`` swaps ``cos_table`` between the distinct live
+    pairs in ``input_rope_by_ratio`` (ratio 1 / 4 / 128), so one capture
+    session keys expansions from several sources while the persistent
+    metadata keeps only the last selection. Refreshing every entry from
+    that single table would rotate the c4/c128 entries with the wrong rope
+    on replay and mis-select the sparse blocks.
+    """
+    backend = csa_attention_module.DsaAttentionBackend(
+        compress_ratios=[4],
+        window_size=4,
+        n_layers=1,
+        num_heads=1,
+        attn_head_dim=4,
+        index_topk=4,
+        index_n_heads=1,
+        index_head_dim=4,
+        rope_head_dim=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    def make_dsa(kv_len: int, rope_values: dict[int, float]) -> SimpleNamespace:
+        dsa = backend._builder.build(
+            multi_block_tables=[
+                torch.tensor([[1, 2]], dtype=torch.int32),
+                torch.tensor([[1, 2]], dtype=torch.int32),
+            ],
+            kv_seq_lens=[kv_len],
+            q_seq_lens=[1],
+            positions=torch.tensor([kv_len - 1]),
+            dsa_cos_sin=None,
+            is_prefill=False,
+            is_chunked_prefill=False,
+            new_cache_slots=None,
+            enable_graph=True,
+            graph_block_table_capacity_cols=2,
+        )
+        pairs = {
+            ratio: (
+                torch.full((1, 1), float(value)),
+                torch.full((1, 1), float(value)),
+            )
+            for ratio, value in rope_values.items()
+        }
+        dsa.input_rope_by_ratio = pairs
+        # The layer loop leaves cos_table on the c4 selection at capture end.
+        dsa.cos_table, dsa.sin_table = pairs[4]
+        return dsa
+
+    persistent = make_dsa(7, {1: 1.0, 4: 4.0, 128: 128.0})
+    refreshed = make_dsa(8, {1: 2.0, 4: 7.0, 128: 9.0})
+    expansions: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+    for pair in persistent.input_rope_by_ratio.values():
+        rope_key = (id(pair[0]), id(pair[1]), torch.float32)
+        expansions[rope_key] = (
+            pair[0].repeat_interleave(2, dim=-1),
+            pair[1].repeat_interleave(2, dim=-1),
+        )
+    persistent.qli_expanded_rope.update(expansions)
+    persistent.qli_v2_metadata = (
+        persistent.seq_lens_q,
+        persistent.actual_seq_lengths_kv // 4,
+        persistent.actual_seq_lengths_kv % 4,
+        persistent.actual_seq_lengths_query,
+    )
+    metadata = SimpleNamespace(dsa_metadata=persistent)
+    backend._build_dsa_metadata_for_forward = lambda *args, **kwargs: refreshed
+    state = AclGraphExecutionState(persistent_buffers={})
+    context = ForwardContext(
+        attention_backend=backend,
+        device=torch.device("cpu"),
+        metadata=metadata,
+        layer_caches=[],
+        execution_state=state,
+    )
+
+    with forward_context(context):
+        # Pin the entry-owned slot guard the same way the captured forward
+        # does, then refresh.
+        csa_attention_module._slot_guard_tensors(persistent.manager_slot_mappings[0], 1, torch.device("cpu"))
+        backend.refresh_dsa_metadata_for_graph_replay(metadata)
+
+    # Each entry rotates with ITS source pair: 1 -> 2.0, 4 -> 7.0, 128 -> 9.0.
+    # Refreshing every entry from the last selection (cos_table = pair 4)
+    # would stamp 7.0 into all three.
+    by_ratio = {
+        ratio: expansions[(id(pair[0]), id(pair[1]), torch.float32)]
+        for ratio, pair in persistent.input_rope_by_ratio.items()
+    }
+    assert by_ratio[1][0].tolist() == [[2.0, 2.0]]
+    assert by_ratio[4][0].tolist() == [[7.0, 7.0]]
+    assert by_ratio[128][0].tolist() == [[9.0, 9.0]]
+    # The rewrite stays in place: the captured graph bound these addresses.
+    ratio4_key = (
+        id(persistent.input_rope_by_ratio[4][0]),
+        id(persistent.input_rope_by_ratio[4][1]),
+        torch.float32,
+    )
+    assert expansions[ratio4_key][0].data_ptr() == persistent.qli_expanded_rope[ratio4_key][0].data_ptr()
+
+
 def test_graph_dsa_build_uses_stable_host_length_values(monkeypatch) -> None:
     backend = _make_backend()
     monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
