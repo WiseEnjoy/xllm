@@ -798,9 +798,22 @@ class DsaAttentionBackend(AttentionBackend):
         if qli_expanded_rope and cos_table is not None and sin_table is not None:
             cos_rows = cos_table.reshape(-1, cos_table.size(-1)) if cos_table.dim() > 2 else cos_table
             sin_rows = sin_table.reshape(-1, sin_table.size(-1)) if sin_table.dim() > 2 else sin_table
+            # Each entry was expanded from ONE per-layer selection:
+            # select_dsa_layer_rope swaps cos_table between the distinct live
+            # pairs in input_rope_by_ratio (ratio 1 / 4 / 128), so a capture
+            # session keys expansions from several sources while this
+            # metadata holds only the last selection. Resolve every entry's
+            # own source by the identity its build side keyed on (those pairs
+            # refreshed in place above); an entry keyed outside the map keeps
+            # this metadata pair as its source.
             for rope_key, (cached_cos, cached_sin) in qli_expanded_rope.items():
-                fresh_cos = cos_rows.to(rope_key[2]).repeat_interleave(2, dim=-1)
-                fresh_sin = sin_rows.to(rope_key[2]).repeat_interleave(2, dim=-1)
+                src_cos, src_sin = cos_rows, sin_rows
+                for ratio_pair in persistent.input_rope_by_ratio.values():
+                    if id(ratio_pair[0]) == rope_key[0] and id(ratio_pair[1]) == rope_key[1]:
+                        src_cos, src_sin = ratio_pair
+                        break
+                fresh_cos = src_cos.to(rope_key[2]).repeat_interleave(2, dim=-1)
+                fresh_sin = src_sin.to(rope_key[2]).repeat_interleave(2, dim=-1)
                 if cached_cos.shape != fresh_cos.shape or cached_sin.shape != fresh_sin.shape:
                     continue
                 cached_cos.copy_(fresh_cos, non_blocking=True)
@@ -1725,9 +1738,6 @@ class DsaAttentionBackend(AttentionBackend):
                 seqused_ori_kv = seq_kv if is_prefill else seq_kv.clamp(max=self.window_size)
                 seqused_cmp_kv = seq_kv // ratio if has_cmp else None
                 cmp_residual_kv = seq_kv % ratio if has_cmp else None
-                # Pin the capture-time baked maxima to the replay domain
-                # bounds (see graph_capture above); eager builds keep the
-                # exact per-batch maxima.
                 max_ori_kv_arg = int(max_kv)
                 max_cmp_kv_arg = int(max_kv) // ratio if has_cmp else 0
                 if graph_capture:
@@ -1885,31 +1895,25 @@ class DsaAttentionBackend(AttentionBackend):
             if tensor is not None and tensor.device != self.device:
                 setattr(compressed_metadata, name, tensor.to(self.device))
         host_cache: dict[int, torch.Tensor] = {}
-        device_cache: dict[int, torch.Tensor] = {}
         use_a5 = _uses_a5_sparse_kernels()
         self._move_grid_to_device(
-            compressed_metadata,
             compressed_metadata.manager_block_tables,
             compressed_metadata.block_tables,
             host_cache,
-            device_cache,
             use_a5=use_a5,
         )
         if use_a5:
             self._eager_bt_host = host_cache
         self._move_grid_to_device(
-            compressed_metadata,
             compressed_metadata.manager_slot_mappings,
             compressed_metadata.slot_mappings,
         )
 
     def _move_grid_to_device(
         self,
-        metadata: DsaMetadata,
         managers: list[torch.Tensor],
         grids: list[list[torch.Tensor]],
         host_cache: dict[int, torch.Tensor] | None = None,
-        device_cache: dict[int, torch.Tensor] | None = None,
         *,
         use_a5: bool = False,
     ) -> None:
@@ -1930,10 +1934,9 @@ class DsaAttentionBackend(AttentionBackend):
                     layer_tensors[index] = device_tensor
                 elif tensor.device != self.device:
                     layer_tensors[index] = tensor.to(self.device)
-        if use_a5 and host_cache is not None and device_cache is not None:
+        if use_a5 and host_cache is not None:
             for host_tensor, device_tensor in zip(managers, device_managers):
                 if host_tensor.device.type == "cpu" and host_tensor.numel() > 0:
-                    device_cache[id(host_tensor)] = device_tensor
                     host_cache[device_tensor.data_ptr()] = host_tensor
         # Keep the metadata list aliasing the exact tensors the grids bound
         # above: graph refresh rewrites managers in place through this list,
