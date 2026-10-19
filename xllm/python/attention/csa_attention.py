@@ -685,8 +685,13 @@ class DsaAttentionBackend(AttentionBackend):
         state = get_forward_context().execution_state
         if state is None:
             return None
-        key_cmp = ("dsv4_cmp_seqused", compress_ratio)
-        key_res = ("dsv4_cmp_residual", compress_ratio)
+        # Single construction point for these registry keys (the refresh
+        # loop only rewrites keys it iterates). int() normalizes the ratio
+        # element so every lookup hashes on one key type regardless of the
+        # caller's int-like input.
+        ratio_key = int(compress_ratio)
+        key_cmp = ("dsv4_cmp_seqused", ratio_key)
+        key_res = ("dsv4_cmp_residual", ratio_key)
         if key_cmp in state.persistent_buffers:
             return (state.persistent_buffers[key_cmp], state.persistent_buffers[key_res])
         cmp = seq_kv // compress_ratio
@@ -1968,7 +1973,12 @@ class DsaAttentionBackend(AttentionBackend):
         token: torch.Tensor,
         valid: torch.Tensor,
     ) -> torch.Tensor:
-        """Build SWA manager source indices where the block table lives."""
+        """Build SWA manager source indices where the block table lives.
+
+        ``token`` and ``valid`` must already live on ``block_table.device``;
+        the caller converts them once per device so a refresh step performs
+        at most one copy per distinct device instead of one per layer group.
+        """
         if block_table.dim() != 2:
             raise ValueError("SWA graph block table must have shape [batch, blocks]")
         n_seqs = max(len(kv_seq_lens), 1)
@@ -1986,10 +1996,10 @@ class DsaAttentionBackend(AttentionBackend):
         # (sequence, window position). The previous host gather synced the
         # device every refresh step to pull the table's leading columns
         # (up to the full padded width), stalling the schedule-overlap loop;
-        # gather itself reads exactly the window's columns instead.
-        device = block_table.device
-        token = token.to(device)
-        valid = valid.to(device)
+        # gather itself reads exactly the window's columns instead. All
+        # tensors are host-built by the caller and moved at most once per
+        # device -- an H2D copy that never stalls the device (no D2H, no
+        # .item()), and a no-op when the table itself is host-resident.
         block_pos = torch.div(token, block_size, rounding_mode="floor").remainder(table_width)
         block_id = block_table[:n_seqs].gather(1, block_pos).to(torch.int64)
         source = block_id.clamp(min=0) * block_size + token.remainder(block_size)
@@ -2020,6 +2030,10 @@ class DsaAttentionBackend(AttentionBackend):
 
         source_rows_by_group: dict[int, int] = {}
         source_rows: list[torch.Tensor] = []
+        # Move the host-built token/valid views to each table's device at
+        # most once per refresh (dict cache) instead of once per call.
+        token_on_device: dict[torch.device, torch.Tensor] = {}
+        valid_on_device: dict[torch.device, torch.Tensor] = {}
         for layer_id, (cache_idx, group_id) in enumerate(specs):
             if cache_idx < 0 or group_id < 0 or group_id >= len(self.group_infos) or group_id in source_rows_by_group:
                 continue
@@ -2030,14 +2044,18 @@ class DsaAttentionBackend(AttentionBackend):
             )
             if block_table is None:
                 continue
+            device = block_table.device
+            if device not in token_on_device:
+                token_on_device[device] = token.to(device)
+                valid_on_device[device] = valid.to(device)
             source_rows_by_group[group_id] = len(source_rows)
             source_rows.append(
                 self._build_swa_window_source_indices(
                     block_table,
                     kv_seq_lens,
                     block_size=self.group_infos[group_id].block_size,
-                    token=token,
-                    valid=valid,
+                    token=token_on_device[device],
+                    valid=valid_on_device[device],
                 )
             )
 
