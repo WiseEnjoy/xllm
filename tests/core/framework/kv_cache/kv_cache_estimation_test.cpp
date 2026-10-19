@@ -605,7 +605,7 @@ TEST(KVCacheEstimationTest, EstimatesDeepSeekV4Pools) {
   options.dtype = torch::kFloat32;
   options.kv_cache_dtype = "auto";
   options.cache_size_in_bytes =
-      2818048 + /*sixteen_additional_swa_blocks=*/16 * 90112;
+      2818048 + /*twenty_one_additional_swa_blocks=*/21 * 90112;
   options.block_size = 128;
   options.max_seqs_per_batch = 4;
   options.max_tokens_per_batch = 2176;
@@ -626,7 +626,7 @@ TEST(KVCacheEstimationTest, EstimatesDeepSeekV4Pools) {
 #else
   constexpr int64_t kIndexBytes = 1;
   constexpr int64_t kScaleBytes = 2;
-  constexpr int64_t kExpectedUnits = 28;
+  constexpr int64_t kExpectedUnits = 40;
 #endif
   const int64_t token_unit_bytes =
       geometry.c4_physical_dim() * (16 * 4 + 8 * kIndexBytes + kScaleBytes) +
@@ -637,6 +637,54 @@ TEST(KVCacheEstimationTest, EstimatesDeepSeekV4Pools) {
   EXPECT_EQ(capacity.c4_count(), expected_units);
   EXPECT_EQ(capacity.c128_count(), expected_units);
   EXPECT_EQ(capacity.n_blocks(), expected_units * manager_blocks_per_unit);
+}
+
+TEST(KVCacheEstimationTest, FloorsDSV4CompressedPoolsForFullBatch) {
+  ModelArgs model_args;
+  model_args.model_type("deepseek_v4")
+      .n_layers(3)
+      .head_dim(16)
+      .index_head_dim(8)
+      .window_size(128)
+      .compress_ratios({1, 4, 128});
+
+  KVCacheEstimateOptions options;
+  options.dtype = torch::kFloat32;
+  options.kv_cache_dtype = "auto";
+  options.block_size = 128;
+  options.max_seqs_per_batch = 8;
+  options.max_tokens_per_batch = 1024;
+  options.instance_role = InstanceRole::DECODE;
+
+  const Dsv4CacheGeometry geometry;
+  const DeepSeekV4CachePolicy cache_policy =
+      get_dsv4_cache_policy(options.dtype);
+  const int64_t scale_bytes =
+      cache_policy.has_indexer_cache_scale ? cache_policy.scale_dtype_size : 0;
+  const int64_t swa_bytes_per_block =
+      /*c1=*/128 * 16 * 4 +
+      /*c4=*/128 * (16 * 4 + 2 * 16 * 4 * 2 + 2 * 8 * 4 * 2) +
+      /*c128=*/128 * (16 * 4 + 16 * 4 * 2);
+  const int64_t compressed_unit_bytes =
+      geometry.c4_physical_dim() *
+          (16 * 4 + 8 * cache_policy.index_dtype_size + scale_bytes) +
+      geometry.c128_physical_dim() * 16 * 4;
+  // Eight window blocks, eight burst blocks, eight per-sequence tail blocks,
+  // and two guard blocks.
+  constexpr int64_t kSwaBlocks = 26;
+  constexpr int64_t kCompressedFloorUnits = 8 * 8 + 8;
+  options.cache_size_in_bytes = kSwaBlocks * swa_bytes_per_block +
+                                kCompressedFloorUnits * compressed_unit_bytes;
+
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+
+  EXPECT_EQ(capacity.swa_count(), kSwaBlocks);
+  EXPECT_EQ(capacity.c4_count(), kCompressedFloorUnits);
+  EXPECT_EQ(capacity.c128_count(), kCompressedFloorUnits);
+  EXPECT_EQ(capacity.n_blocks(),
+            kCompressedFloorUnits *
+                (geometry.compressed_block_token_size() / options.block_size));
 }
 
 TEST(KVCacheEstimationTest, DeepSeekV4RejectsBudgetWithoutCompressedCacheUnit) {
@@ -1091,10 +1139,13 @@ TEST(KVCacheEstimationTest,
   constexpr int64_t kDraftSwaBytes =
       /*layers=*/3 * /*swa_count=*/35 * /*block_size=*/128 *
       /*head_dim=*/16 * /*float32_bytes=*/4;
-  // Reserve both SWA pools and exactly two compressed units for either
-  // the model-dtype indexer cache or the quantized indexer cache with scales.
+  // Cover the full-batch floor exactly. The target-only run reuses the draft
+  // SWA bytes as compressed capacity, so it keeps more units than the joint
+  // target/draft run.
+  constexpr int64_t kJointCompressedUnits = 8 * 4 + 8;
   target_options.cache_size_in_bytes =
-      kTargetSwaBytes + kDraftSwaBytes + 2 * compressed_unit_bytes;
+      kTargetSwaBytes + kDraftSwaBytes +
+      kJointCompressedUnits * compressed_unit_bytes;
   target_options.block_size = 128;
   target_options.max_seqs_per_batch = 4;
   target_options.max_tokens_per_batch = 2176;
@@ -1113,8 +1164,8 @@ TEST(KVCacheEstimationTest,
   EXPECT_LE(capacity.cache_size_in_bytes() + kDraftSwaBytes,
             target_options.cache_size_in_bytes);
   EXPECT_EQ(capacity.swa_count(), 35);
-  EXPECT_EQ(capacity.c4_count(), 2);
-  EXPECT_EQ(capacity.c128_count(), 2);
+  EXPECT_EQ(capacity.c4_count(), kJointCompressedUnits);
+  EXPECT_EQ(capacity.c128_count(), kJointCompressedUnits);
   EXPECT_EQ(capacity.swa_count(), target_only_capacity.swa_count());
   EXPECT_GT(target_only_capacity.c4_count(), capacity.c4_count());
   EXPECT_EQ(target_only_capacity.c4_count(), target_only_capacity.c128_count());

@@ -430,7 +430,15 @@ def test_load_weights_reaches_routed_expert_aliases(
             moe_intermediate_size=4,
             hidden_size=3,
         ),
-        model=SimpleNamespace(layers=[SimpleNamespace(self_attn=attention, mlp=mlp)]),
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    self_attn=attention,
+                    hc=SimpleNamespace(process_weights_after_loading=lambda: None),
+                    mlp=mlp,
+                )
+            ]
+        ),
         get_parameter=parameters.__getitem__,
         get_buffer=buffers.__getitem__,
         _load_dsv4_attention=_load_attention,

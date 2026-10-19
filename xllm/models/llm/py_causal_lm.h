@@ -132,6 +132,7 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
       const std::vector<int32_t>& execution_token_counts);
   void moe_tp_all_reduce(torch::Tensor& tensor);
   void moe_ep_all_reduce(torch::Tensor& tensor);
+  std::string moe_ep_hccl_comm_name();
   void eplb_batch_isend_irecv(const pybind11::list& operation_types,
                               const pybind11::list& tensors,
                               const pybind11::list& remote_ranks);

@@ -529,6 +529,14 @@ py::dict PyCausalLM::build_config_dict(
   d["enable_fused_mc2"] = KernelConfig::get_instance().enable_fused_mc2() > 0;
   d["enable_dsa_cp"] = KernelConfig::get_instance().enable_dsa_cp() &&
                        !speculative_runtime_config.is_draft_engine;
+  // Python DeepSeek-V4 builds its MegaMoE communication resources from the
+  // native MoE EP group. Keep this model-specific so other Python models keep
+  // the existing C++ resource lifecycle unchanged.
+  if (model_args_.model_type() == "deepseek_v4") {
+    d["enable_mega_moe"] = KernelConfig::get_instance().enable_mega_moe();
+    d["megamoe_max_tokens_per_rank"] =
+        KernelConfig::get_instance().megamoe_max_tokens_per_rank();
+  }
   const auto& eplb_config = EPLBConfig::get_instance();
   // Typed GLM5.2 EP metadata is registered from ep_size; the degree selects
   // eager-only EPLv2 even when no MegaMoE resource is requested.
@@ -786,6 +794,13 @@ void PyCausalLM::moe_ep_all_reduce(torch::Tensor& tensor) {
   if (moe_ep_group_ != nullptr) {
     moe_ep_group_->allreduce(tensor);
   }
+}
+
+std::string PyCausalLM::moe_ep_hccl_comm_name() {
+  if (moe_ep_group_ != nullptr) {
+    return moe_ep_group_->hccl_comm_name(false);
+  }
+  return std::string();
 }
 
 void PyCausalLM::eplb_batch_isend_irecv(const py::list& operation_types,

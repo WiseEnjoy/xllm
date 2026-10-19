@@ -68,6 +68,45 @@ def _metadata(linear_state_indices: torch.Tensor) -> SimpleNamespace:
     )
 
 
+def test_spec_verify_rows_expand_to_token_row_bucket() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        attention_backend,
+        torch.device("cpu"),
+        max_batch=2,
+        max_model_len=8,
+        num_decoding_tokens=6,
+        spec_verify_rows=6,
+    )
+    metadata = _metadata(torch.arange(2, dtype=torch.int32))
+
+    assert runner.sequence_batch_capacity == 2
+    assert runner.max_batch == 16
+    assert runner._engram_graph_token_capacity() == 16
+    with patch.object(runner, "_has_compatible_decode_metadata", return_value=True):
+        assert runner.can_execute(torch.zeros(12, dtype=torch.int32), metadata)
+
+
+def test_plain_decode_does_not_inherit_spec_verify_capacity() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        attention_backend,
+        torch.device("cpu"),
+        max_batch=2,
+        max_model_len=8,
+        num_decoding_tokens=6,
+    )
+    metadata = _metadata(torch.arange(2, dtype=torch.int32))
+
+    assert runner.sequence_batch_capacity == 2
+    assert runner.max_batch == 2
+    assert runner._engram_graph_token_capacity() == 16
+    with patch.object(runner, "_has_compatible_decode_metadata", return_value=True):
+        assert runner.can_execute(torch.zeros(12, dtype=torch.int32), metadata) is False
+
+
 @pytest.mark.parametrize(
     "limit,sequences,expected",
     [(16, 1, True), (16, 2, True), (16, 3, False), (24, 3, False), (32, 3, True), (32, 4, True), (32, 5, False)],
@@ -904,6 +943,54 @@ def test_dp_expanded_verify_and_dummy_rank_share_graph_decision() -> None:
     ):
         assert wide_runners[0].can_execute(torch.zeros(4, dtype=torch.int32), active)
         assert wide_runners[1].can_execute(torch.zeros(1, dtype=torch.int32), dummy)
+
+
+def test_dp_unmarked_shape_expanded_rows_raise_instead_of_diverging() -> None:
+    """DSpark-style verify rows carry no typed expanded view; only the
+    group-wide marker may promote them to the expanded graph under DP."""
+
+    def dspark_rows(rows: int, sequences: int) -> SimpleNamespace:
+        metadata = _dp_metadata((4, 1))
+        metadata.raw_dp_execution_token_counts = (4, 0)
+        metadata.linear_state_indices = torch.arange(sequences, dtype=torch.int32)
+        metadata.q_cu_seq_lens = torch.arange(rows + 1, dtype=torch.int32)
+        metadata.kv_cu_seq_lens = torch.arange(rows + 1, dtype=torch.int32)
+        return metadata
+
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=8,
+            max_model_len=16,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=2,
+        )
+        for rank in range(2)
+    ]
+
+    # Marked busy and idle ranks share one expanded plan: the DSV4/DSpark
+    # production flow once the step type is marked group-wide.
+    busy = dspark_rows(4, 2)
+    busy.is_spec_verify = True
+    empty = dspark_rows(1, 1)
+    empty.is_spec_verify = True
+    busy_plan = runners[0]._shared_graph_plan(busy, 4)
+    empty_plan = runners[1]._shared_graph_plan(empty, 1)
+    assert busy_plan == empty_plan == (True, 2, 2)
+
+    # Unmarked expanded-looking rows used to be shape-inferred into a private
+    # expanded graph on the busy rank only (the idle rank captured width 1
+    # and the plans diverged); now they are a loud contract error.
+    unmarked = dspark_rows(4, 2)
+    with pytest.raises(RuntimeError, match="group-wide spec verify"):
+        runners[0]._shared_graph_plan(unmarked, 4)
+    # The idle rank's unmarked dummy row cannot see the busy layout and stays
+    # width 1.
+    assert runners[1]._shared_graph_plan(dspark_rows(1, 1), 1) == (False, 1, 4)
 
 
 def test_dp_plain_decode_with_empty_rank_keeps_width_one() -> None:
@@ -1810,16 +1897,16 @@ class _StoppedAfterCaptureError(Exception):
     """Sentinel raised at the replay boundary, after a successful capture."""
 
 
-class _StopAtReplayStream:
-    """``self._stream`` stand-in that stops ``execute`` at the replay.
+class _SentinelGraph:
+    """Stub captured graph that stops ``execute`` at the replay boundary.
 
-    ``execute`` only reaches ``self._stream.wait_stream(...)`` after the first
-    capture has completed and been registered, so raising from ``wait_stream``
-    keeps the test device-free while still exercising the capture-then-register
+    ``execute`` only reaches ``entry.graph.replay()`` after the first capture
+    has completed and been registered, so raising from ``replay`` keeps the
+    test device-free while still exercising the capture-then-register
     ordering.
     """
 
-    def wait_stream(self, *args: object, **kwargs: object) -> None:
+    def replay(self) -> None:
         raise _StoppedAfterCaptureError
 
 
@@ -1833,12 +1920,11 @@ def _engram_execute_harness(
 
     Only ``_allocate_entry`` / ``_fill_entry`` / ``_capture`` and the backend
     ``prepare`` are stubbed; ``execute`` itself -- the gate call, the capture
-    call and the registration that follows it -- runs for real. ``_stream``
-    raises :class:`_StoppedAfterCaptureError` from ``wait_stream`` so a
-    successful capture stops right after registration, before the replay block
-    (no device needed); when ``capture_error`` is set the stubbed ``_capture``
-    raises it instead. ``torch.npu`` is stubbed to the single entry point used
-    on that path so the test does not require an NPU.
+    call and the registration that follows it -- runs for real. The stub
+    capture installs a :class:`_SentinelGraph` whose ``replay`` raises
+    :class:`_StoppedAfterCaptureError` so a successful capture stops right
+    after registration, at the replay boundary (no device needed); when
+    ``capture_error`` is set the stubbed ``_capture`` raises it instead.
     """
 
     class _EngramModel(nn.Module):
@@ -1865,7 +1951,10 @@ def _engram_execute_harness(
     model = _EngramModel()
     backend = SimpleNamespace(page_size=4, is_mla=False, prepare=lambda *args, **kwargs: None)
     runner = DecodeAclGraphRunner(model, backend, torch.device("cpu"), max_batch=8, max_model_len=8)
-    runner._stream = _StopAtReplayStream()
+    # Replay runs on the caller's current stream; the dedicated capture stream
+    # only exists on NPU. A truthy placeholder skips the lazy NPU stream
+    # creation (the stubbed _capture never dereferences it).
+    runner._stream = SimpleNamespace()
     graphs = _KeyRecordingDict()
     runner._graphs = graphs
 
@@ -1874,10 +1963,12 @@ def _engram_execute_harness(
             static_metadata=SimpleNamespace(),
             static_input_ids=input_ids,
             static_positions=positions,
+            static_input_embedding=None,
             execution_state=object(),
             execution_contexts={},
             eplb=None,
             graph=None,
+            graph_tasks=[],
         )
 
     capture_calls: list[Any] = []
@@ -1886,13 +1977,18 @@ def _engram_execute_harness(
         capture_calls.append(entry)
         if capture_error is not None:
             raise capture_error
+        entry.graph = _SentinelGraph()
+        entry.static_output = torch.zeros_like(entry.static_input_ids)
 
     monkeypatch.setattr(runner, "_allocate_entry", fake_allocate_entry)
     monkeypatch.setattr(runner, "_fill_entry", lambda *args, **kwargs: None)
+    # The DSA pre-capture pass (when the backend declares the contract) runs
+    # the eager static forward; stub it so the harness stays model- and
+    # device-free.
+    monkeypatch.setattr(runner, "_forward_static", lambda entry: None)
     monkeypatch.setattr(runner, "_capture", fake_capture)
-    # The only ``torch.npu`` call reached on this path is the replay-boundary
-    # ``current_stream`` lookup, right before ``_stream.wait_stream`` raises.
-    monkeypatch.setattr(torch, "npu", SimpleNamespace(current_stream=lambda: None), raising=False)
+    # The replay runs on the caller's current stream, so no ``torch.npu``
+    # entry point is reached on this path while ``graph_tasks`` is empty.
     return runner, model, capture_calls, graphs
 
 
@@ -1948,6 +2044,62 @@ def test_acl_runner_execute_registers_only_after_successful_capture(
     graph_key = graphs.keys_written[0]
     assert runner._graphs.get(graph_key) is capture_calls[0]
     assert len(runner._graphs) == 1
+
+
+def test_acl_runner_first_capture_skips_dsa_prerun_without_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-DSA backends keep the historical capture path unchanged.
+
+    The eager pre-capture forward exists only to materialize the persistent
+    DSA metadata outside the captured region; a backend without
+    ``prepare_dsa_metadata_for_forward`` must not run it.
+    """
+
+    runner, model, capture_calls, graphs = _engram_execute_harness(monkeypatch, staged=True)
+    forward_calls: list[Any] = []
+    monkeypatch.setattr(runner, "_forward_static", lambda entry: forward_calls.append(entry))
+    input_ids, positions, metadata = _engram_execute_inputs()
+
+    with pytest.raises(_StoppedAfterCaptureError):
+        runner.execute(input_ids, positions, metadata)
+
+    assert forward_calls == [], "non-DSA backends must not run the pre-capture forward"
+    assert len(capture_calls) == 1
+
+
+def test_acl_runner_first_capture_runs_dsa_prerun_before_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DSA-contract backends get one eager static forward before the capture.
+
+    The pre-run binds the persistent DSA metadata at stable addresses; it
+    must complete before ``_capture`` records the region.
+    """
+
+    runner, model, capture_calls, graphs = _engram_execute_harness(monkeypatch, staged=True)
+    runner.attention_backend = SimpleNamespace(
+        page_size=4,
+        is_mla=False,
+        prepare=lambda *args, **kwargs: None,
+        prepare_dsa_metadata_for_forward=lambda metadata: None,
+    )
+    events: list[str] = []
+    monkeypatch.setattr(runner, "_forward_static", lambda entry: events.append("forward"))
+    harness_capture = runner._capture
+
+    def recording_capture(entry: Any) -> None:
+        events.append("capture")
+        harness_capture(entry)
+
+    monkeypatch.setattr(runner, "_capture", recording_capture)
+    input_ids, positions, metadata = _engram_execute_inputs()
+
+    with pytest.raises(_StoppedAfterCaptureError):
+        runner.execute(input_ids, positions, metadata)
+
+    assert events == ["forward", "capture"], "the DSA pre-run must precede the capture"
+    assert len(capture_calls) == 1
 
 
 def test_acl_runner_execute_leaves_no_entry_when_capture_raises(

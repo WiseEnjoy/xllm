@@ -49,9 +49,12 @@ from xllm.python.attention.dsa_metadata import (
     build_cache_specs,
 )
 from xllm.python.model_executor.forward_context import (
+    copy_into_execution_buffer,
     get_forward_context,
     get_forward_context_or_none,
+    in_acl_graph,
 )
+from xllm.python.platform import current_platform
 
 if TYPE_CHECKING:
     from xllm.python.attention.backend import AttentionMetadata
@@ -67,6 +70,11 @@ HEAVILY_COMPRESSED_ATTENTION = "heavily_compressed_attention"
 _MASK_MODE_RIGHT_DOWN_CAUSAL = 3
 _MASK_MODE_COMPRESS = 4
 _DSPARK_SWA_INDEX_ALIGNMENT = 128
+
+
+def _uses_a5_sparse_kernels() -> bool:
+    """Whether DeepSeek-V4 should use the Ascend A5 sparse kernels."""
+    return current_platform.get_ascend_soc_generation() == "a5"
 
 
 def _uses_prefill_attention(metadata: AttentionMetadata) -> bool:
@@ -197,6 +205,13 @@ class DsaAttentionBackend(AttentionBackend):
     layer's compression ratio.
     """
 
+    # Whether graph-mode metadata prep must build the SWA window-source
+    # indices outside the capture. The captured V4 sparse kernels consume
+    # those indices; Csa2AttentionBackend (V4.1) computes its window logic
+    # in-forward and overrides this to False, so the shared A5 graph branch
+    # never drags it into the V4-only window-source state.
+    graph_uses_swa_window_sources: bool = True
+
     def __init__(
         self,
         compress_ratios: list[int],
@@ -232,6 +247,9 @@ class DsaAttentionBackend(AttentionBackend):
         self.dspark_block_size = dspark_block_size
         self.dspark_use_native_sas = dspark_use_native_sas
         self._dspark_swa_location: tuple[int, int, int] | None = None
+        self._swa_window_layer_specs: list[tuple[int, int]] | None = None
+        self._swa_window_sources: torch.Tensor | None = None
+        self._swa_window_row_map: list[int] = []
         for layer_id, layer_caches in enumerate(self.caches_info):
             for cache_id, cache_info in enumerate(layer_caches):
                 if cache_info.cache_type == DSA_CACHE_SLIDING_WINDOW:
@@ -303,12 +321,30 @@ class DsaAttentionBackend(AttentionBackend):
         """Build compressed-attention metadata in the current model forward."""
         metadata = self._metadata if metadata is None else metadata
         assert metadata is not None
+        if bool(getattr(metadata, "dsa_graph_mode", False)) and getattr(metadata, "dsa_metadata", None) is not None:
+            # ACL graph capture: bind the persistent DSA built before the
+            # capture and DO NOT relaunch the AICPU metadata kernels inside
+            # the captured region. The T4 tiling metadata is
+            # value-independent within a block-count regime, so the
+            # capture-time content stays correct for the replayed walks;
+            # the value-bearing inputs (seqused cmp/residual, block tables,
+            # slots, window sources) are rewritten eagerly by the per-step
+            # refresh (see refresh_dsa_metadata_for_graph_replay and
+            # _get_graph_cmp_seqused). Rebuilding the metadata in-graph
+            # replays value-locked AICPU state and faults with device error
+            # 507011.
+            persistent = metadata.dsa_metadata
+            if persistent.c1_metadata is None or persistent.c4_metadata is None or persistent.c128_metadata is None:
+                self._build_precomputed_metadata(persistent, metadata)
+            return
         compressed_metadata = self._build_dsa_metadata_for_forward(metadata)
         metadata.dsa_metadata = compressed_metadata
 
     def _build_dsa_metadata_for_forward(
         self,
         metadata: AttentionMetadata,
+        *,
+        include_precomputed: bool = True,
     ) -> DsaMetadata:
         """Build one request's complete DSA metadata without publishing it."""
         multi_block_tables = list(metadata.multi_block_tables)
@@ -376,6 +412,28 @@ class DsaAttentionBackend(AttentionBackend):
             enable_graph=enable_graph,
             graph_block_table_capacity_cols=graph_capacity_cols,
         )
+        if enable_graph and _uses_a5_sparse_kernels() and self.graph_uses_swa_window_sources:
+            self._build_swa_window_sources(compressed_metadata, kv_seq_lens)
+        if enable_graph and self._builder.outputs_have_padding:
+            # Remap padding-lane -1 block-table entries to the reserved
+            # block 0 (the tables may live on either the host or the
+            # device -- the engine hands device tensors to the builder, and
+            # a device-side masked fill is still an eager op here, outside
+            # the captured region). The CANN compressor/indexer kernels do
+            # not guard against -1 block ids and compute invalid device
+            # addresses from them (device error 507011). Block 0 holds
+            # garbage data at valid addresses and the kernels only consume
+            # data within the refreshed seqused bounds. The window source
+            # builder above already ran: it masks invalid blocks explicitly
+            # and must see the raw -1 placeholders.
+            # The masked fill is skipped when the builder produced no
+            # padding lanes (shape-matched clone / full ring gather): the
+            # runner pre-clamps its tables, so nothing can be negative and
+            # the fill would only burn a [batch, width] device op per
+            # manager on every refresh.
+            for bt in compressed_metadata.manager_block_tables:
+                if bt is not None and bt.numel() > 0:
+                    bt[bt < 0] = 0
         # Capacity-bucket bound (token rows) baked into the captured graph's
         # committed-row gathers. The decode-graph runner fixes it once per graph
         # entry; it must stay constant across replays of that entry or the
@@ -389,7 +447,8 @@ class DsaAttentionBackend(AttentionBackend):
         if getattr(metadata, "dsa_cos_sin", None) is not None and metadata.dsa_cos_sin.numel() > 0:
             compressed_metadata.input_rope_by_ratio = self._build_dsa_rope_metadata(compressed_metadata, metadata)
         self._move_metadata_to_device(compressed_metadata)
-        self._build_precomputed_metadata(compressed_metadata, metadata)
+        if include_precomputed:
+            self._build_precomputed_metadata(compressed_metadata, metadata)
         return compressed_metadata
 
     def _build_empty_dp_block_tables(
@@ -451,6 +510,42 @@ class DsaAttentionBackend(AttentionBackend):
             )
         return normalized
 
+    def _get_graph_cmp_seqused(
+        self,
+        compress_ratio: int,
+        seq_kv: torch.Tensor,
+        *,
+        graph_decode: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Bind persistent cmp seqused/residual tensors for graph decode.
+
+        An in-graph ``seq_kv // ratio`` / ``seq_kv % ratio`` derivation reads
+        the refreshed values through captured elementwise ops and faults the
+        attention kernel on the first value-changing replay with device error
+        507011 (verified by per-layer pinning: the fault follows the first
+        c4 layer left unpinned). The capture pre-run therefore derives both
+        eagerly and lands them in execution buffers; the captured forward
+        (and every replay) binds the buffer addresses directly, and
+        ``refresh_dsa_metadata_for_graph_replay`` rewrites their content with
+        eager derivations outside the graph -- the same pattern as every
+        other refreshed field (block tables, slots, window sources).
+        """
+        if not graph_decode:
+            return None
+        state = get_forward_context().execution_state
+        if state is None:
+            return None
+        key_cmp = ("dsv4_cmp_seqused", compress_ratio)
+        key_res = ("dsv4_cmp_residual", compress_ratio)
+        if key_cmp in state.persistent_buffers:
+            return (state.persistent_buffers[key_cmp], state.persistent_buffers[key_res])
+        cmp = seq_kv // compress_ratio
+        residual = seq_kv % compress_ratio
+        return (
+            copy_into_execution_buffer(key_cmp, cmp),
+            copy_into_execution_buffer(key_res, residual),
+        )
+
     def refresh_dsa_metadata_for_graph_replay(
         self,
         metadata: AttentionMetadata | None = None,
@@ -460,8 +555,111 @@ class DsaAttentionBackend(AttentionBackend):
         if metadata is None or metadata.dsa_metadata is None:
             raise RuntimeError("ACL graph DSA metadata must be captured before replay")
         persistent = metadata.dsa_metadata
-        refreshed = self._build_dsa_metadata_for_forward(metadata)
+        # Rebuild the input views AND the AICPU tiling metadata. The tiling
+        # must be rebuilt per step: the captured attention kernels walk as
+        # deep as the refreshed seqused, and a stale T4 only describes the
+        # capture-time depth. The copy lands the fresh build at the address
+        # the graph bound. (The cmp seqused/residual stay off-graph -- see
+        # _get_graph_cmp_seqused.)
+        refreshed = self._build_dsa_metadata_for_forward(
+            metadata,
+            include_precomputed=True,
+        )
         self._copy_graph_dsa_metadata(persistent, refreshed)
+        # Rewrite the persistent cmp seqused/residual buffers the captured
+        # forward binds (see _get_graph_cmp_seqused). The derivations run
+        # eagerly here -- fresh kernel launches every step, never captured --
+        # so the replayed attention kernels read the refreshed values through
+        # the buffer copy instead of through re-executed in-graph ops.
+        _state = get_forward_context_or_none()
+        _exec_state = getattr(_state, "execution_state", None) if _state is not None else None
+        if _exec_state is not None:
+            for _key in list(_exec_state.persistent_buffers):
+                if not (
+                    isinstance(_key, tuple) and len(_key) == 2 and _key[0] in ("dsv4_cmp_seqused", "dsv4_cmp_residual")
+                ):
+                    continue
+                _ratio = _key[1]
+                if _key[0] == "dsv4_cmp_seqused":
+                    _src = persistent.actual_seq_lengths_kv // _ratio
+                else:
+                    _src = persistent.actual_seq_lengths_kv % _ratio
+                copy_into_execution_buffer(_key, _src)
+        # Rewrite the slot-guard snapshots bound by the captured KV scatters.
+        # _slot_guard_tensors derives long/device copies plus a clamp-min
+        # view once per (slot_mapping, update_rows) and the captured
+        # scatter_nd_update binds those derived tensors. The refreshed slot
+        # mappings themselves are rewritten in place by the copy above, so
+        # without this rewrite every replay would scatter the new tokens'
+        # KV to the capture-time slots while the refreshed block tables and
+        # window sources read the current slots, leaving the newest tokens'
+        # real cache slots unwritten (uninitialized memory in the SWA
+        # window, exploding rows and RMSNorm-overflow zero logits).
+        # Only this entry's guards are rewritten: each graph entry owns the
+        # guards it captured (see _slot_guard_tensors), so a replay never
+        # pays for -- or depends on -- another entry's or another backend's
+        # guards.
+        _guard_caches = []
+        if _exec_state is not None:
+            _entry_guards = _exec_state.persistent_buffers.get(_SLOT_GUARD_STATE_KEY)
+            if _entry_guards:
+                _guard_caches.append(_entry_guards)
+        _guard_caches.append(_graph_slot_guard_cache)
+        for _guard_cache in _guard_caches:
+            for _guard in _guard_cache:
+                _g_sm, _g_rows, _g_dev, _g_slots, _g_safe, _g_mask = _guard
+                _g_fresh = _g_sm.reshape(-1).to(device=_g_dev, dtype=torch.long)[:_g_rows]
+                _g_slots.copy_(_g_fresh)
+                _g_safe.copy_(_g_fresh.clamp_min(0))
+                _g_mask.copy_(_g_fresh.ge(0).unsqueeze(1))
+        # Rewrite the cached qli_v2 tuple's seqused_k/residual_k in place so
+        # the in-graph indexer's walk depth stays consistent with the
+        # attention's cmp seqused buffers (a stale tuple walks a shallower
+        # index cache than the refreshed attention expects and faults with
+        # device error 507011 on the first value-changing replay).
+        if _exec_state is not None:
+            _qli_t = getattr(persistent, "qli_v2_metadata", None)
+            if _qli_t is not None and len(_qli_t) == 4:
+                _qli_t[1].copy_(persistent.actual_seq_lengths_kv // 4, non_blocking=True)
+                _qli_t[2].copy_(persistent.actual_seq_lengths_kv % 4, non_blocking=True)
+        # Rewrite the cached QLI expanded RoPE in place. The indexer's partial
+        # rotary consumes the repeat_interleave'd full-width cos/sin, and the
+        # capture hit this cache (keyed on the persistent tables' identity,
+        # stable because graph capture binds the persistent metadata instead
+        # of rebuilding it), so the expansion op itself never entered the
+        # graph: without this rewrite every replay would rotate the indexer
+        # query with the pre-run positions' rope, silently degrading the
+        # sparse block selection as sequences grow past the capture depth.
+        _qli_rope = getattr(persistent, "qli_expanded_rope", None)
+        _cos_table = getattr(persistent, "cos_table", None)
+        _sin_table = getattr(persistent, "sin_table", None)
+        if _qli_rope and _cos_table is not None and _sin_table is not None:
+            _cos_v = _cos_table.reshape(-1, _cos_table.size(-1)) if _cos_table.dim() > 2 else _cos_table
+            _sin_v = _sin_table.reshape(-1, _sin_table.size(-1)) if _sin_table.dim() > 2 else _sin_table
+            for _rope_key, (_cos_exp, _sin_exp) in _qli_rope.items():
+                _fresh_cos = _cos_v.to(_rope_key[2]).repeat_interleave(2, dim=-1)
+                _fresh_sin = _sin_v.to(_rope_key[2]).repeat_interleave(2, dim=-1)
+                if _cos_exp.shape != _fresh_cos.shape or _sin_exp.shape != _fresh_sin.shape:
+                    continue
+                _cos_exp.copy_(_fresh_cos, non_blocking=True)
+                _sin_exp.copy_(_fresh_sin, non_blocking=True)
+        # The graph window compact's clamped window length and its seqused
+        # arg are built once (identity-keyed on the persistent kv lens), but
+        # the captured valid-mask op and the attention kernel read them live,
+        # so every refresh rewrites them with the current clamped values. A
+        # capture below the window saturation point otherwise freezes the
+        # walked window at the capture-time length (graph warmup captures at
+        # decode_seq_len=16) while the sequences grow, truncating the SWA
+        # attention for every replay. Each graph entry owns its own state in
+        # the registry; only the state whose key is this entry's persistent
+        # kv-lens tensor is rewritten.
+        for _win_state in getattr(self, "_graph_window_states", None) or []:
+            if _win_state[0] is not persistent.actual_seq_lengths_kv:
+                continue
+            _fresh_lens = persistent.actual_seq_lengths_kv.to(torch.int64).clamp(min=0, max=self.window_size)
+            _win_state[5].copy_(_fresh_lens, non_blocking=True)
+            _win_state[6].copy_(_fresh_lens.to(torch.int32), non_blocking=True)
+            break
 
     @classmethod
     def _copy_graph_dsa_metadata(
@@ -508,28 +706,20 @@ class DsaAttentionBackend(AttentionBackend):
             pad_value=-1,
         )
 
-        if len(persistent.block_tables) != len(refreshed.block_tables):
-            raise RuntimeError("ACL graph DSA block-table layer count changed")
-        if len(persistent.slot_mappings) != len(refreshed.slot_mappings):
-            raise RuntimeError("ACL graph DSA slot-mapping layer count changed")
-        for layer_id, (persistent_layer, refreshed_layer) in enumerate(
-            zip(persistent.block_tables, refreshed.block_tables, strict=True)
-        ):
-            cls._copy_graph_tensor_list(
-                persistent_layer,
-                refreshed_layer,
-                f"block_tables[{layer_id}]",
-                pad_value=-1,
-            )
-        for layer_id, (persistent_layer, refreshed_layer) in enumerate(
-            zip(persistent.slot_mappings, refreshed.slot_mappings, strict=True)
-        ):
-            cls._copy_graph_tensor_list(
-                persistent_layer,
-                refreshed_layer,
-                f"slot_mappings[{layer_id}]",
-                pad_value=-1,
-            )
+        # Each layer grid aliases one manager tensor. Copy managers only;
+        # copying the grid would repeat every H2D transfer once per layer.
+        cls._copy_graph_tensor_list(
+            persistent.manager_block_tables,
+            refreshed.manager_block_tables,
+            "manager_block_tables",
+            pad_value=-1,
+        )
+        cls._copy_graph_tensor_list(
+            persistent.manager_slot_mappings,
+            refreshed.manager_slot_mappings,
+            "manager_slot_mappings",
+            pad_value=-1,
+        )
 
         if persistent.input_rope_by_ratio.keys() != refreshed.input_rope_by_ratio.keys():
             raise RuntimeError("ACL graph DSA RoPE ratio set changed")
@@ -542,10 +732,10 @@ class DsaAttentionBackend(AttentionBackend):
         persistent.max_seq_len = refreshed.max_seq_len
         persistent.sparse_metadata_ori_win_left = getattr(refreshed, "sparse_metadata_ori_win_left", -1)
         persistent.is_acl_graph = refreshed.is_acl_graph
+        persistent.precomputed_metadata_inputs = refreshed.precomputed_metadata_inputs
         # The capture-time capacity bound is re-derived from the same static
         # entry metadata, so this is a no-op unless the entry changed buckets.
         persistent.graph_token_capacity = int(getattr(refreshed, "graph_token_capacity", 0) or 0)
-        persistent.precomputed_metadata_inputs = refreshed.precomputed_metadata_inputs
 
     @classmethod
     def _copy_graph_tensor_list(
@@ -729,8 +919,10 @@ class DsaAttentionBackend(AttentionBackend):
             cos, sin = self._slice_cos_sin_cache(cos_sin_cache)
             pair = (cos, sin)
         compressed_metadata.layer_id = layer_id
-        compressed_metadata.cos_table = pair[0].contiguous()
-        compressed_metadata.sin_table = pair[1].contiguous()
+        # Keep the request-shaped views selected above. Materializing them
+        # duplicates the half-width RoPE tables on every layer and forward.
+        compressed_metadata.cos_table = pair[0]
+        compressed_metadata.sin_table = pair[1]
 
     def select_compressed_attention_layer_rope(
         self,
@@ -750,9 +942,9 @@ class DsaAttentionBackend(AttentionBackend):
         metadata = self._metadata if metadata is None else metadata
         css = getattr(metadata, "dsa_cos_sin", None) if metadata is not None else None
         if compressed_metadata.cos_table is None and css is not None and css.numel() > 0:
-            compressed_metadata.cos_table, compressed_metadata.sin_table = (
-                tensor.contiguous() for tensor in css.chunk(2, dim=-1)
-            )
+            cos, sin = css.chunk(2, dim=-1)
+            compressed_metadata.cos_table = cos
+            compressed_metadata.sin_table = sin
         csa_cos_sin = getattr(metadata, "dsa_c4_cos_sin", None) if metadata is not None else None
         if csa_cos_sin is not None and compressed_metadata.c4_pad_positions.numel() > 0:
             csa_indices = compressed_metadata.c4_pad_positions.clamp_min(0).long().to(csa_cos_sin.device)
@@ -923,6 +1115,7 @@ class DsaAttentionBackend(AttentionBackend):
                 ori_block_table,
                 self.window_size,
                 cp_ctx.local_kv_cu_seq_lens if cp_enabled else None,
+                use_zero_based_blocks=_uses_a5_sparse_kernels(),
             )
         else:
             if ori_kv is not None and ori_slot is not None:
@@ -980,7 +1173,6 @@ class DsaAttentionBackend(AttentionBackend):
         seq_q = compressed_metadata.actual_seq_lengths_query
         seq_kv = compressed_metadata.actual_seq_lengths_kv
         sparse_meta_for_kernel = sparse_meta
-        ori_block_table_for_kernel = ori_block_table_for_attn
         cmp_block_table_for_kernel = cmp_block_table
         # Match C++ DSAttention's optional contract exactly: prefill and
         # chunked prefill pass query cu-seqlens, while decode leaves
@@ -994,6 +1186,40 @@ class DsaAttentionBackend(AttentionBackend):
             cu_seqlens_ori_kv_for_attn = cp_ctx.local_kv_cu_seq_lens if cp_enabled else seq_q
         else:
             cu_seqlens_ori_kv_for_attn = None
+        seqused_ori_kernel: torch.Tensor | None = None
+        seqused_cmp_kernel: torch.Tensor | None = None
+        cmp_residual_kernel: torch.Tensor | None = None
+        if _uses_a5_sparse_kernels():
+            seqused_ori_kernel = seq_kv
+            if not use_prefill_attn:
+                if bool(getattr(metadata, "dsa_graph_mode", False)):
+                    ori_kv_for_attn, ori_block_table_for_attn, seqused_ori_kernel = self._graph_window_compact(
+                        ori_kv_for_attn, seq_kv, layer_id
+                    )
+                else:
+                    ori_kv_for_attn, ori_block_table_for_attn, seqused_ori_kernel = self._decode_window_compact_eager(
+                        ori_kv_for_attn, ori_block_table_for_attn, seq_kv
+                    )
+            if compress_ratio > 1:
+                # Graph decode: read the cmp seqused/residual from persistent
+                # tensors the per-step refresh rewrites (eager derivation
+                # outside the graph). An in-graph ``seq_kv // ratio`` /
+                # ``% ratio`` derivation reads the refreshed values through
+                # captured elementwise ops and faults the attention kernel on
+                # the first value-changing replay with device error 507011
+                # (verified: pinning the derived tensors per layer moves the
+                # fault to the next unpinned c4 layer). Eager paths (draft,
+                # fallback, prefill) keep the direct derivation.
+                graph_cmp = self._get_graph_cmp_seqused(
+                    compress_ratio,
+                    seq_kv,
+                    graph_decode=(not use_prefill_attn) and bool(getattr(metadata, "dsa_graph_mode", False)),
+                )
+                if graph_cmp is not None:
+                    seqused_cmp_kernel, cmp_residual_kernel = graph_cmp
+                else:
+                    seqused_cmp_kernel = seq_kv // compress_ratio
+                    cmp_residual_kernel = seq_kv % compress_ratio
         sinks = getattr(layer, "attn_sink", None) if getattr(layer, "attn_sink_loaded", False) else None
         if sinks is not None:
             sinks = sinks.to(q.device, dtype=torch.float32).contiguous()
@@ -1017,7 +1243,7 @@ class DsaAttentionBackend(AttentionBackend):
             cmp_kv=cmp_kv if compress_ratio > 1 else None,
             ori_sparse_indices=ori_sparse_indices,
             cmp_sparse_indices=compress_topk_idxs,
-            ori_block_table=ori_block_table_for_kernel,
+            ori_block_table=ori_block_table_for_attn,
             cmp_block_table=cmp_block_table_for_kernel if compress_ratio > 1 else None,
             cu_seqlens_q=seq_q,
             cu_seqlens_ori_kv=cu_seqlens_ori_kv_for_attn,
@@ -1026,6 +1252,9 @@ class DsaAttentionBackend(AttentionBackend):
             cu_seqlens_cmp_kv=None,
             seqused_q=None,
             seqused_kv=seq_kv,
+            seqused_ori_kv=seqused_ori_kernel,
+            seqused_cmp_kv=seqused_cmp_kernel,
+            cmp_residual_kv=cmp_residual_kernel,
             # sinks: the attention sink parameter (attn_sink) is required by the
             # sparse_attn_sharedkv kernel (C++ :949 passes attn_sink_ when loaded).
             sinks=sinks,
@@ -1208,6 +1437,23 @@ class DsaAttentionBackend(AttentionBackend):
         max_q = forward_meta.q_max_seq_len if max_query_len_override is None else max_query_len_override
         max_kv = forward_meta.kv_max_seq_len if max_seq_len_override is None else max_seq_len_override
         is_prefill = _uses_prefill_attention(metadata)
+        # ACL graph captures bake the max_seqlen int args into the captured
+        # tiling of the AICPU metadata kernels. A replay whose refreshed
+        # device-side seqused exceeds the baked bound faults in-kernel with
+        # device error 507011: a graph captured at kv=100 faults once the
+        # context grows past it, and a c128 graph captured below position 128
+        # (baked max 0) faults when the compressed cache first activates.
+        # Graph captures therefore pin the baked maxima to the replay domain
+        # bounds -- the ori path never sees more than the clamped window
+        # (plus the draft block), and the compressed paths are bounded by the
+        # graph entry's kv capacity. Eager builds keep the exact per-batch
+        # maxima.
+        graph_capture = not is_prefill and bool(getattr(metadata, "dsa_graph_mode", False))
+        ori_kv_capacity = 0
+        kv_capacity = 0
+        if graph_capture:
+            ori_kv_capacity = self.window_size + max(self.dspark_block_size, 0)
+            kv_capacity = int(getattr(metadata, "dsa_graph_kv_capacity", 0) or 0)
         if is_prefill:
             compressed_metadata.explicit_swa_indices = None
         else:
@@ -1230,33 +1476,90 @@ class DsaAttentionBackend(AttentionBackend):
             self._use_native_sas(is_prefill),
         )
         compressed_metadata.sparse_metadata_ori_win_left = ori_win_left
+        use_a5 = _uses_a5_sparse_kernels()
         for ratio in (1, 4, 128):
             has_cmp = ratio > 1
             cmp_topk = self.index_topk if ratio == 4 else 0
-            sparse_metadata = kernels.sparse_attn_sharedkv_metadata(
-                num_heads_q=self.num_heads,
-                num_heads_kv=1,
-                head_dim=self.head_dim,
-                cu_seqlens_q=seq_q,
-                cu_seqlens_ori_kv=cu_seqlens_ori_kv,
-                cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
-                seqused_q=seqused_q,
-                seqused_kv=seqused_kv,
-                batch_size=batch_size,
-                max_seqlen_q=max_q,
-                max_seqlen_kv=max_kv,
-                ori_topk=0,
-                cmp_topk=cmp_topk,
-                cmp_ratio=ratio,
-                ori_mask_mode=_MASK_MODE_COMPRESS,
-                cmp_mask_mode=_MASK_MODE_RIGHT_DOWN_CAUSAL,
-                ori_win_left=ori_win_left,
-                ori_win_right=0,
-                layout_q="TND",
-                layout_kv="PA_ND",
-                has_ori_kv=True,
-                has_cmp_kv=has_cmp,
-            )
+            if use_a5:
+                seqused_ori_kv = seq_kv if is_prefill else seq_kv.clamp(max=self.window_size)
+                seqused_cmp_kv = seq_kv // ratio if has_cmp else None
+                cmp_residual_kv = seq_kv % ratio if has_cmp else None
+                # Pin the capture-time baked maxima to the replay domain
+                # bounds (see graph_capture above); eager builds keep the
+                # exact per-batch maxima.
+                max_ori_kv_arg = int(max_kv)
+                max_cmp_kv_arg = int(max_kv) // ratio if has_cmp else 0
+                if graph_capture:
+                    # Pin the capture-time baked maxima to the replay domain
+                    # bounds (see graph_capture above); eager builds keep the
+                    # exact per-batch maxima. The ori bound must be the
+                    # entry's kv capacity, exactly like the cmp and indexer
+                    # bounds: the per-row metadata descriptors track the
+                    # absolute kv position, so a max_kv-derived bound grows
+                    # past the domain baked into the captured kernel launch
+                    # and later rows fall outside it (their attention rows
+                    # compute as zeros on every replay after the context
+                    # crosses the capture-time bound).
+                    if kv_capacity > 0:
+                        max_ori_kv_arg = max(max_ori_kv_arg, kv_capacity)
+                    else:
+                        max_ori_kv_arg = max(max_ori_kv_arg, ori_kv_capacity)
+                    if has_cmp and kv_capacity > 0:
+                        max_cmp_kv_arg = max(max_cmp_kv_arg, kv_capacity // ratio)
+                sparse_metadata = kernels.sparse_flash_mla_metadata(
+                    num_heads_q=self.num_heads,
+                    num_heads_kv=1,
+                    head_dim=self.head_dim,
+                    cu_seqlens_q=seq_q,
+                    cu_seqlens_ori_kv=None,
+                    cu_seqlens_cmp_kv=None,
+                    seqused_q=None,
+                    seqused_ori_kv=seqused_ori_kv,
+                    seqused_cmp_kv=seqused_cmp_kv,
+                    cmp_residual_kv=cmp_residual_kv,
+                    ori_topk_length=None,
+                    cmp_topk_length=None,
+                    batch_size=batch_size,
+                    max_seqlen_q=max_q,
+                    max_seqlen_ori_kv=max_ori_kv_arg,
+                    max_seqlen_cmp_kv=max_cmp_kv_arg,
+                    ori_topk=0,
+                    cmp_topk=cmp_topk,
+                    cmp_ratio=ratio,
+                    ori_mask_mode=_MASK_MODE_COMPRESS,
+                    cmp_mask_mode=_MASK_MODE_RIGHT_DOWN_CAUSAL,
+                    ori_win_left=ori_win_left,
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_BBND",
+                    has_ori_kv=True,
+                    has_cmp_kv=has_cmp,
+                )
+            else:
+                sparse_metadata = kernels.sparse_attn_sharedkv_metadata(
+                    num_heads_q=self.num_heads,
+                    num_heads_kv=1,
+                    head_dim=self.head_dim,
+                    cu_seqlens_q=seq_q,
+                    cu_seqlens_ori_kv=cu_seqlens_ori_kv,
+                    cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                    seqused_q=seqused_q,
+                    seqused_kv=seqused_kv,
+                    batch_size=batch_size,
+                    max_seqlen_q=max_q,
+                    max_seqlen_kv=max_kv,
+                    ori_topk=0,
+                    cmp_topk=cmp_topk,
+                    cmp_ratio=ratio,
+                    ori_mask_mode=_MASK_MODE_COMPRESS,
+                    cmp_mask_mode=_MASK_MODE_RIGHT_DOWN_CAUSAL,
+                    ori_win_left=ori_win_left,
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_ND",
+                    has_ori_kv=True,
+                    has_cmp_kv=has_cmp,
+                )
             if ratio == 1:
                 compressed_metadata.c1_metadata = sparse_metadata
             elif ratio == 4:
@@ -1266,17 +1569,50 @@ class DsaAttentionBackend(AttentionBackend):
         query_lens = seq_q[1:].clone() if seq_q.numel() > 1 else compressed_metadata.seq_lens_q
         key_lens = compressed_metadata.seq_lens if compressed_metadata.seq_lens.numel() else seq_kv
         compressed_metadata.precomputed_metadata_inputs += (query_lens, key_lens)
-        compressed_metadata.qli_metadata = kernels.quant_lightning_indexer_metadata(
-            num_heads_q=max(self.index_n_heads, 1),
-            num_heads_k=1,
-            head_dim=max(self.index_head_dim, 1),
-            actual_seq_lengths_query=query_lens,
-            actual_seq_lengths_key=key_lens,
-            max_seqlen_q=max(max_q, 1),
-            max_seqlen_k=max(max_kv, 1),
-            sparse_count=self.index_topk,
-            cmp_ratio=4,
-        )
+        if use_a5:
+            key_lens_comp = (key_lens // 4).to(torch.int32)
+            cmp_residual_k = (key_lens % 4).to(torch.int32)
+            query_len_cumsum = seq_q if seq_q.numel() > 1 else compressed_metadata.kv_cu_seq_lens
+            compressed_metadata.precomputed_metadata_inputs += (
+                query_len_cumsum,
+                key_lens,
+                key_lens_comp,
+                cmp_residual_k,
+            )
+            compressed_metadata.qli_metadata = kernels.quant_lightning_indexer_v2_metadata(
+                cu_seqlens_q=query_len_cumsum,
+                cu_seqlens_k=None,
+                seqused_q=None,
+                seqused_k=key_lens_comp,
+                cmp_residual_k=cmp_residual_k,
+                num_heads_q=max(self.index_n_heads, 1),
+                num_heads_k=1,
+                head_dim=max(self.index_head_dim, 1),
+                topk=self.index_topk,
+                quant_mode=2,
+                batch_size=int(max(key_lens_comp.size(0), 1)),
+                max_seqlen_q=max(max_q, 1),
+                max_seqlen_k=(
+                    max(max(max_kv, 1), kv_capacity // 4) if graph_capture and kv_capacity > 0 else max(max_kv, 1)
+                ),
+                layout_q="TND",
+                layout_k="PA_BBND",
+                mask_mode=_MASK_MODE_RIGHT_DOWN_CAUSAL,
+                cmp_ratio=4,
+                device=str(self.device),
+            )
+        else:
+            compressed_metadata.qli_metadata = kernels.quant_lightning_indexer_metadata(
+                num_heads_q=max(self.index_n_heads, 1),
+                num_heads_k=1,
+                head_dim=max(self.index_head_dim, 1),
+                actual_seq_lengths_query=query_lens,
+                actual_seq_lengths_key=key_lens,
+                max_seqlen_q=max(max_q, 1),
+                max_seqlen_k=max(max_kv, 1),
+                sparse_count=self.index_topk,
+                cmp_ratio=4,
+            )
 
     def _move_metadata_to_device(self, compressed_metadata: DsaMetadata) -> None:
         """Mirror ``deepseek_v4_move_dsa_metadata_to_device`` for eager mode."""
@@ -1304,14 +1640,317 @@ class DsaAttentionBackend(AttentionBackend):
         )
         for name in tensor_fields:
             tensor = getattr(compressed_metadata, name, None)
-            if tensor is not None:
+            # Skip the no-op ``.to`` dispatch for already-placed tensors.
+            if tensor is not None and tensor.device != self.device:
                 setattr(compressed_metadata, name, tensor.to(self.device))
-        for layer_tensors in compressed_metadata.block_tables:
+        host_cache: dict[int, torch.Tensor] = {}
+        device_cache: dict[int, torch.Tensor] = {}
+        use_a5 = _uses_a5_sparse_kernels()
+        self._move_grid_to_device(
+            compressed_metadata,
+            compressed_metadata.manager_block_tables,
+            compressed_metadata.block_tables,
+            host_cache,
+            device_cache,
+            use_a5=use_a5,
+        )
+        if use_a5:
+            self._eager_bt_host = host_cache
+        self._move_grid_to_device(
+            compressed_metadata,
+            compressed_metadata.manager_slot_mappings,
+            compressed_metadata.slot_mappings,
+        )
+
+    def _move_grid_to_device(
+        self,
+        metadata: DsaMetadata,
+        managers: list[torch.Tensor],
+        grids: list[list[torch.Tensor]],
+        host_cache: dict[int, torch.Tensor] | None = None,
+        device_cache: dict[int, torch.Tensor] | None = None,
+        *,
+        use_a5: bool = False,
+    ) -> None:
+        """Move unique manager tables and rebind the layer-grid aliases."""
+        device_managers: list[torch.Tensor] = []
+        for tensor in managers:
+            device_managers.append(tensor.to(self.device))
+        manager_by_id = {id(tensor): device for tensor, device in zip(managers, device_managers)}
+        # Grid entries are usually views of the manager tables (fresh Python
+        # objects, so the id cache misses). Calling ``.to`` on an
+        # already-placed view costs a full no-op dispatch (~14us) and the
+        # per-layer grids add up to hundreds of such calls per forward; a
+        # device comparison is an order of magnitude cheaper.
+        for layer_tensors in grids:
             for index, tensor in enumerate(layer_tensors):
-                layer_tensors[index] = tensor.to(self.device)
-        for layer_tensors in compressed_metadata.slot_mappings:
-            for index, tensor in enumerate(layer_tensors):
-                layer_tensors[index] = tensor.to(self.device)
+                device_tensor = manager_by_id.get(id(tensor))
+                if device_tensor is not None:
+                    layer_tensors[index] = device_tensor
+                elif tensor.device != self.device:
+                    layer_tensors[index] = tensor.to(self.device)
+        if not use_a5 or host_cache is None or device_cache is None:
+            return
+        for host_tensor, device_tensor in zip(managers, device_managers):
+            if host_tensor.device.type == "cpu" and host_tensor.numel() > 0:
+                device_cache[id(host_tensor)] = device_tensor
+                host_cache[device_tensor.data_ptr()] = host_tensor
+
+    def _build_swa_window_layer_specs(self) -> list[tuple[int, int]]:
+        """Resolve the SWA cache index and manager group for each layer."""
+        if self._swa_window_layer_specs is None:
+            specs: list[tuple[int, int]] = []
+            for layer_id, layer_caches in enumerate(self.caches_info):
+                mapping = self._resolve_cache_mapping(
+                    layer_id,
+                    self._layer_compress_ratio(layer_id),
+                )
+                cache_idx = mapping.ori_cache_idx
+                group_id = layer_caches[cache_idx].group_id if 0 <= cache_idx < len(layer_caches) else -1
+                specs.append((cache_idx, group_id))
+            self._swa_window_layer_specs = specs
+        return self._swa_window_layer_specs
+
+    def _build_swa_window_source_indices(
+        self,
+        block_table: torch.Tensor,
+        kv_seq_lens: list[int],
+        *,
+        block_size: int,
+        token: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build SWA manager source indices on the host."""
+        if block_table.dim() != 2:
+            raise ValueError("SWA graph block table must have shape [batch, blocks]")
+        n_seqs = max(len(kv_seq_lens), 1)
+        if block_table.size(0) < n_seqs:
+            raise ValueError(f"SWA graph block table has {block_table.size(0)} rows, but {n_seqs} sequences are active")
+        if block_size <= 0 or self.window_size > block_size:
+            raise ValueError(
+                f"SWA window size {self.window_size} must be positive and no greater than cache block size {block_size}"
+            )
+
+        table_width = int(block_table.size(1))
+        if table_width <= 0:
+            return torch.full((n_seqs, self.window_size), -1, dtype=torch.int64)
+        block_pos = torch.div(token, block_size, rounding_mode="floor").remainder(table_width)
+        # Only the leading block-table columns the window can touch are
+        # pulled to the host; the graph-stable table is padded to the full
+        # graph capacity (thousands of columns) and a full pull would stall
+        # the per-step refresh on a large device-to-host sync.
+        needed_cols = min(table_width, int(block_pos.max().item()) + 1 if block_pos.numel() else 1)
+        host_table = block_table[:n_seqs, :needed_cols].detach().cpu().to(torch.int64)
+        block_id = host_table.gather(1, block_pos)
+        source = block_id.clamp(min=0) * block_size + token.remainder(block_size)
+        return torch.where(
+            valid & block_id.ge(0),
+            source,
+            torch.full_like(source, -1),
+        )
+
+    def _build_swa_window_sources(
+        self,
+        compressed_metadata: DsaMetadata,
+        kv_seq_lens: list[int],
+    ) -> torch.Tensor | None:
+        """Refresh SWA source indices captured by the ACL graph."""
+        specs = self._build_swa_window_layer_specs()
+        n_seqs = max(len(kv_seq_lens), 1)
+        kv_lens = torch.zeros(n_seqs, dtype=torch.int64)
+        if kv_seq_lens:
+            kv_lens[: min(len(kv_seq_lens), n_seqs)] = torch.tensor(kv_seq_lens[:n_seqs], dtype=torch.int64)
+        window_lens = kv_lens.clamp(min=0, max=self.window_size)
+        token = (
+            kv_lens.unsqueeze(1)
+            - window_lens.unsqueeze(1)
+            + torch.arange(self.window_size, dtype=torch.int64).unsqueeze(0)
+        )
+        valid = torch.arange(self.window_size).unsqueeze(0) < window_lens.unsqueeze(1)
+
+        source_rows_by_group: dict[int, int] = {}
+        source_rows: list[torch.Tensor] = []
+        for layer_id, (cache_idx, group_id) in enumerate(specs):
+            if cache_idx < 0 or group_id < 0 or group_id >= len(self.group_infos) or group_id in source_rows_by_group:
+                continue
+            block_table = _get_layer_cache_tensor(
+                compressed_metadata.block_tables,
+                layer_id,
+                cache_idx,
+            )
+            if block_table is None:
+                continue
+            source_rows_by_group[group_id] = len(source_rows)
+            source_rows.append(
+                self._build_swa_window_source_indices(
+                    block_table,
+                    kv_seq_lens,
+                    block_size=self.group_infos[group_id].block_size,
+                    token=token,
+                    valid=valid,
+                )
+            )
+
+        self._swa_window_row_map = [source_rows_by_group.get(group_id, -1) for _, group_id in specs]
+        if not source_rows:
+            self._swa_window_sources = None
+            return None
+
+        sources = torch.stack(source_rows).to(self.device)
+        context = get_forward_context_or_none()
+        if context is None or context.execution_state is None:
+            # Protocol-level metadata tests have no executor context. The
+            # production ACL graph path always carries execution state and
+            # uses a persistent fixed-address buffer.
+            self._swa_window_sources = sources
+        else:
+            self._swa_window_sources = copy_into_execution_buffer(
+                ("dsv4_swa_window_sources",),
+                sources,
+            )
+        return self._swa_window_sources
+
+    def _graph_window_compact(
+        self,
+        ori_kv: torch.Tensor,
+        seq_kv: torch.Tensor,
+        layer_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather the latest SWA window with a graph-stable shape."""
+        if ori_kv.dim() != 4 or ori_kv.size(2) != 1:
+            raise ValueError("SWA graph cache must have shape [blocks, block_size, 1, head_dim]")
+        block_size = int(ori_kv.size(1))
+        if block_size != self.window_size:
+            raise ValueError(f"SWA graph cache block size {block_size} must equal window size {self.window_size}")
+
+        sources = self._swa_window_sources
+        row_map = self._swa_window_row_map
+        if sources is None or sources.dim() != 3:
+            raise RuntimeError("ACL graph SWA source indices were not captured")
+        if layer_id < 0 or layer_id >= len(row_map):
+            raise RuntimeError(f"ACL graph SWA source row is missing for layer {layer_id}")
+        source_row = row_map[layer_id]
+        if source_row < 0 or source_row >= sources.size(0):
+            raise RuntimeError(f"ACL graph SWA source row is missing for layer {layer_id}")
+
+        n_seqs = int(seq_kv.size(0))
+        if sources.size(1) < n_seqs or sources.size(2) != self.window_size:
+            raise RuntimeError("ACL graph SWA source-index shape changed")
+        source_indices = sources[source_row, :n_seqs]
+        source_valid = source_indices.ge(0)
+        safe_indices = source_indices.clamp(
+            min=0,
+            max=ori_kv.numel() // ori_kv.size(-1) - 1,
+        )
+        head_dim = ori_kv.size(-1)
+        gathered = ori_kv.reshape(-1, head_dim)[safe_indices]
+
+        compact_state = getattr(self, "_win_compact_state", None)
+        # Graph entries bind their own window tensors at capture time, so
+        # every state derived under a graph forward is kept in a registry;
+        # the single-slot fallback only serves the latest eager build.
+        graph_states = getattr(self, "_graph_window_states", None)
+        if graph_states is None:
+            graph_states = []
+            self._graph_window_states = graph_states
+        for candidate in graph_states:
+            if (
+                candidate[0] is seq_kv
+                and candidate[1] == n_seqs
+                and candidate[2] == ori_kv.dtype
+                and candidate[3] == seq_kv.device
+            ):
+                compact_state = candidate
+                break
+        if (
+            compact_state is None
+            or compact_state[0] is not seq_kv
+            or compact_state[1] != n_seqs
+            or compact_state[2] != ori_kv.dtype
+            or compact_state[3] != seq_kv.device
+        ):
+            window_lens = seq_kv.to(torch.int64).clamp(min=0, max=self.window_size)
+            offsets = torch.arange(self.window_size, device=seq_kv.device).unsqueeze(0)
+            compact_state = (
+                seq_kv,
+                n_seqs,
+                ori_kv.dtype,
+                seq_kv.device,
+                offsets,
+                window_lens,
+                window_lens.to(torch.int32),
+                torch.arange(n_seqs, device=seq_kv.device, dtype=torch.int32).unsqueeze(1),
+                torch.zeros((), dtype=ori_kv.dtype, device=ori_kv.device),
+            )
+            self._win_compact_state = compact_state
+            if in_acl_graph():
+                graph_states.append(compact_state)
+        _, _, _, _, offsets, window_lens, seqused, compact_bt, zero_scalar = compact_state
+        valid = (offsets < window_lens.unsqueeze(1)) & source_valid
+        compact = torch.where(
+            valid.unsqueeze(-1),
+            gathered,
+            zero_scalar,
+        )
+        compact_kv = compact.reshape(n_seqs, block_size, 1, head_dim)
+        return compact_kv, compact_bt, seqused
+
+    def _decode_window_compact_eager(
+        self,
+        ori_kv: torch.Tensor,
+        ori_bt: torch.Tensor,
+        seq_kv: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather the newest SWA window into a zero-based eager decode cache."""
+        if ori_kv.dim() != 4 or ori_kv.size(2) != 1:
+            raise ValueError("SWA decode cache must have shape [blocks, block_size, 1, head_dim]")
+        if ori_bt.dim() != 2:
+            raise ValueError("SWA decode block table must have shape [batch, blocks]")
+
+        block_size = int(ori_kv.size(1))
+        window = self.window_size
+        n_seqs = seq_kv.size(0)
+        head_dim = ori_kv.size(-1)
+        device = ori_kv.device
+        if block_size <= 0 or window <= 0 or window > block_size:
+            raise ValueError(
+                f"SWA window size {window} must be positive and no greater than cache block size {block_size}"
+            )
+        if ori_bt.size(0) < n_seqs:
+            raise ValueError(f"SWA block table has {ori_bt.size(0)} rows, but {n_seqs} sequences are active")
+
+        kv_cpu = seq_kv.detach().to("cpu", torch.int64)
+        window_lens = kv_cpu.clamp(max=window)
+        token = kv_cpu.unsqueeze(1) - window_lens.unsqueeze(1) + torch.arange(window)
+        valid = torch.arange(window).unsqueeze(0) < window_lens.unsqueeze(1)
+
+        host_cache = getattr(self, "_eager_bt_host", {})
+        bt_cpu = host_cache.get(ori_bt.data_ptr())
+        if bt_cpu is not None:
+            bt_host = bt_cpu.to(torch.int64)
+        else:
+            bt_host = ori_bt.detach().cpu().to(torch.int64)
+
+        width = bt_host.size(1)
+        row_bt = bt_host[:n_seqs]
+        block_pos = (token // block_size) % width
+        block_id = torch.gather(row_bt, 1, block_pos)
+        slot_valid = valid & (block_id >= 0)
+        src = block_id.clamp(min=0) * block_size + (token % block_size)
+        src = torch.where(slot_valid, src, torch.zeros_like(src))
+
+        src_idx = src.to(device)
+        valid_device = slot_valid.to(device)
+        window_lens_device = window_lens.to(torch.int32).to(device)
+        gathered = ori_kv.reshape(-1, head_dim)[src_idx]
+        compact = torch.where(
+            valid_device.unsqueeze(-1),
+            gathered,
+            torch.zeros((), dtype=ori_kv.dtype, device=device),
+        )
+        compact_kv = compact.reshape(n_seqs, block_size, 1, head_dim)
+        compact_bt = torch.arange(n_seqs, device=device, dtype=torch.int32).unsqueeze(1)
+        return compact_kv, compact_bt, window_lens_device
 
 
 # Keep the historical import stable.  There is one implementation and one
@@ -1357,6 +1996,7 @@ def _build_prefill_pa_nd_kv(
     block_table_hint: torch.Tensor | None,
     block_size: int,
     cu_seqlens_dst: torch.Tensor | None = None,
+    use_zero_based_blocks: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Python port of C++ build_prefill_pa_nd_kv (deepseek_sparse_attention.cpp:272-368).
 
@@ -1393,9 +2033,11 @@ def _build_prefill_pa_nd_kv(
         max_blocks_per_req,
     )
 
-    # Block 0 is zero-filled padding block; real blocks are 1-based.
+    # sparse_attn_sharedkv reserves block zero as padding, while
+    # sparse_flash_mla addresses the cache directly with zero-based block ids.
+    block_base = 0 if use_zero_based_blocks else 1
     packed_kv = torch.zeros(
-        total_blocks + 1,
+        total_blocks + block_base,
         block_size,
         kv.size(1),
         kv.size(2),
@@ -1404,7 +2046,7 @@ def _build_prefill_pa_nd_kv(
     )
 
     table_data = [0] * (batch_size * table_cols)
-    next_block = 1
+    next_block = block_base
     for req in range(batch_size):
         q_start = cu[req]
         src_len = cu[req + 1] - q_start
@@ -1435,6 +2077,69 @@ def _get_layer_cache_tensor(
     return layer_tensors[layer_id][cache_idx]
 
 
+_SLOT_GUARD_CACHE_MAX = 16
+_slot_guard_cache: list[tuple[torch.Tensor, int, torch.device, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+# Fallback registry for guards derived under a graph forward that carries no
+# execution state. In production every graph forward (pre-run, warmup and
+# capture) carries its graph entry's execution state, and the guard is pinned
+# onto THAT entry (see _slot_guard_tensors): the entry dies with its graph and
+# releases the tensors, and a replay refreshes only its own guards. The
+# replayed scatter reads the guard addresses directly, so freeing graph-bound
+# guards (which the recycling cache above does once eager forwards push
+# ``_SLOT_GUARD_CACHE_MAX`` fresh entries) hands the device memory to
+# unrelated allocations and faults the replayed scatter with device error
+# 507011.
+_graph_slot_guard_cache: list[tuple[torch.Tensor, int, torch.device, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+# Key under which a graph entry's execution state owns its slot guards.
+_SLOT_GUARD_STATE_KEY = ("dsv4_slot_guards",)
+
+
+def _slot_guard_tensors(
+    slot_mapping: torch.Tensor,
+    update_rows: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reuse index guards for the same slot mapping within recent forwards.
+
+    Graph-decode forwards (pre-run, warmup and capture all carry the entry's
+    execution state) pin every guard they touch onto that graph entry: the
+    capture may bind tensors first derived during the eager pre-run, so a
+    cache hit under a graph forward promotes the entry onto the capturing
+    entry's non-evicting registry.
+    """
+    graph_forward = in_acl_graph()
+    entry_guards = None
+    if graph_forward:
+        _state = get_forward_context_or_none()
+        _exec_state = getattr(_state, "execution_state", None) if _state is not None else None
+        if _exec_state is not None:
+            entry_guards = _exec_state.persistent_buffers.setdefault(_SLOT_GUARD_STATE_KEY, [])
+    for cache in (_slot_guard_cache, _graph_slot_guard_cache, entry_guards):
+        if cache is None:
+            continue
+        for index, entry in enumerate(cache):
+            if entry[0] is slot_mapping and entry[1] == update_rows and entry[2] == device:
+                if cache is _slot_guard_cache and entry_guards is not None:
+                    entry_guards.append(cache.pop(index))
+                return entry[3], entry[4], entry[5]
+
+    slots = slot_mapping.reshape(-1).to(torch.long).to(device)
+    slots_slice = slots[:update_rows]
+    safe_slots = slots_slice.clamp_min(0)
+    valid_mask = slots_slice.ge(0).unsqueeze(1)
+    entry = (slot_mapping, update_rows, device, slots_slice, safe_slots, valid_mask)
+    if entry_guards is not None:
+        entry_guards.append(entry)
+    elif graph_forward:
+        _graph_slot_guard_cache.append(entry)
+    else:
+        _slot_guard_cache.append(entry)
+        if len(_slot_guard_cache) > _SLOT_GUARD_CACHE_MAX:
+            del _slot_guard_cache[0]
+    return slots_slice, safe_slots, valid_mask
+
+
 def _scatter_by_slot(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -1456,7 +2161,9 @@ def _scatter_by_slot(
         return
     value_2d = value.reshape(-1, value.size(-1))
     cache_2d = cache.view(-1, value_2d.size(1))
-    slots = slot_mapping.reshape(-1).to(torch.long).to(cache.device)
+    slots = slot_mapping.reshape(-1)
+    if slots.device != cache.device or slots.dtype != torch.long:
+        slots = slots.to(device=cache.device, dtype=torch.long)
     update_rows = min(slots.size(0), value_2d.size(0))
     if update_rows <= 0:
         return
@@ -1468,8 +2175,7 @@ def _scatter_by_slot(
         # for the first decode step.
         from xllm.python import kernels
 
-        slots_slice = slots[:update_rows]
-        safe_slots = slots_slice.clamp_min(0)
+        slots_slice, safe_slots, valid_mask = _slot_guard_tensors(slot_mapping, update_rows, cache.device)
         updates = value_2d[:update_rows].to(cache.dtype)
         context = get_forward_context_or_none()
         if context is not None and context.acl_graph is not None:
@@ -1477,7 +2183,6 @@ def _scatter_by_slot(
             # captured path; it is not reliably capturable on NPU.
             safe_values = updates
         else:
-            valid_mask = slots_slice.ge(0).unsqueeze(1)
             old_values = cache_2d.index_select(0, safe_slots)
             safe_values = torch.where(valid_mask, updates, old_values)
         kernels.scatter_nd_update(
@@ -1499,4 +2204,31 @@ def _sparse_attn_sharedkv(**kwargs):
     """Thin indirection so the backend can be unit-tested without the kernel."""
     from xllm.python import kernels
 
-    return kernels.sparse_attn_sharedkv(**kwargs)
+    seqused_ori_kv = kwargs.pop("seqused_ori_kv", None)
+    seqused_cmp_kv = kwargs.pop("seqused_cmp_kv", None)
+    cmp_residual_kv = kwargs.pop("cmp_residual_kv", None)
+    if not _uses_a5_sparse_kernels():
+        return kernels.sparse_attn_sharedkv(**kwargs)
+
+    seqused_kv = kwargs.pop("seqused_kv", None)
+    cmp_ratio = kwargs.get("cmp_ratio", 1)
+    cmp_kv = kwargs.get("cmp_kv")
+    has_cmp = cmp_kv is not None and cmp_ratio > 1
+    kwargs["layout_kv"] = "PA_BBND"
+    kwargs["cu_seqlens_ori_kv"] = None
+    kwargs["cu_seqlens_cmp_kv"] = None
+    kwargs["seqused_ori_kv"] = seqused_ori_kv if seqused_ori_kv is not None else seqused_kv
+    if has_cmp:
+        if seqused_cmp_kv is None and seqused_kv is not None:
+            seqused_cmp_kv = seqused_kv // cmp_ratio
+            cmp_residual_kv = seqused_kv % cmp_ratio
+        kwargs["seqused_cmp_kv"] = seqused_cmp_kv
+        kwargs["cmp_residual_kv"] = cmp_residual_kv
+    else:
+        kwargs["seqused_cmp_kv"] = None
+        kwargs["cmp_residual_kv"] = None
+        kwargs["cmp_mask_mode"] = 0
+    kwargs.setdefault("ori_topk_length", None)
+    kwargs.setdefault("cmp_topk_length", None)
+    kwargs["topk_value_mode"] = 1
+    return kernels.sparse_flash_mla(**kwargs)

@@ -134,8 +134,12 @@ _EXPORTS = {
         "hc_post",
         "hc_pre",
         "hc_pre_fused",
+        "quant_lightning_indexer_v2",
+        "quant_lightning_indexer_v2_metadata",
         "sparse_attn_sharedkv",
         "sparse_attn_sharedkv_metadata",
+        "sparse_flash_mla",
+        "sparse_flash_mla_metadata",
     ),
 }
 
@@ -218,6 +222,10 @@ __all__ = [
     "moe_gating_top_k_hash",
     "sparse_attn_sharedkv",
     "sparse_attn_sharedkv_metadata",
+    "quant_lightning_indexer_v2",
+    "quant_lightning_indexer_v2_metadata",
+    "sparse_flash_mla",
+    "sparse_flash_mla_metadata",
     "causal_conv1d_qkv_prefill",
     "causal_conv1d_update_v2",
     "fused_gdn_gating",
