@@ -68,7 +68,7 @@ def test_markov_bias_matches_embedding_projection() -> None:
 
 
 def test_confidence_head_supports_batched_markov_features() -> None:
-    head = DSparkConfidenceHead(3, 2, True, torch.device("cpu"))
+    head = DSparkConfidenceHead(3, 2, True, torch.float32, torch.device("cpu"))
     with torch.no_grad():
         head.proj.weight.copy_(torch.tensor([[1.0, -1.0, 0.5, 2.0, -2.0]]))
         head.proj.bias.copy_(torch.tensor([0.25]))
@@ -88,6 +88,21 @@ def test_base_preserves_dspark_checkpoint_names() -> None:
         "confidence_head.proj.weight",
         "confidence_head.proj.bias",
     }
+
+
+def test_confidence_head_runs_in_model_dtype() -> None:
+    head = DSparkConfidenceHead(3, 2, True, torch.bfloat16, torch.device("cpu"))
+    assert head.proj.weight.dtype is torch.bfloat16
+    assert head.proj.bias.dtype is torch.bfloat16
+
+    hidden = torch.tensor([[[1.0, 2.0, 3.0], [0.5, 0.0, -1.0]]], dtype=torch.bfloat16)
+    markov = torch.tensor([[[0.25, 0.5], [1.0, -1.0]]], dtype=torch.bfloat16)
+
+    output = head(hidden, markov)
+
+    assert output.dtype is torch.float32
+    expected = torch.sigmoid(head.proj(torch.cat((hidden, markov), dim=-1))).squeeze(-1)
+    torch.testing.assert_close(output, expected.to(torch.float32))
 
 
 def test_base_forwards_confidence_for_batched_hidden() -> None:

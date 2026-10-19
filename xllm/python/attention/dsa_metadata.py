@@ -121,6 +121,11 @@ class DsaMetadata:
     # on the request-owned metadata makes every ACL graph entry retain the
     # stable tensor addresses captured by each layer.
     input_rope_by_ratio: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    # Expanded QLI RoPE tables scoped to one forward so compressed layers can
+    # share the half-to-full-width conversion.
+    qli_expanded_rope: dict[tuple[int, int, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict
+    )
     # Global-position RoPE for the KV / compressor / index-cache writes under
     # prefill CP. ``cos_table`` / ``sin_table`` are localized to this rank's
     # query rows, but the projected-attention KV path runs on the full
@@ -133,12 +138,19 @@ class DsaMetadata:
     # same group share the same underlying tensor (no copy).
     block_tables: list[list[torch.Tensor]] = field(default_factory=list)
     slot_mappings: list[list[torch.Tensor]] = field(default_factory=list)
+    # One source table per cache manager. The per-layer grids re-reference
+    # these tensors, so data movement can visit each manager once.
+    manager_block_tables: list[torch.Tensor] = field(default_factory=list)
+    manager_slot_mappings: list[torch.Tensor] = field(default_factory=list)
 
     # Precomputed AICPU tiling metadata (filled by the backend, not the builder).
     c1_metadata: torch.Tensor | None = None
     c4_metadata: torch.Tensor | None = None
     c128_metadata: torch.Tensor | None = None
     qli_metadata: torch.Tensor | None = None
+    # A5 QLI v2 length tensors derived once for this forward. Each compressed
+    # layer reuses the same request-level values.
+    qli_v2_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     # Runtime window baked into c1/c4/c128 metadata. Native DSpark expands
     # this window and supplies explicit SWA indices to the attention kernel.
     sparse_metadata_ori_win_left: int = -1
@@ -388,6 +400,15 @@ class DsaMetadataBuilder:
         # shared-path behaviour (DSV4 / V4-dspark); ``"ring"`` is requested by
         # the DeepSeek-V4.1 backend whose readers need every column addressed.
         self.read_table_layout = read_table_layout
+        # Ring-layout column index cache for ``_process_swa_group``: the
+        # ``arange(width) % semantic_cols`` table is a pure function of its
+        # key, so rebuilding it every forward only adds allocations to the
+        # metadata-refresh hot path.
+        self._ring_cols_cache: dict[tuple[int, int, torch.device], torch.Tensor] = {}
+        # Whether the latest build() produced any -1 padding lanes in its
+        # manager tables (padding rows / columns). Consumers use this to skip
+        # the "-1 remap to block 0" masked fill when nothing can be negative.
+        self.outputs_have_padding = False
 
     # -- public API ---------------------------------------------------------
 
@@ -443,9 +464,11 @@ class DsaMetadataBuilder:
         dsa.input_positions = positions
         dsa.is_acl_graph = enable_graph
         if dsa_cos_sin is not None and dsa_cos_sin.numel() > 0:
+            # Preserve the source layout instead of copying each half-width
+            # RoPE table; NPU kernels accept these request-shaped views.
             cos_sin_chunks = dsa_cos_sin.chunk(2, dim=-1)
-            dsa.cos_table = cos_sin_chunks[0].contiguous()
-            dsa.sin_table = cos_sin_chunks[1].contiguous()
+            dsa.cos_table = cos_sin_chunks[0]
+            dsa.sin_table = cos_sin_chunks[1]
         if positions is not None and positions.numel() > 0:
             self._build_positions(dsa, kv_seq_lens, q_lens, enable_graph, dst=dst)
         if dst is not None and self._start_pos_dst_ok(dst, dsa):
@@ -456,6 +479,7 @@ class DsaMetadataBuilder:
         else:
             dsa.start_pos = (dsa.actual_seq_lengths_kv - dsa.seq_lens_q).to(torch.int32)
 
+        self.outputs_have_padding = False
         self._build_block_tables_and_slots(
             multi_block_tables,
             kv_seq_lens,
@@ -615,37 +639,31 @@ class DsaMetadataBuilder:
         the compressed RoPE needs the position ``next_pos - ratio``.
         """
         total_tokens = int(dsa.input_positions.numel())
-        c4_positions: list[int] = []
-        c128_positions: list[int] = []
-        for seq, kv_len in enumerate(kv_seq_lens):
-            q_len = min(q_lens[seq], kv_len)
-            start_pos = kv_len - q_len
-            for i in range(q_len):
-                pos = start_pos + i
-                next_pos = pos + 1
-                if next_pos % 4 == 0:
-                    c4_positions.append(next_pos - 4)
-                if next_pos % 128 == 0:
-                    c128_positions.append(next_pos - 128)
+        # Concatenate the per-sequence position ranges in sequence-major order,
+        # then select positions whose successor crosses each ratio boundary.
+        ranges = [
+            torch.arange(kv_len - min(q_lens[seq], kv_len), kv_len, dtype=torch.int64)
+            for seq, kv_len in enumerate(kv_seq_lens)
+        ]
+        positions = torch.cat(ranges) if ranges else torch.empty(0, dtype=torch.int64)
+        next_positions = positions + 1
+        c4_positions = next_positions[(next_positions % 4) == 0] - 4
+        c128_positions = next_positions[(next_positions % 128) == 0] - 128
 
-        def _pad(positions: list[int], ratio: int) -> torch.Tensor:
+        def _pad(values: torch.Tensor, ratio: int) -> torch.Tensor:
             if enable_graph:
                 # Graph mode pads to total_tokens so the tensor address is stable
                 # across bucket sizes. C++ vector::resize() zero-fills the tail.
-                out = torch.zeros(total_tokens, dtype=dsa.input_positions.dtype)
-                for idx, p in enumerate(positions):
-                    out[idx] = p
-                return out
-            # Non-graph: resize to min(total_tokens, total_tokens//ratio + batch_size)
-            # with 0 padding, matching C++ dsa_metadata_builder.cpp:717
-            # (c4_target = min(num_tokens, num_tokens/4 + batch_size)).
-            batch_size = len(kv_seq_lens)
-            target = min(total_tokens, total_tokens // ratio + batch_size)
+                target = total_tokens
+            else:
+                # Non-graph: resize to min(total_tokens, total_tokens//ratio + batch_size)
+                # with 0 padding, matching C++ dsa_metadata_builder.cpp:717
+                # (c4_target = min(num_tokens, num_tokens/4 + batch_size)).
+                target = min(total_tokens, total_tokens // ratio + len(kv_seq_lens))
             out = torch.zeros(target, dtype=dsa.input_positions.dtype)
-            for idx, p in enumerate(positions):
-                if idx >= target:
-                    break
-                out[idx] = p
+            count = min(int(values.numel()), target)
+            if count > 0:
+                out[:count] = values[:count].to(dsa.input_positions.dtype)
             return out
 
         dsa.c4_pad_positions = self._write_positions(dst, "c4_pad_positions", _pad(c4_positions, 4))
@@ -766,6 +784,8 @@ class DsaMetadataBuilder:
                 else:
                     dsa.block_tables[lid].append(torch.empty(0))
                     dsa.slot_mappings[lid].append(torch.empty(0))
+        dsa.manager_block_tables = list(proc_bt)
+        dsa.manager_slot_mappings = list(proc_slots)
 
     def _find_group_dst(
         self,
@@ -867,6 +887,36 @@ class DsaMetadataBuilder:
     # -- TOKEN group (process_token_group, cpp:364-464) --------------------
     # Commits only the compressed rows crossed by the current forward step.
 
+    @staticmethod
+    def _gather_block_ids(
+        raw_bt: torch.Tensor,
+        seq_ids: list[int],
+        block_idxs: list[int],
+    ) -> list[int]:
+        """Gather ``raw_bt[seq, block_idx]`` for a whole batch with one device
+        op and one host sync.
+
+        The scalar equivalent (``int(raw_bt[s, b].item())`` per slot) costs one
+        device synchronization per call, which dominates the metadata rebuild
+        once the batch grows (a concurrency-16 refresh gathers ~100 slots per
+        manager). Out-of-range requests are reported as ``-1`` so callers can
+        treat them as absent slots.
+        """
+        rows = int(raw_bt.size(0))
+        cols = int(raw_bt.size(1))
+        out = [-1] * len(seq_ids)
+        if not seq_ids or rows <= 0 or cols <= 0:
+            return out
+        flat = [s * cols + b for s, b in zip(seq_ids, block_idxs) if 0 <= s < rows and 0 <= b < cols]
+        keep = [i for i, (s, b) in enumerate(zip(seq_ids, block_idxs)) if 0 <= s < rows and 0 <= b < cols]
+        if not keep:
+            return out
+        flat_idx = torch.tensor(flat, dtype=torch.int64, device=raw_bt.device)
+        got = raw_bt.reshape(-1)[flat_idx].tolist()
+        for j, i in enumerate(keep):
+            out[i] = got[j]
+        return out
+
     def _process_token_group(
         self,
         raw_bt: torch.Tensor,
@@ -889,28 +939,10 @@ class DsaMetadataBuilder:
 
         out_slot_rows = max(graph_slot_capacity, committed_rows) if graph_slot_capacity > 0 else committed_rows
         use_dst_slots = self._slot_dst_ok(dst_slots, raw_bt, out_slot_rows)
-        if use_dst_slots:
-            # In-place: seed the host list directly (no device ``torch.full`` +
-            # ``.tolist()`` D2H) and write once into the captured buffer.
-            slots_list = [-1] * out_slot_rows
-        else:
-            out_slots = torch.full((out_slot_rows,), -1, dtype=torch.int32, device=raw_bt.device)
-            slots_list = out_slots.tolist()
-        semantic_cols = int(raw_bt.size(1))
 
-        def slot_for_compressed_index(seq: int, compressed_idx: int) -> int:
-            if seq >= raw_bt.size(0) or semantic_cols <= 0:
-                return -1
-            block_idx = compressed_idx // block_size
-            if block_idx >= semantic_cols:
-                return -1
-            block_id = int(raw_bt[seq, block_idx].item())
-            if block_id < 0:
-                return -1
-            block_offset = compressed_idx % block_size
-            return block_id * block_size + block_offset
-
-        write_idx = 0
+        slots_list = [-1] * out_slot_rows
+        seq_ids: list[int] = []
+        comp_idxs: list[int] = []
         for seq in range(batch_size):
             ctx_len = int(ctx_lens[seq])
             q_len = max(0, min(int(q_lens[seq]), ctx_len))
@@ -918,9 +950,19 @@ class DsaMetadataBuilder:
             prev_committed = prev_ctx_len // ratio
             committed = ctx_len // ratio
             new_committed = committed - prev_committed
-            for i in range(new_committed):
-                slots_list[write_idx] = slot_for_compressed_index(seq, prev_committed + i)
-                write_idx += 1
+            seq_ids.extend([seq] * new_committed)
+            comp_idxs.extend(range(prev_committed, committed))
+        # Vectorized equivalent of the per-slot ``slot_for_compressed_index``
+        # loop (cpp:408-433): one batched gather instead of one ``.item()``
+        # device sync per newly committed row.
+        block_ids = self._gather_block_ids(
+            raw_bt,
+            seq_ids,
+            [compressed_idx // block_size for compressed_idx in comp_idxs],
+        )
+        for i, block_id in enumerate(block_ids):
+            if block_id >= 0:
+                slots_list[i] = block_id * block_size + comp_idxs[i] % block_size
         if use_dst_slots:
             out_slots = dst_slots
             out_slots.copy_(torch.tensor(slots_list, dtype=torch.int32), non_blocking=True)
@@ -933,12 +975,17 @@ class DsaMetadataBuilder:
             if self._block_table_dst_ok(dst_bt, raw_bt, batch_size, cap):
                 out_bt = dst_bt
                 out_bt.fill_(-1)
+                self.outputs_have_padding = True
                 rows = min(batch_size, int(raw_bt.size(0)))
                 copy_cols = min(int(raw_bt.size(1)), cap)
                 if rows > 0 and copy_cols > 0:
                     out_bt[:rows, :copy_cols] = raw_bt[:rows, :copy_cols]
             else:
-                out_bt = self._pad_block_table(raw_bt, batch_size, cap, -1)
+                if int(raw_bt.size(0)) == batch_size and int(raw_bt.size(1)) >= cap:
+                    out_bt = raw_bt.clone()
+                else:
+                    out_bt = self._pad_block_table(raw_bt, batch_size, cap, -1)
+                    self.outputs_have_padding = True
         return out_bt, out_slots
 
     # -- SWA group (process_swa_group, cpp:466-572) ------------------------
@@ -983,40 +1030,42 @@ class DsaMetadataBuilder:
                 dst_slots=dst_slots if use_dst_slots else None,
             )
         else:
-            if use_dst_slots:
-                out_slots = dst_slots
-                out_slots.fill_(-1)
-                slots_list = [-1] * out_slot_rows
-            else:
-                out_slots = torch.full((out_slot_rows,), -1, dtype=torch.int32, device=raw_bt.device)
-                slots_list = out_slots.tolist()
-
-            def slot_for_position(seq: int, pos: int) -> int:
-                if semantic_cols <= 0 or seq >= raw_bt.size(0):
-                    return -1
-                block_idx = (pos // block_size) % semantic_cols
-                block_id = int(raw_bt[seq, block_idx].item())
-                if block_id < 0:
-                    return -1
-                block_offset = pos % block_size
-                return block_id * block_size + block_offset
-
             write_idx = 0
+            slots_list = [-1] * out_slot_rows
             if new_cache_slots is not None and len(new_cache_slots) == query_total_tokens:
                 slots_list[:query_total_tokens] = [int(slot) for slot in new_cache_slots]
                 write_idx = query_total_tokens
             else:
+                rows = int(raw_bt.size(0))
+                seq_ids: list[int] = []
+                positions: list[int] = []
+                out_indices: list[int] = []
                 for seq in range(batch_size):
                     ctx_len = int(ctx_lens[seq])
                     q_len = max(0, min(int(q_lens[seq]), ctx_len))
-                    if seq >= raw_bt.size(0):
-                        write_idx += q_len
-                        continue
-                    q_start = ctx_len - q_len
-                    for i in range(q_len):
-                        slots_list[write_idx] = slot_for_position(seq, q_start + i)
-                        write_idx += 1
+                    if seq < rows:
+                        q_start = ctx_len - q_len
+                        seq_ids.extend([seq] * q_len)
+                        positions.extend(range(q_start, q_start + q_len))
+                        out_indices.extend(range(write_idx, write_idx + q_len))
+                    # Sequences whose block-table rows are missing keep their -1
+                    # padding at their own output offset; every sequence advances
+                    # the cursor either way so gathered tokens land at the output
+                    # index their (seq, position) occupies.
+                    write_idx += q_len
+                # Vectorized equivalent of the per-position ``slot_for_position``
+                # loop (cpp:466-572): one batched gather instead of one
+                # ``.item()`` device sync per query token.
+                block_ids = self._gather_block_ids(
+                    raw_bt,
+                    seq_ids,
+                    [(pos // block_size) % semantic_cols if semantic_cols > 0 else 0 for pos in positions],
+                )
+                for i, block_id in enumerate(block_ids):
+                    if block_id >= 0:
+                        slots_list[out_indices[i]] = block_id * block_size + positions[i] % block_size
             if use_dst_slots:
+                out_slots = dst_slots
                 out_slots.copy_(torch.tensor(slots_list, dtype=torch.int32), non_blocking=True)
             else:
                 out_slots = torch.tensor(slots_list, dtype=torch.int32, device=raw_bt.device)
@@ -1060,34 +1109,60 @@ class DsaMetadataBuilder:
         if graph_slot_capacity > 0 and graph_block_table_capacity_cols > 0:
             storage_cols = max(graph_block_table_capacity_cols, int(raw_bt.size(1)))
             max_dst_len = max(max_dst_len, storage_cols)
-        if self._block_table_dst_ok(dst_bt, raw_bt, batch_size, max_dst_len):
-            new_bt = dst_bt
-            new_bt.fill_(-1)
-        else:
-            new_bt = torch.full(
+        use_dst_bt = self._block_table_dst_ok(dst_bt, raw_bt, batch_size, max_dst_len)
+        rows = min(batch_size, int(raw_bt.size(0)))
+        ring_fill = (
+            self.read_table_layout == READ_TABLE_LAYOUT_RING and rows > 0 and max_dst_len > 0 and semantic_cols > 0
+        )
+        if ring_fill:
+            # The ring gather below overwrites every column of ``[:rows]``, so
+            # uninitialized storage plus a padding-row fill replaces a full
+            # ``torch.full(-1)`` pass over the whole table.
+            new_bt = dst_bt if use_dst_bt else torch.empty(
                 (batch_size, max_dst_len),
-                -1,
                 dtype=torch.int32,
                 device=raw_bt.device,
             )
-        rows = min(batch_size, int(raw_bt.size(0)))
-        if self.read_table_layout == READ_TABLE_LAYOUT_RING:
-            if rows > 0 and max_dst_len > 0 and semantic_cols > 0:
-                # Vectorized equivalent of a NAIVE per-column ring fill: filling
-                # `max_dst_len` columns (up to the graph storage width) with one
-                # device op each on every forward would cost ~151x-2141x more.
+            if batch_size > rows:
+                new_bt[rows:].fill_(-1)
+                self.outputs_have_padding = True
+            # Vectorized equivalent of a NAIVE per-column ring fill: filling
+            # `max_dst_len` columns (up to the graph storage width) with one
+            # device op each on every forward would cost ~151x-2141x more.
+            cache_key = (max_dst_len, semantic_cols, raw_bt.device)
+            cols = self._ring_cols_cache.get(cache_key)
+            if cols is None:
+                if len(self._ring_cols_cache) >= 64:
+                    self._ring_cols_cache.clear()
                 cols = torch.arange(max_dst_len, device=raw_bt.device) % semantic_cols
-                new_bt[:rows] = raw_bt[:rows, cols]
+                self._ring_cols_cache[cache_key] = cols
+            new_bt[:rows] = raw_bt[:rows, cols]
         else:
-            for s in range(batch_size):
-                if s >= raw_bt.size(0):
-                    continue
-                retained_cols = min(semantic_cols, dst_lens[s])
-                start_col = dst_lens[s] - retained_cols
-                for j in range(retained_cols):
-                    logical_col = start_col + j
-                    physical_col = logical_col % semantic_cols
-                    new_bt[s, logical_col] = raw_bt[s, physical_col]
+            if use_dst_bt:
+                new_bt = dst_bt
+                new_bt.fill_(-1)
+            else:
+                new_bt = torch.full(
+                    (batch_size, max_dst_len),
+                    -1,
+                    dtype=torch.int32,
+                    device=raw_bt.device,
+                )
+            self.outputs_have_padding = True
+            if self.read_table_layout != READ_TABLE_LAYOUT_RING:
+                # Right-aligned tables keep -1 outside the retained columns
+                # by design; flag them so consumers preserve the historical
+                # remap behaviour.
+                self.outputs_have_padding = True
+                for s in range(batch_size):
+                    if s >= raw_bt.size(0):
+                        continue
+                    retained_cols = min(semantic_cols, dst_lens[s])
+                    start_col = dst_lens[s] - retained_cols
+                    for j in range(retained_cols):
+                        logical_col = start_col + j
+                        physical_col = logical_col % semantic_cols
+                        new_bt[s, logical_col] = raw_bt[s, physical_col]
         return new_bt, out_slots
 
     @staticmethod
@@ -1213,8 +1288,12 @@ class DsaMetadataBuilder:
         pad_value: int,
     ) -> torch.Tensor:
         cols = max(capacity_cols, int(raw_bt.size(1)))
-        out = torch.full((batch_size, cols), pad_value, dtype=torch.int32, device=raw_bt.device)
         rows = min(batch_size, int(raw_bt.size(0)))
         copy_cols = min(int(raw_bt.size(1)), cols)
+        if int(raw_bt.size(0)) == batch_size and copy_cols == cols:
+            # Shape already matches: one clone instead of a full ``pad_value``
+            # pass followed by a copy.
+            return raw_bt.clone()
+        out = torch.full((batch_size, cols), pad_value, dtype=torch.int32, device=raw_bt.device)
         out[:rows, :copy_cols] = raw_bt[:rows, :copy_cols]
         return out

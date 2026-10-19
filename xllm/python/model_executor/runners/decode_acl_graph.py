@@ -204,6 +204,10 @@ class _StaticAttentionMetadata:
     # Token-capacity bound of the CSA2 committed-row buckets (0 = backend does
     # not bucket); consumed by the backend's capacity gathers.
     dsa_graph_token_capacity: int = 0
+    # KV-length domain bound (max model context) for ACL-graph DSA captures
+    # (0 = unset). The backend pins the capture-time baked max_seqlen ints to
+    # this bound so no replay's refreshed seqused can exceed them.
+    dsa_graph_kv_capacity: int = 0
 
 
 class _DecodeGraphEntry:
@@ -286,6 +290,7 @@ class DecodeAclGraphRunner(BaseRunner):
         *,
         is_spec_draft: bool = False,
         draft_query_width: int = 1,
+        spec_verify_rows: int = 1,
         eplv2_graph_token_limit: int | None = None,
     ) -> None:
         super().__init__(model, attention_backend, device)
@@ -293,13 +298,12 @@ class DecodeAclGraphRunner(BaseRunner):
         self.dp_rank = dp_rank
         # Each rank may receive every sequence in the batch. The scheduler's
         # remaining_seq_budget is the full max_seqs_per_batch, not an even
-        # split, so the graph capacity matches that budget.
-        self.max_batch = max_batch
-        # Token rows per logical sequence: 1 for plain decode, num_spec+1 for
-        # MTP spec-verify. Static paging buffers are sized in token rows so the
-        # expanded-verify graph (N*width rows) gets matching capacity instead
-        # of the sequence-only max_batch (item 二).
-        self.num_decoding_tokens = max(1, int(num_decoding_tokens))
+        # split, so the graph sequence capacity matches that budget.
+        self.sequence_batch_capacity = max(1, int(max_batch))
+        # Admission counts logical sequences; graph buffers and keys count
+        # token rows. Keep the scheduler budget independent of verify width.
+        self.max_batch = self.sequence_batch_capacity
+        self.num_decoding_tokens = max(1, int(num_decoding_tokens), int(spec_verify_rows))
         # Optional memory guardrail: buckets above the limit fall back to
         # eager instead of capturing ever-larger graphs (0 disables).
         self.decode_batch_size_limit = int(decode_batch_size_limit or 0)
@@ -313,6 +317,11 @@ class DecodeAclGraphRunner(BaseRunner):
         self._graphs: dict[_GraphKey, _DecodeGraphEntry] = {}
         self._paged_kv_indices_buffer: torch.Tensor | None = None
         self._max_blocks_per_sequence: int = 0
+        self._pinned_block_table_staging: dict[tuple[str, torch.dtype, torch.Size], list[torch.Tensor]] = {}
+        # Per-slot events for the reused pinned stages; the next host write to
+        # a slot waits on the copy enqueued through it (see _pinned_stage).
+        self._pinned_stage_events: dict[tuple[str, torch.dtype, torch.Size], list[torch.npu.Event | None]] = {}
+        self._pinned_stage_cursor: dict[tuple[str, torch.dtype, torch.Size], int] = {}
         self._stream: torch.npu.Stream | None = None
         self._update_stream: torch.npu.Stream | None = None
         self._replay_done_event: torch.npu.Event | None = None
@@ -332,10 +341,10 @@ class DecodeAclGraphRunner(BaseRunner):
     def _engram_graph_token_capacity(self) -> int:
         """Floor, in token rows, for the graph-visible engram staging block.
 
-        ``max_batch`` counts sequences (segments), not token rows: the captured
-        graph packs ``num_decoding_tokens`` token rows per sequence at the
-        verify slots (1 for plain decode) -- the same per-sequence width
-        ``_shared_graph_plan`` folds into ``verify_width``. A spec-draft runner
+        The captured graph packs ``num_decoding_tokens`` token rows per
+        sequence at the verify slots (1 for plain decode) -- the same
+        per-sequence width ``_shared_graph_plan`` folds into ``verify_width``.
+        A spec-draft runner
         additionally emits up to ``draft_query_width`` query rows per sequence;
         that is a different quantity from the verify rows and may be
         larger, so fold the wider of the two, keeping the block from being sized
@@ -350,7 +359,7 @@ class DecodeAclGraphRunner(BaseRunner):
         it large only wastes HBM. ``_decode_bucket`` then aligns this floor to
         the graph key's padded token-row bucket.
         """
-        seq_capacity = self.max_batch
+        seq_capacity = self.sequence_batch_capacity
         if self.decode_batch_size_limit > 0:
             seq_capacity = min(seq_capacity, self.decode_batch_size_limit)
         rows_per_seq = self.num_decoding_tokens
@@ -394,7 +403,7 @@ class DecodeAclGraphRunner(BaseRunner):
         decode stays width 1.
         """
         if local_expanded is None:
-            local_expanded = resolve_expanded_decode_metadata(metadata) is not None
+            local_expanded = self._is_expanded_verify(metadata, batch_size=batch_size)
         marked_spec_verify = bool(getattr(metadata, "is_spec_verify", False))
         spec_verify = marked_spec_verify or local_expanded
         local_width = 1
@@ -405,7 +414,12 @@ class DecodeAclGraphRunner(BaseRunner):
                 local_width = batch_size // seq_count
         packed_plan = False
         if self.dp_size > 1:
-            # Local expanded rows must not choose a width the empty rank cannot see.
+            # Local expanded rows must not choose a width the empty rank
+            # cannot see: under DP the width comes ONLY from the explicitly
+            # marked step type (``is_spec_verify``) plus num_decoding_tokens,
+            # both group-wide, so an empty rank and a busy rank share one
+            # graph key. An unmarked local expanded layout is a contract
+            # violation and raises instead of capturing a private graph.
             if marked_spec_verify and self.num_decoding_tokens > 1:
                 if local_width > 1 and local_width != self.num_decoding_tokens:
                     raise RuntimeError(
@@ -479,6 +493,53 @@ class DecodeAclGraphRunner(BaseRunner):
             elif batch_size % self._draft_query_width == 0:
                 admission_batch = batch_size // self._draft_query_width
         return is_expanded, verify_width, admission_batch
+
+    @property
+    def _backend_uses_dsa_graph_contract(self) -> bool:
+        """Whether the backend materializes persistent DSA state per step.
+
+        DSA-family backends (DSV4 / V4.1 / MTP, all ``DsaAttentionBackend``
+        subclasses) build metadata that graph capture must not record; they
+        get the eager pre-capture pass in ``execute``. Every other backend
+        keeps the historical capture path unchanged.
+        """
+        return getattr(self.attention_backend, "prepare_dsa_metadata_for_forward", None) is not None
+
+    def _is_expanded_verify(
+        self,
+        metadata: AttentionMetadata,
+        expanded_view: object | None = None,
+        batch_size: int | None = None,
+    ) -> bool:
+        """Return whether a step uses the flattened verify-row graph layout.
+
+        DSpark target verification exports row-aligned paging and one
+        linear-state slot per logical sequence without building the typed
+        expanded view. Treat the explicit verify marker as the same layout.
+        """
+        if expanded_view is not None:
+            return True
+        if resolve_expanded_decode_metadata(metadata) is not None or (
+            bool(getattr(metadata, "is_spec_verify", False)) and self.num_decoding_tokens > 1
+        ):
+            return True
+        if batch_size is None or self.num_decoding_tokens <= 1:
+            return False
+        linear_idx = getattr(metadata, "linear_state_indices", None)
+        q_cu = getattr(metadata, "q_cu_seq_lens", None)
+        kv_cu = getattr(metadata, "kv_cu_seq_lens", None)
+        if linear_idx is None or q_cu is None or kv_cu is None:
+            return False
+        sequence_count = linear_idx.numel()
+        if sequence_count <= 0 or sequence_count >= batch_size:
+            return False
+        verify_width, remainder = divmod(batch_size, sequence_count)
+        return (
+            remainder == 0
+            and verify_width == self.num_decoding_tokens
+            and q_cu.numel() == batch_size + 1
+            and kv_cu.numel() == batch_size + 1
+        )
 
     def can_execute(
         self,
@@ -1027,7 +1088,9 @@ class DecodeAclGraphRunner(BaseRunner):
             return False
         batch_size = input_ids.numel()
         is_expanded = (
-            local_expanded if local_expanded is not None else resolve_expanded_decode_metadata(metadata) is not None
+            local_expanded
+            if local_expanded is not None
+            else self._is_expanded_verify(metadata, expanded_view, batch_size)
         )
         is_packed_verify = not is_expanded and verify_width > 1
 
@@ -1100,16 +1163,18 @@ class DecodeAclGraphRunner(BaseRunner):
                 )
                 return False
         # V4.1 CSA2 multi-manager paging: graph replay refreshes every DSA
-        # manager's block table (_fill_dsa_block_tables raises without them),
-        # so a batch whose manager table count does not match the backend's
-        # group count must stay on the eager runner, whose CSA2 path has
-        # explicit table-less fallbacks (ring block 0 / plain window). Table-less
-        # batches were already normalized above (empty DP shard dummy), so this
-        # only rejects genuinely malformed multi-manager exports.
+        # manager's block table (_fill_dsa_block_tables raises without them).
+        # The refresh consumes the group-aligned PREFIX of the source tables:
+        # speculative inputs inherit the target's SWA/C4/C128 tables on top of
+        # their own manager tables (the eager CSA2 path clamps the same way),
+        # so only a batch with FEWER tables than backend groups must stay on
+        # the eager runner. Table-less batches were already normalized above
+        # (empty DP shard dummy), so this only rejects genuinely malformed
+        # multi-manager exports.
         group_infos = getattr(self.attention_backend, "group_infos", None)
         if group_infos is not None:
             source_tables = list(getattr(metadata, "multi_block_tables", ()) or ())
-            if not source_tables or len(source_tables) != len(group_infos):
+            if not source_tables or len(source_tables) < len(group_infos):
                 return False
         # V4.1 CSA2 committed-row capacity buckets: the captured graph's
         # gathers are sized by max_model_len, so a context beyond it (or a
@@ -1422,9 +1487,8 @@ class DecodeAclGraphRunner(BaseRunner):
     ) -> None:
         metadata = self._normalize_dsa_metadata(metadata)
         batch_size = input_ids.shape[0]
-        # Same seq-vs-token admission as execute: MTP verify packs
-        # (num_spec+1) token-rows per seq, so the capacity gate (max_batch,
-        # in seqs) must compare SEQUENCE count, not token count.
+        # Admission is in token-row buckets; _shared_graph_plan folds expanded
+        # verify rows back to logical sequences.
         _, _, admission_batch = self._shared_graph_plan(
             metadata,
             batch_size,
@@ -1471,10 +1535,8 @@ class DecodeAclGraphRunner(BaseRunner):
             # dp_execution_token_counts agree across ranks and the fixed-shape
             # all_gather matches). The bucket is in TOKEN rows — same unit as
             # the non-DP _decode_bucket(batch_size) — because the static
-            # buffers / q_cu / q_seq_lens are all per token row; folding tokens
-            # back to sequences here would under-size the buffers and crash
-            # _fill_entry's per-token-row copy. The sequence capacity gate
-            # below uses the shared verify layout, including an empty rank.
+            # buffers / q_cu / q_seq_lens are all per token row. The shared
+            # verify layout also covers an empty DP rank.
             # Assert this rank's count equals its batch_size.
             execution_counts = getattr(metadata, "dp_execution_token_counts", None)
             if execution_counts is None or len(execution_counts) != self.dp_size:
@@ -1573,7 +1635,7 @@ class DecodeAclGraphRunner(BaseRunner):
             input_batch,
             verify_width=verify_width,
             kpool_query_lens=kpool_query_lens,
-            local_expanded=expanded_view is not None,
+            local_expanded=self._is_expanded_verify(metadata, expanded_view, batch_size),
         )
 
         prepare_context = ForwardContext(
@@ -1621,6 +1683,31 @@ class DecodeAclGraphRunner(BaseRunner):
 
         if first_capture:
             self._engram_first_capture_gate(staged=staged)
+            if self._backend_uses_dsa_graph_contract:
+                # Populate the persistent DSA metadata OUTSIDE the captured
+                # region first. The model's first forward builds it via
+                # ``prepare_dsa_metadata_for_forward``; letting that build run
+                # inside ``_capture`` would record the builder's transient H2D
+                # copies (host staging freed after the step) plus the AICPU
+                # metadata kernels, and every replay would re-run those copies
+                # against freed host memory -- clobbering the refreshed values
+                # and faulting in-graph kernels with device error 507011. One
+                # eager execution on the static tensors leaves
+                # ``static_metadata.dsa_metadata`` (and the attached RoPE
+                # tables) bound at stable addresses; the capture below then
+                # records only the layer ops reading them.
+                with forward_context(prepare_context):
+                    self._forward_static(entry)
+                    # The first forward above built the persistent DSA and
+                    # landed the cmp seqused/residual execution buffers (see
+                    # _get_graph_cmp_seqused). The capture below then records
+                    # only the layer ops reading those address-stable tensors;
+                    # the per-step refresh rewrites their content eagerly
+                    # outside the graph.
+                # The capture stream must not race the eager build's H2D
+                # writes.
+                if self.device.type == "npu":
+                    torch.npu.synchronize()
             self._capture(entry)
             if capture_metadata is not None:
                 # Capture may still read the persistent indices. Order real
@@ -1651,21 +1738,27 @@ class DecodeAclGraphRunner(BaseRunner):
             # the write is safe.
             self._graphs[graph_key] = entry
 
-        # Besides ordering input updates, this wait protects the output view
-        # returned by the previous replay.  The graph cannot overwrite its
-        # static output until consumers queued on the current stream finish.
-        self._stream.wait_stream(torch.npu.current_stream())
-        with torch.npu.stream(self._stream):
-            entry.graph.replay()
-            output = self._slice_output(entry.static_output, batch_size)
+        # Replay on the CURRENT (compute) stream. The dedicated capture stream
+        # stays for capture only (NPUGraph requires a non-default stream).
+        # Replaying on the compute stream serializes the graph's captured HCCL
+        # collectives with eagerly-enqueued HCCL (speculative draft forwards,
+        # prefill all-reduces, H2D fills) on ONE stream -- two streams sharing
+        # one HCCL communicator under concurrency corrupts its state (device
+        # error 507011).
+        entry.graph.replay()
+        output = self._slice_output(entry.static_output, batch_size)
 
-        with torch.npu.stream(self._update_stream):
-            self._update_stream.wait_event(self._replay_done_event)
-            self._update_graph_tasks(self._update_stream, entry.graph_tasks)
+        # A captured FIA task waits on its update event before execution. This
+        # lets replay run concurrently with the host-side updates for later
+        # layers while preventing the graph from observing stale parameters.
+        if entry.graph_tasks:
+            with torch.npu.stream(self._update_stream):
+                self._update_stream.wait_event(self._replay_done_event)
+                self._update_graph_tasks(self._update_stream, entry.graph_tasks)
 
-        self._replay_done_event.record(self._stream)
-
-        torch.npu.current_stream().wait_stream(self._stream)
+            # The next update must not overwrite task parameters until this
+            # replay has consumed them.
+            self._replay_done_event.record(torch.npu.current_stream())
         return output
 
     def _stage_engram_rows_outside_graph(
@@ -2029,12 +2122,11 @@ class DecodeAclGraphRunner(BaseRunner):
         if self._paged_kv_indices_buffer is None:
             page_size = self.attention_backend.page_size
             max_blocks_per_sequence = (self.max_model_len + page_size - 1) // page_size
-            # Capacity in TOKEN rows: MTP spec-verify captures N*width rows,
-            # so the flat paged_kv_indices buffer must hold
-            # max_batch * num_decoding_tokens * max_blocks entries (item 二);
-            # sizing it by sequences alone underflows on expanded-verify copy.
+            # Capacity in token rows: speculative verify captures N*width
+            # independent paging rows, so size the flat paged_kv indices from
+            # the sequence budget and verify width.
             self._paged_kv_indices_buffer = torch.zeros(
-                self.max_batch * self.num_decoding_tokens * max_blocks_per_sequence,
+                self.sequence_batch_capacity * self.num_decoding_tokens * max_blocks_per_sequence,
                 dtype=paged_kv_indices.dtype,
                 device=device,
             )
@@ -2169,6 +2261,7 @@ class DecodeAclGraphRunner(BaseRunner):
             ),
         )
         entry.static_metadata.q_cu_host_values = [0] * (padded_batch_size + 1)
+        entry.static_metadata.dsa_graph_kv_capacity = int(self.max_model_len)
         expanded_view = resolve_expanded_decode_metadata(metadata, block_size=self.attention_backend.page_size)
         local_expanded = expanded_view is not None
         group_expanded = verify_width > 1 or local_expanded
@@ -2275,6 +2368,65 @@ class DecodeAclGraphRunner(BaseRunner):
             )
         return tuple(tables)
 
+    _PINNED_STAGE_SLOTS = 8
+
+    def _pinned_stage(
+        self, source: torch.Tensor, kind: str
+    ) -> tuple[torch.Tensor, tuple[str, torch.dtype, torch.Size] | None, int | None]:
+        """Return a reusable pinned CPU view for asynchronous graph refreshes.
+
+        Stages rotate over ``_PINNED_STAGE_SLOTS`` buffers, each carrying the
+        event of the last host-to-device copy enqueued through it. The next
+        host write to a slot first waits on that event: schedule overlap lets
+        the host prepare later steps while the device still executes earlier
+        ones, and without the guard the write could land in a slot whose
+        previous async copy has not run yet -- putting a later batch's block
+        table into this step's graph (nondeterministic cross-sequence KV
+        reads). The rotation depth only bounds how far the host may run ahead;
+        the per-slot event keeps the reuse correct at any depth.
+        """
+        if source.device.type != "cpu" or source.is_pinned():
+            return source, None, None
+        key = (kind, source.dtype, source.shape)
+        ring = self._pinned_block_table_staging.get(key)
+        if ring is None:
+            try:
+                ring = [
+                    torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
+                    for _ in range(self._PINNED_STAGE_SLOTS)
+                ]
+            except RuntimeError:
+                return source, None, None
+            self._pinned_block_table_staging[key] = ring
+            self._pinned_stage_events[key] = [None] * len(ring)
+            self._pinned_stage_cursor[key] = -1
+        events = self._pinned_stage_events[key]
+        index = (self._pinned_stage_cursor[key] + 1) % len(ring)
+        pending = events[index]
+        if pending is not None:
+            pending.synchronize()
+        staged = ring[index]
+        staged.copy_(source)
+        self._pinned_stage_cursor[key] = index
+        return staged, key, index
+
+    def _copy_block_table(self, target: torch.Tensor, source: torch.Tensor) -> None:
+        if target.device.type == source.device.type:
+            target.copy_(source)
+            return
+        staged, stage_key, stage_index = self._pinned_stage(source, "block_table")
+        non_blocking = stage_key is not None and staged.is_pinned() and target.device.type in ("cuda", "npu")
+        if non_blocking:
+            target.copy_(staged, non_blocking=True)
+            events = self._pinned_stage_events[stage_key]
+            event = events[stage_index]
+            if event is None:
+                event = torch.npu.Event()
+                events[stage_index] = event
+            event.record()
+        else:
+            target.copy_(staged)
+
     def _fill_entry(
         self,
         entry: _DecodeGraphEntry,
@@ -2326,7 +2478,7 @@ class DecodeAclGraphRunner(BaseRunner):
             block_table.shape[0],
         )
         is_expanded = (
-            local_expanded if local_expanded is not None else resolve_expanded_decode_metadata(metadata) is not None
+            local_expanded if local_expanded is not None else self._is_expanded_verify(metadata, batch_size=batch_size)
         )
         cumulative_kv_seq_lens = self._cumulative_lengths(
             kv_seq_lens,
@@ -2381,7 +2533,10 @@ class DecodeAclGraphRunner(BaseRunner):
                 src_bt.shape[1],
                 static_metadata.block_table.shape[1],
             )
-            static_metadata.block_table[:batch_size, :copy_cols].copy_(src_bt[:batch_size, :copy_cols])
+            self._copy_block_table(
+                static_metadata.block_table[:batch_size, :copy_cols],
+                src_bt[:batch_size, :copy_cols],
+            )
             if padded_batch_size > batch_size:
                 static_metadata.block_table[batch_size:].zero_()
 
@@ -2543,9 +2698,9 @@ class DecodeAclGraphRunner(BaseRunner):
                 # Capacity padding must repeat that ring; zero-filled columns
                 # would redirect later positions to the reserved block zero.
                 cols = torch.arange(target.shape[1], device=source.device) % source.shape[1]
-                target[:batch_size].copy_(source[:batch_size, cols])
+                self._copy_block_table(target[:batch_size], source[:batch_size, cols].clamp_min(0))
             else:
-                target[:batch_size, : source.shape[1]].copy_(source[:batch_size])
+                self._copy_block_table(target[:batch_size, : source.shape[1]], source[:batch_size].clamp_min(0))
 
     def _fill_graph_dsa_positions(
         self,
@@ -2682,7 +2837,17 @@ class DecodeAclGraphRunner(BaseRunner):
             eplb=getattr(entry, "eplb", None),
             execution_contexts=entry.execution_contexts,
         )
-        with forward_context(context), torch.npu.graph(entry.graph, stream=self._stream):
+        with (
+            forward_context(context),
+            torch.npu.graph(
+                entry.graph,
+                stream=self._stream,
+                # Match the C++ AclGraph capture mode: THREAD_LOCAL allows other
+                # threads (eager prefill, prepare H2D) to keep executing
+                # synchronous operations during lazy capture.
+                capture_error_mode="thread_local",
+            ),
+        ):
             entry.static_output = self._forward_static(entry)
         entry.graph_tasks = capture_context.tasks
 

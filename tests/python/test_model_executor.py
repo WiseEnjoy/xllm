@@ -1462,6 +1462,7 @@ class TestModelExecutorConstruction:
             num_decoding_tokens=4,
             enable_mega_moe_token_mask=False,
             is_spec_draft=is_spec_draft,
+            spec_verify_rows=1 if is_spec_draft else 4,
             draft_query_width=1,
         )
 
@@ -1649,9 +1650,8 @@ class TestModelExecutorConstruction:
             num_decoding_tokens=4,
         )
 
-        # PR3 passes max_seqs_per_batch (sequences) directly as the runner's
-        # max_batch capacity; the runner derives its local DP capacity with
-        # ceil-div internally.
+        # The runner receives the scheduler sequence budget. It derives its
+        # local DP capacity and token-row graph capacity internally.
         assert mock_create.call_args.args[4] == 17
         mock_graph_runner.assert_called_once_with(
             model.model,
@@ -1665,6 +1665,7 @@ class TestModelExecutorConstruction:
             num_decoding_tokens=4,
             enable_mega_moe_token_mask=True,
             is_spec_draft=False,
+            spec_verify_rows=4,
             draft_query_width=1,
         )
 
@@ -1690,6 +1691,7 @@ class TestModelExecutorConstruction:
         )
 
         assert mock_graph_runner.call_args.kwargs["draft_query_width"] == 8
+        assert mock_graph_runner.call_args.kwargs["spec_verify_rows"] == 1
 
     @patch("xllm.python.model_executor.executor._create_attention_backend")
     def test_model_provided_graph_runner_keeps_default_execution_contract(self, mock_create: MagicMock) -> None:
@@ -2248,9 +2250,12 @@ class TestDecodeAclGraphSpeculativeMetadata:
         assert output.data_ptr() == static_output.data_ptr()
         output[0, 0] = -1
         assert static_output[0, 0].item() == -1
-        replay_stream.wait_stream.assert_called_once_with(current_stream)
-        current_stream.wait_stream.assert_called_once_with(replay_stream)
+        # The replay runs on the caller's current (compute) stream: captured
+        # HCCL collectives must serialize with eagerly-enqueued HCCL, two
+        # streams sharing one communicator corrupt its state (507011).
         graph.replay.assert_called_once_with()
+        replay_stream.wait_stream.assert_not_called()
+        current_stream.wait_stream.assert_not_called()
         refresh_dsa.assert_called_once_with(entry.static_metadata)
 
     def test_graph_token_mask_updates_in_place_for_reused_bucket(self) -> None:

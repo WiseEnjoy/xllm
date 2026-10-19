@@ -120,7 +120,11 @@ def test_load_weights_routes_compressor_aliases_through_loader(
         cmp_wkv=object(),
         process_weights_after_loading=lambda: None,
     )
-    layer = SimpleNamespace(self_attn=attention, mlp=object())
+    layer = SimpleNamespace(
+        self_attn=attention,
+        hc=SimpleNamespace(process_weights_after_loading=lambda: None),
+        mlp=object(),
+    )
     model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
     torch.nn.Module.__init__(model)
     model.cfg = SimpleNamespace(tp_size=1, tp_rank=0, n_layers=1, n_heads=1)

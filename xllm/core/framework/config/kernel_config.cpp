@@ -65,6 +65,10 @@ DEFINE_bool(enable_mega_moe,
             false,
             "enable mega_moe fused operator for MoE expert parallel.");
 
+DEFINE_int32(megamoe_max_tokens_per_rank,
+             512,
+             "Max buffered tokens per rank for the mega_moe fused operator.");
+
 DEFINE_bool(enable_dspark_native_sas,
             false,
             "Enable native NPU DSpark SparseAttnSharedkv semantics with a "
@@ -143,6 +147,7 @@ void KernelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_aclnn_swiglu);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_mega_moe);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dspark_native_sas);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(megamoe_max_tokens_per_rank);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_flashcomm1);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dsa_cp);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_kda_cp);
@@ -165,6 +170,7 @@ void KernelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_aclnn_swiglu);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_mega_moe);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dspark_native_sas);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(megamoe_max_tokens_per_rank);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_flashcomm1);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dsa_cp);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_kda_cp);
@@ -205,6 +211,8 @@ void KernelConfig::append_config_json(
       config_json, default_config, enable_aclnn_swiglu);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_mega_moe);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, megamoe_max_tokens_per_rank);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_dspark_native_sas);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
