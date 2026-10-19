@@ -480,7 +480,10 @@ void set_dsv4_compressed_counts(const Dsv4KVCacheEstimateCost& cache_cost,
 // up to 8 units per sequence were observed on Ascend950 before full batches
 // stopped allocating (see the full-batch floor cases in
 // kv_cache_estimation_test.cpp). The multipliers below are that validated
-// empirical margin, not derived hard bounds. They apply to Ascend950 DSV4
+// empirical margin, not derived hard bounds; the floor also reserves one
+// sequence-equivalent beyond max_seqs (kDsv4FloorExtraBurstSeqs) so a burst
+// landing while the admission count sits exactly at a full batch stays
+// admissible. They apply to Ascend950 DSV4
 // compressed managers (ratios 4 and 128) only and are named so hardware or
 // manager behavior changes update them next to the guarding test; a
 // memory-capacity-derived bound is intentionally not used because the floor
@@ -491,6 +494,9 @@ void set_dsv4_compressed_counts(const Dsv4KVCacheEstimateCost& cache_cost,
 // floor.
 constexpr int64_t kDsv4C4FloorUnitsPerSeq = 8;
 constexpr int64_t kDsv4C128FloorUnitsPerSeq = 2;
+// One sequence-equivalent beyond max_seqs: a checkpoint re-allocation burst
+// can arrive while the batch is exactly full (windows 4/128 above).
+constexpr int64_t kDsv4FloorExtraBurstSeqs = 1;
 int64_t dsv4_compressed_floor_unit_count(
     const Dsv4KVCacheEstimateCost& cache_cost,
     const KVCacheEstimateOptions& options) {
@@ -498,12 +504,14 @@ int64_t dsv4_compressed_floor_unit_count(
       std::max(options.max_seqs_per_batch, static_cast<int64_t>(1));
   int64_t floor_unit_count = 0;
   if (cache_cost.n_c4_layers > 0) {
-    floor_unit_count =
-        std::max(floor_unit_count, kDsv4C4FloorUnitsPerSeq * (max_seqs + 1));
+    floor_unit_count = std::max(
+        floor_unit_count,
+        kDsv4C4FloorUnitsPerSeq * (max_seqs + kDsv4FloorExtraBurstSeqs));
   }
   if (cache_cost.n_c128_layers > 0) {
-    floor_unit_count =
-        std::max(floor_unit_count, kDsv4C128FloorUnitsPerSeq * (max_seqs + 1));
+    floor_unit_count = std::max(
+        floor_unit_count,
+        kDsv4C128FloorUnitsPerSeq * (max_seqs + kDsv4FloorExtraBurstSeqs));
   }
   return floor_unit_count;
 }
