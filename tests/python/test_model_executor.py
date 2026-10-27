@@ -221,6 +221,7 @@ def test_v41_executor_preserves_csa2_dispatch_after_main_integration(
             num_decoding_tokens=1,
             enable_mega_moe_token_mask=False,
             is_spec_draft=False,
+            spec_verify_rows=1,
             draft_query_width=1,
         )
         executor.decode_graph_runner.bind_execution_metadata_builders.assert_called_once_with(())

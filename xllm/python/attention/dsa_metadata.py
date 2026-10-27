@@ -1151,9 +1151,7 @@ class DsaMetadataBuilder:
             self.outputs_have_padding = True
             if self.read_table_layout != READ_TABLE_LAYOUT_RING:
                 # Right-aligned tables keep -1 outside the retained columns
-                # by design; flag them so consumers preserve the historical
-                # remap behaviour.
-                self.outputs_have_padding = True
+                # by design; consumers preserve the historical remap behaviour.
                 for s in range(batch_size):
                     if s >= raw_bt.size(0):
                         continue

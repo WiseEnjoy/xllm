@@ -266,9 +266,16 @@ def test_qli_decode_uses_request_shaped_rope_rows(monkeypatch: pytest.MonkeyPatc
     assert rope_dim == 2
 
 
-def test_registry_resolves_deepseek_v4() -> None:
-    cls = get_model_class("deepseek_v4")
-    assert cls.__name__ == "DeepseekV4ForCausalLM"
+@pytest.mark.parametrize("platform", ["npu", "cpu"])
+def test_registry_resolves_deepseek_v4(monkeypatch: pytest.MonkeyPatch, platform: str) -> None:
+    from xllm.python import registry
+
+    monkeypatch.setattr(registry.current_platform, "device_type", lambda: platform)
+    if platform == "npu":
+        assert get_model_class("deepseek_v4").__name__ == "DeepseekV4ForCausalLM"
+    else:
+        with pytest.raises(NotImplementedError, match="not supported on platform 'cpu'"):
+            get_model_class("deepseek_v4")
 
 
 def test_hyper_connection_shapes() -> None:

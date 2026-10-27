@@ -1487,8 +1487,8 @@ class DecodeAclGraphRunner(BaseRunner):
     ) -> None:
         metadata = self._normalize_dsa_metadata(metadata)
         batch_size = input_ids.shape[0]
-        # Admission is in token-row buckets; _shared_graph_plan folds expanded
-        # verify rows back to logical sequences.
+        # Admission counts logical sequences; _shared_graph_plan folds verify
+        # token rows by their exported width.
         _, _, admission_batch = self._shared_graph_plan(
             metadata,
             batch_size,
