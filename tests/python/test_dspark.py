@@ -77,7 +77,7 @@ def test_confidence_head_supports_batched_markov_features() -> None:
 
     output = head(hidden, markov)
 
-    expected = torch.sigmoid(head.proj(torch.cat((hidden, markov), dim=-1))).squeeze(-1)
+    expected = torch.sigmoid(head.proj(torch.cat((hidden.float(), markov.float()), dim=-1))).squeeze(-1)
     torch.testing.assert_close(output, expected)
 
 
@@ -90,10 +90,10 @@ def test_base_preserves_dspark_checkpoint_names() -> None:
     }
 
 
-def test_confidence_head_runs_in_model_dtype() -> None:
+def test_confidence_head_preserves_fp32_probability_precision() -> None:
     head = DSparkConfidenceHead(3, 2, True, torch.bfloat16, torch.device("cpu"))
-    assert head.proj.weight.dtype is torch.bfloat16
-    assert head.proj.bias.dtype is torch.bfloat16
+    assert head.proj.weight.dtype is torch.float32
+    assert head.proj.bias.dtype is torch.float32
 
     hidden = torch.tensor([[[1.0, 2.0, 3.0], [0.5, 0.0, -1.0]]], dtype=torch.bfloat16)
     markov = torch.tensor([[[0.25, 0.5], [1.0, -1.0]]], dtype=torch.bfloat16)
@@ -101,7 +101,7 @@ def test_confidence_head_runs_in_model_dtype() -> None:
     output = head(hidden, markov)
 
     assert output.dtype is torch.float32
-    expected = torch.sigmoid(head.proj(torch.cat((hidden, markov), dim=-1))).squeeze(-1)
+    expected = torch.sigmoid(head.proj(torch.cat((hidden.float(), markov.float()), dim=-1))).squeeze(-1)
     torch.testing.assert_close(output, expected.to(torch.float32))
 
 
@@ -125,3 +125,14 @@ def test_base_rejects_confidence_without_head() -> None:
     with pytest.raises(RuntimeError, match="not enabled"):
         model.dspark_confidence_probs(torch.ones(1, 1, 3), torch.tensor([[0]]))
     assert not model.has_dspark_confidence_head()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_confidence_head_does_not_round_near_threshold(dtype: torch.dtype) -> None:
+    head = DSparkConfidenceHead(1, 0, False, dtype, torch.device("cpu"), bias=False)
+    with torch.no_grad():
+        head.proj.weight.fill_(0.0004)
+    result = head(torch.ones((1, 1), dtype=dtype), None)
+    # Both low-precision sigmoids round this to 0.5 before the final upcast.
+    assert result.item() > 0.50005
+    torch.testing.assert_close(result, torch.sigmoid(torch.tensor([0.0004])), rtol=0, atol=0)
