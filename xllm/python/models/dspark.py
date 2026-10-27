@@ -69,7 +69,7 @@ class DSparkConfidenceHead(nn.Module):
         if self.with_markov:
             if markov_embedding is None:
                 raise ValueError("DSpark confidence head requires Markov embeddings")
-            hidden = torch.cat((hidden.float(), markov_embedding.float()), dim=-1)
+            hidden = torch.cat((hidden, markov_embedding), dim=-1)
         return torch.sigmoid(self.proj(hidden.float())).squeeze(-1)
 
 
