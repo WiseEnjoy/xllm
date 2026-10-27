@@ -329,6 +329,7 @@ class DsaAttentionBackend(AttentionBackend):
     # in-forward and overrides this to False, so the shared A5 graph branch
     # never drags it into the V4-only window-source state.
     graph_uses_swa_window_sources: bool = True
+    _sparse_metadata_ratios: tuple[int, ...] = (1, 4, 128)
 
     def __init__(
         self,
@@ -352,6 +353,12 @@ class DsaAttentionBackend(AttentionBackend):
             n_layers,
         )
         self._builder = DsaMetadataBuilder(self.caches_info, self.group_infos)
+        if (
+            self.graph_uses_swa_window_sources
+            and len(self.group_infos) == 1
+            and self.group_infos[0].cache_type == DSA_CACHE_SLIDING_WINDOW
+        ):
+            self._sparse_metadata_ratios = (1,)
         self.window_size = window_size
         self.index_topk = index_topk
         self.index_n_heads = index_n_heads
@@ -460,7 +467,7 @@ class DsaAttentionBackend(AttentionBackend):
             # replays value-locked AICPU state and faults with device error
             # 507011.
             persistent = metadata.dsa_metadata
-            if persistent.c1_metadata is None or persistent.c4_metadata is None or persistent.c128_metadata is None:
+            if any(getattr(persistent, f"c{ratio}_metadata") is None for ratio in self._sparse_metadata_ratios):
                 self._build_precomputed_metadata(persistent, metadata)
             return
         compressed_metadata = self._build_dsa_metadata_for_forward(metadata, group_limit=group_limit)
@@ -1340,6 +1347,8 @@ class DsaAttentionBackend(AttentionBackend):
 
         default_pair = build_pair(default_cache, positions)
         rope_by_ratio[1] = default_pair
+        if self._sparse_metadata_ratios == (1,):
+            return rope_by_ratio
 
         c4_pair = build_pair(c4_cache, compressed_metadata.c4_pad_positions)
         compressed_metadata.c4_cos, compressed_metadata.c4_sin = c4_pair
@@ -1777,13 +1786,18 @@ class DsaAttentionBackend(AttentionBackend):
         )
         compressed_metadata.sparse_metadata_ori_win_left = ori_win_left
         use_a5 = _uses_a5_sparse_kernels()
-        for ratio in (1, 4, 128):
+        for ratio in self._sparse_metadata_ratios:
             has_cmp = ratio > 1
             cmp_topk = self.index_topk if ratio == 4 else 0
             if use_a5:
                 seqused_ori_kv = seq_kv if is_prefill else seq_kv.clamp(max=self.window_size)
                 seqused_cmp_kv = seq_kv // ratio if has_cmp else None
                 cmp_residual_kv = seq_kv % ratio if has_cmp else None
+                compressed_metadata.precomputed_metadata_inputs += tuple(
+                    value
+                    for value in (seqused_ori_kv, seqused_cmp_kv, cmp_residual_kv)
+                    if value is not None
+                )
                 max_ori_kv_arg = int(max_kv)
                 max_cmp_kv_arg = int(max_kv) // ratio if has_cmp else 0
                 if graph_capture:
@@ -1863,6 +1877,8 @@ class DsaAttentionBackend(AttentionBackend):
                 compressed_metadata.c4_metadata = sparse_metadata
             elif ratio == 128:
                 compressed_metadata.c128_metadata = sparse_metadata
+        if 4 not in self._sparse_metadata_ratios:
+            return
         query_lens = seq_q[1:].clone() if seq_q.numel() > 1 else compressed_metadata.seq_lens_q
         key_lens = compressed_metadata.seq_lens if compressed_metadata.seq_lens.numel() else seq_kv
         compressed_metadata.precomputed_metadata_inputs += (query_lens, key_lens)
@@ -2510,13 +2526,9 @@ def _scatter_by_slot(
         return
     value_2d = value.reshape(-1, value.size(-1))
     cache_2d = cache.view(-1, value_2d.size(1))
-    slots = slot_mapping.reshape(-1)
-    if slots.device != cache.device or slots.dtype != torch.long:
-        slots = slots.to(device=cache.device, dtype=torch.long)
-    update_rows = min(slots.size(0), value_2d.size(0))
+    update_rows = min(slot_mapping.numel(), value_2d.size(0))
     if update_rows <= 0:
         return
-    valid = slots[:update_rows] >= 0
     if cache.device.type == "npu":
         # Match C++ scatter_by_slot exactly. The dedicated NPU kernel preserves
         # the cache's storage/layout semantics; Tensor.index_copy_ selects a
@@ -2524,7 +2536,7 @@ def _scatter_by_slot(
         # for the first decode step.
         from xllm.python import kernels
 
-        slots_slice, safe_slots, valid_mask = _slot_guard_tensors(slot_mapping, update_rows, cache.device)
+        _, safe_slots, valid_mask = _slot_guard_tensors(slot_mapping, update_rows, cache.device)
         updates = value_2d[:update_rows].to(cache.dtype)
         context = get_forward_context_or_none()
         if context is not None and context.acl_graph is not None:
@@ -2540,6 +2552,10 @@ def _scatter_by_slot(
             safe_values,
         )
         return
+    slots = slot_mapping.reshape(-1)
+    if slots.device != cache.device or slots.dtype != torch.long:
+        slots = slots.to(device=cache.device, dtype=torch.long)
+    valid = slots[:update_rows] >= 0
     if not valid.any():
         return
     cache_2d.index_copy_(

@@ -740,3 +740,44 @@ def test_graph_rejects_block_table_larger_than_bucket_capacity() -> None:
             enable_graph=True,
             graph_block_table_capacity_cols=2,
         )
+
+
+@pytest.mark.parametrize("column_stride", [1, 2])
+@pytest.mark.parametrize(
+    "source_rows,source_cols,ctx_lens,capacity",
+    [
+        (2, 2, [9, 9], 4),
+        (2, 3, [17, 17], 8),
+        (8, 2, [0, 1, 4, 5, 8, 9, 9, 33], 8),
+        (3, 2, [5, 5, 9, 9, 13, 13], 8),
+        (3, 0, [0, 4, 9], 4),
+        (0, 2, [4, 8], 4),
+        (96, 3, [17] * 96, 8192),
+    ],
+)
+def test_right_aligned_swa_row_copies_match_scalar_ring_addresses(
+    source_rows: int, source_cols: int, ctx_lens: list[int], capacity: int, column_stride: int
+) -> None:
+    builder, _, _ = _make_builder()
+    source = torch.arange(source_rows * source_cols * column_stride, dtype=torch.int32)
+    source = source.reshape(source_rows, source_cols * column_stride)[:, ::column_stride]
+    if source.numel():
+        source[0, 0] = -1
+    batch_size = len(ctx_lens)
+    result, _ = builder._process_swa_group(
+        source,
+        block_size=4,
+        ctx_lens=ctx_lens,
+        q_lens=[1] * batch_size,
+        batch_size=batch_size,
+        graph_slot_capacity=batch_size,
+        graph_block_table_capacity_cols=capacity,
+        new_cache_slots=None,
+    )
+    lengths = [(max(length, 0) + 3) // 4 for length in ctx_lens]
+    expected = torch.full((batch_size, max(capacity, source_cols, max(lengths))), -1, dtype=torch.int32)
+    for row in range(min(source_rows, batch_size)):
+        retained = min(source_cols, lengths[row])
+        for column in range(lengths[row] - retained, lengths[row]):
+            expected[row, column] = source[row, column % source_cols]
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)

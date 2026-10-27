@@ -1152,16 +1152,50 @@ class DsaMetadataBuilder:
             if self.read_table_layout != READ_TABLE_LAYOUT_RING:
                 # Right-aligned tables keep -1 outside the retained columns
                 # by design; consumers preserve the historical remap behaviour.
-                for s in range(batch_size):
-                    if s >= raw_bt.size(0):
-                        continue
-                    retained_cols = min(semantic_cols, dst_lens[s])
-                    start_col = dst_lens[s] - retained_cols
-                    for j in range(retained_cols):
-                        logical_col = start_col + j
-                        physical_col = logical_col % semantic_cols
-                        new_bt[s, logical_col] = raw_bt[s, physical_col]
+                if use_dst_bt:
+                    # A supplied destination may alias the source. Preserve
+                    # the scalar write order for that optional in-place path.
+                    for s in range(rows):
+                        retained_cols = min(semantic_cols, dst_lens[s])
+                        start_col = dst_lens[s] - retained_cols
+                        for j in range(retained_cols):
+                            logical_col = start_col + j
+                            physical_col = logical_col % semantic_cols
+                            new_bt[s, logical_col] = raw_bt[s, physical_col]
+                else:
+                    self._copy_right_aligned_swa_rows(new_bt, raw_bt, dst_lens, rows, semantic_cols)
         return new_bt, out_slots
+
+    @staticmethod
+    def _copy_right_aligned_swa_rows(
+        target: torch.Tensor,
+        source: torch.Tensor,
+        dst_lens: Sequence[int],
+        rows: int,
+        semantic_cols: int,
+    ) -> None:
+        """Copy equal-window row runs, splitting only at the physical ring wrap."""
+        start_row = 0
+        while start_row < rows:
+            end_row = start_row + 1
+            while end_row < rows and dst_lens[end_row] == dst_lens[start_row]:
+                end_row += 1
+            retained_cols = min(semantic_cols, dst_lens[start_row])
+            if retained_cols > 0:
+                start_col = dst_lens[start_row] - retained_cols
+                physical_col = start_col % semantic_cols
+                if end_row == start_row + 1 and retained_cols == 1:
+                    target[start_row, start_col] = source[start_row, physical_col]
+                else:
+                    first_cols = min(retained_cols, semantic_cols - physical_col)
+                    target[start_row:end_row, start_col : start_col + first_cols].copy_(
+                        source[start_row:end_row, physical_col : physical_col + first_cols]
+                    )
+                    if first_cols < retained_cols:
+                        target[start_row:end_row, start_col + first_cols : dst_lens[start_row]].copy_(
+                            source[start_row:end_row, : retained_cols - first_cols]
+                        )
+            start_row = end_row
 
     @staticmethod
     def _swa_slots_on_device(

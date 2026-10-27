@@ -452,6 +452,7 @@ def test_csa2_backend_skips_v4_swa_window_source_prep(monkeypatch: pytest.Monkey
     # consumption, Csa2 opts out because its captured forward computes the
     # window logic in-graph.
     assert backend.graph_uses_swa_window_sources is False
+    assert backend._sparse_metadata_ratios == (1, 4, 128)
     assert csa_attention_module.CsaAttentionBackend.graph_uses_swa_window_sources is True
 
     monkeypatch.setattr(csa_attention_module, "_uses_a5_sparse_kernels", lambda: True)
@@ -678,6 +679,35 @@ def test_scatter_by_slot_npu_works_without_forward_context(monkeypatch: pytest.M
     assert len(calls) == 1
     assert calls[0][1].shape == (3, 1)
     assert calls[0][2].shape == (3, 3)
+
+
+def test_scatter_by_slot_npu_reuses_guard_conversion_and_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from xllm.python import kernels
+
+    operations = []
+
+    class RecordOperations(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            operations.append(func)
+            return func(*args, **(kwargs or {}))
+
+    monkeypatch.setattr(csa_attention_module, "get_forward_context_or_none", lambda: None)
+    monkeypatch.setattr(kernels, "scatter_nd_update", lambda *args: None, raising=False)
+    with FakeTensorMode():
+        cache = torch.zeros(4, 3, dtype=torch.float32, device="npu")
+        slots = torch.tensor([1, -1, 3], dtype=torch.int32, device="npu")
+        values = torch.ones(3, 3, dtype=torch.float32, device="npu")
+        converted = slots.to(torch.long)
+        guards = (converted, converted.clamp_min(0), converted.ge(0).unsqueeze(1))
+        monkeypatch.setattr(csa_attention_module, "_slot_guard_tensors", lambda *args: guards)
+        with RecordOperations():
+            _scatter_by_slot(cache, slots, values)
+
+    assert torch.ops.aten._to_copy.default not in operations
+    assert torch.ops.aten.ge.Scalar not in operations
 
 
 def test_default_mapping_is_empty() -> None:
@@ -1136,6 +1166,51 @@ def test_decode_precomputed_metadata_matches_cpp_contract(monkeypatch) -> None:
     assert qli_calls[0]["actual_seq_lengths_key"].tolist() == [85]
     assert qli_calls[0]["head_dim"] == 128
     assert compressed_metadata.precomputed_metadata_inputs[0] is compressed_metadata.actual_seq_lengths_query
+
+
+@pytest.mark.parametrize("use_a5", [False, True])
+def test_pure_swa_builds_only_consumed_metadata(monkeypatch, use_a5: bool) -> None:
+    backend = CsaAttentionBackend(
+        compress_ratios=[1, 1, 1],
+        window_size=128,
+        n_layers=3,
+        num_heads=8,
+        attn_head_dim=512,
+        index_topk=512,
+        index_n_heads=64,
+        index_head_dim=128,
+        rope_head_dim=64,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    sparse_calls, qli_calls = _patch_metadata_kernels(monkeypatch, use_a5=use_a5)
+    dsa = SimpleNamespace(
+        actual_seq_lengths_query=torch.tensor([0, 1], dtype=torch.int32),
+        actual_seq_lengths_kv=torch.tensor([85], dtype=torch.int32),
+        seq_lens_q=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([85], dtype=torch.int32),
+        max_query_len=1,
+        max_seq_len=85,
+    )
+    metadata = SimpleNamespace(max_query_len=1, max_seq_len=85, dsa_graph_mode=True, dsa_metadata=dsa)
+    backend._build_precomputed_metadata(dsa, metadata)
+    assert [call["cmp_ratio"] for call in sparse_calls] == [1]
+    assert qli_calls == []
+    if use_a5:
+        assert any(value is sparse_calls[0]["seqused_ori_kv"] for value in dsa.precomputed_metadata_inputs)
+    backend.prepare_dsa_metadata_for_forward(metadata)
+    assert len(sparse_calls) == 1
+    dsa.input_positions = torch.tensor([1], dtype=torch.int64)
+    dsa.c4_pad_positions = torch.tensor([2], dtype=torch.int64)
+    dsa.c128_pad_positions = torch.tensor([3], dtype=torch.int64)
+    metadata.dsa_cos_sin = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    metadata.dsa_c4_cos_sin = metadata.dsa_cos_sin + 100
+    metadata.dsa_c128_cos_sin = metadata.dsa_cos_sin + 200
+    rope = backend._build_dsa_rope_metadata(dsa, metadata)
+    assert set(rope) == {1}
+    torch.testing.assert_close(rope[1][0], metadata.dsa_cos_sin[1:2, :2])
+    torch.testing.assert_close(rope[1][1], metadata.dsa_cos_sin[1:2, 2:])
+    assert dsa.c4_cos.numel() == dsa.c128_cos.numel() == 0
 
 
 def test_a5_decode_precomputed_metadata_matches_cpp_contract(monkeypatch) -> None:
