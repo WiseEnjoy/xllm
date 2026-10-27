@@ -2458,3 +2458,85 @@ def test_v41_engram_graph_replay_rejects_invalid_history_shape(shape: tuple[int,
         pytest.raises(ValueError, match="Engram lookback depth"),
     ):
         runner._fill_entry(entry, input_ids, input_ids, metadata, batch_size=4, input_embedding=None)
+
+
+def test_pinned_stage_reuses_shapes_and_waits_before_host_write() -> None:
+    runner = _runner()
+    empty = torch.empty
+    snapshots = []
+
+    def allocate(*args: Any, **kwargs: Any) -> torch.Tensor:
+        kwargs.pop("pin_memory", None)
+        return empty(*args, **kwargs)
+
+    with patch("torch.empty", side_effect=allocate):
+        for step in range(64):
+            source = torch.full((step + 1, 7), step, dtype=torch.int32)
+            staged, key, slot = runner._pinned_stage(source, "block_table")
+            torch.testing.assert_close(staged, source)
+            expected = staged.clone()
+            event = MagicMock()
+            event.query.return_value = False
+            # Simulate the old copy reading host memory only when synchronized.
+            event.synchronize.side_effect = lambda view=staged, value=expected: torch.testing.assert_close(view, value)
+            runner._pinned_stage_events[key][slot] = event
+            snapshots.append(event)
+    assert len(runner._pinned_block_table_staging) == 1
+    ring = next(iter(runner._pinned_block_table_staging.values()))
+    assert len(ring) == 8
+    assert sum(t.storage.numel() * t.storage.element_size() for t in ring) <= 8 * 512 * 4
+    assert sum(event.synchronize.call_count for event in snapshots) == 56
+
+
+def test_pinned_stage_allocation_failure_propagates() -> None:
+    runner = _runner()
+    source = torch.zeros((2, 4), dtype=torch.int32)
+    with (
+        patch("torch.empty", side_effect=RuntimeError("allocator failed")),
+        pytest.raises(RuntimeError, match="allocator failed"),
+    ):
+        runner._pinned_stage(source, "block_table")
+
+
+def test_pinned_stage_preserves_other_managers_inflight_copy() -> None:
+    runner = _runner()
+    empty = torch.empty
+
+    def allocate(*args: Any, **kwargs: Any) -> torch.Tensor:
+        kwargs.pop("pin_memory", None)
+        return empty(*args, **kwargs)
+
+    with patch("torch.empty", side_effect=allocate):
+        first, first_key, first_slot = runner._pinned_stage(torch.ones(4), "manager_0")
+        pending = MagicMock()
+        pending.query.return_value = False
+        runner._pinned_stage_events[first_key][first_slot] = pending
+        for value in range(32):
+            staged, _, _ = runner._pinned_stage(torch.full((4,), float(value)), "manager_1")
+            torch.testing.assert_close(staged, torch.full((4,), float(value)))
+        # Another manager must not consume this manager's overlap slots.
+        pending.synchronize.assert_not_called()
+        torch.testing.assert_close(first, torch.ones(4))
+        for _ in range(8):
+            runner._pinned_stage(torch.zeros(4), "manager_0")
+        pending.synchronize.assert_called_once()
+
+
+def test_pinned_stage_does_not_synchronize_a_completed_copy() -> None:
+    runner = _runner()
+    empty = torch.empty
+
+    def allocate(*args: Any, **kwargs: Any) -> torch.Tensor:
+        kwargs.pop("pin_memory", None)
+        return empty(*args, **kwargs)
+
+    with patch("torch.empty", side_effect=allocate):
+        _, key, slot = runner._pinned_stage(torch.ones(4), "block_table")
+        completed = MagicMock()
+        completed.query.return_value = True
+        runner._pinned_stage_events[key][slot] = completed
+        for _ in range(8):
+            staged, _, _ = runner._pinned_stage(torch.zeros(4), "block_table")
+        torch.testing.assert_close(staged, torch.zeros(4))
+        completed.query.assert_called_once()
+        completed.synchronize.assert_not_called()
