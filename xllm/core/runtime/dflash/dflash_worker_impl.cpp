@@ -1125,9 +1125,13 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
   if (has_json_states) {
-    CHECK(target_output.filter_bitmask_applied_to_logits)
-        << "DFlash target logits must be filtered by the target sampler for "
-           "JSON grammar rows";
+    // A prior-token grammar error retires the affected states before this
+    // forward. An all-retired batch has no mask, even though its state rows
+    // remain present so the request errors can be returned to the scheduler.
+    spec_verify::check_target_masks(
+        target_output,
+        validate_input.sampling_params.filter_mask,
+        validate_input.sampling_params.filter_bitmask);
   }
 
   // Scatter varlen target output back to dense [B, max_val_tokens] layout so

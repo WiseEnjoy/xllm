@@ -121,8 +121,8 @@ def build_apply_token_bitmask_kernel(*, dtype: str, vec_core_num: int):
                         T.tile.select(
                             additive_fp32_ub,
                             allowed_mask_ub,
-                            disallowed_fp32_ub,
                             zero_fp32_ub,
+                            disallowed_fp32_ub,
                             "VSEL_TENSOR_TENSOR_MODE",
                         )
                         T.tile.add(
