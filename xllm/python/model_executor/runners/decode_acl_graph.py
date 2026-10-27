@@ -272,6 +272,13 @@ _GraphKey = tuple[
 ]
 
 
+@dataclass(slots=True)
+class _PinnedStageBuffer:
+    storage: torch.Tensor
+    view: torch.Tensor
+    shape: torch.Size
+
+
 class DecodeAclGraphRunner(BaseRunner):
     """Decode graph runner for NPU (Ascend) using ACL graph capture/replay."""
 
@@ -317,11 +324,11 @@ class DecodeAclGraphRunner(BaseRunner):
         self._graphs: dict[_GraphKey, _DecodeGraphEntry] = {}
         self._paged_kv_indices_buffer: torch.Tensor | None = None
         self._max_blocks_per_sequence: int = 0
-        self._pinned_block_table_staging: dict[tuple[str, torch.dtype, torch.Size], list[torch.Tensor]] = {}
+        self._pinned_block_table_staging: dict[tuple[str, torch.dtype], list[_PinnedStageBuffer | None]] = {}
         # Per-slot events for the reused pinned stages; the next host write to
         # a slot waits on the copy enqueued through it (see _pinned_stage).
-        self._pinned_stage_events: dict[tuple[str, torch.dtype, torch.Size], list[torch.npu.Event | None]] = {}
-        self._pinned_stage_cursor: dict[tuple[str, torch.dtype, torch.Size], int] = {}
+        self._pinned_stage_events: dict[tuple[str, torch.dtype], list[torch.npu.Event | None]] = {}
+        self._pinned_stage_cursor: dict[tuple[str, torch.dtype], int] = {}
         self._stream: torch.npu.Stream | None = None
         self._update_stream: torch.npu.Stream | None = None
         self._replay_done_event: torch.npu.Event | None = None
@@ -2372,7 +2379,7 @@ class DecodeAclGraphRunner(BaseRunner):
 
     def _pinned_stage(
         self, source: torch.Tensor, kind: str
-    ) -> tuple[torch.Tensor, tuple[str, torch.dtype, torch.Size] | None, int | None]:
+    ) -> tuple[torch.Tensor, tuple[str, torch.dtype] | None, int | None]:
         """Return a reusable pinned CPU view for asynchronous graph refreshes.
 
         Stages rotate over ``_PINNED_STAGE_SLOTS`` buffers, each carrying the
@@ -2387,34 +2394,41 @@ class DecodeAclGraphRunner(BaseRunner):
         """
         if source.device.type != "cpu" or source.is_pinned():
             return source, None, None
-        key = (kind, source.dtype, source.shape)
+        # Shapes share one ring. Each slot grows geometrically after its last
+        # copy completes, so retention is bounded by eight largest tables per
+        # dtype rather than eight tables for every shape ever encountered.
+        key = (kind, source.dtype)
         ring = self._pinned_block_table_staging.get(key)
         if ring is None:
-            try:
-                ring = [
-                    torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
-                    for _ in range(self._PINNED_STAGE_SLOTS)
-                ]
-            except RuntimeError:
-                return source, None, None
+            ring = [None] * self._PINNED_STAGE_SLOTS
             self._pinned_block_table_staging[key] = ring
             self._pinned_stage_events[key] = [None] * len(ring)
             self._pinned_stage_cursor[key] = -1
         events = self._pinned_stage_events[key]
         index = (self._pinned_stage_cursor[key] + 1) % len(ring)
         pending = events[index]
-        if pending is not None:
+        if pending is not None and not pending.query():
             pending.synchronize()
-        staged = ring[index]
+        buffer = ring[index]
+        shape = source.shape
+        if buffer is None or buffer.shape != shape:
+            storage = buffer.storage if buffer is not None else None
+            elements = source.numel()
+            if storage is None or storage.numel() < elements:
+                capacity = 1 << (max(1, elements) - 1).bit_length()
+                storage = torch.empty(capacity, dtype=source.dtype, pin_memory=True)
+            buffer = _PinnedStageBuffer(storage, storage[:elements].view(shape), shape)
+            ring[index] = buffer
+        staged = buffer.view
         staged.copy_(source)
         self._pinned_stage_cursor[key] = index
         return staged, key, index
 
-    def _copy_block_table(self, target: torch.Tensor, source: torch.Tensor) -> None:
+    def _copy_block_table(self, target: torch.Tensor, source: torch.Tensor, *, kind: str = "block_table") -> None:
         if target.device.type == source.device.type:
             target.copy_(source)
             return
-        staged, stage_key, stage_index = self._pinned_stage(source, "block_table")
+        staged, stage_key, stage_index = self._pinned_stage(source, kind)
         non_blocking = stage_key is not None and staged.is_pinned() and target.device.type in ("cuda", "npu")
         if non_blocking:
             target.copy_(staged, non_blocking=True)
@@ -2698,9 +2712,17 @@ class DecodeAclGraphRunner(BaseRunner):
                 # Capacity padding must repeat that ring; zero-filled columns
                 # would redirect later positions to the reserved block zero.
                 cols = torch.arange(target.shape[1], device=source.device) % source.shape[1]
-                self._copy_block_table(target[:batch_size], source[:batch_size, cols].clamp_min(0))
+                self._copy_block_table(
+                    target[:batch_size],
+                    source[:batch_size, cols].clamp_min(0),
+                    kind=f"manager_{manager_id}",
+                )
             else:
-                self._copy_block_table(target[:batch_size, : source.shape[1]], source[:batch_size].clamp_min(0))
+                self._copy_block_table(
+                    target[:batch_size, : source.shape[1]],
+                    source[:batch_size].clamp_min(0),
+                    kind=f"manager_{manager_id}",
+                )
 
     def _fill_graph_dsa_positions(
         self,
