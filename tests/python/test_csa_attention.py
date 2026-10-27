@@ -2353,6 +2353,8 @@ def test_move_metadata_to_device_still_moves_cpu_fields(monkeypatch) -> None:
         slot_mappings=[[torch.zeros((2,), dtype=torch.int32)]],
         seq_lens=torch.zeros((2,), dtype=torch.int32),
     )
+    metadata.manager_block_tables = metadata.block_tables[0].copy()
+    metadata.manager_slot_mappings = metadata.slot_mappings[0].copy()
     original_to = torch.Tensor.to
     calls: list[str] = []
 
@@ -2365,6 +2367,10 @@ def test_move_metadata_to_device_still_moves_cpu_fields(monkeypatch) -> None:
 
     # seq_lens + one block table + one slot mapping.
     assert calls == ["meta", "meta", "meta"]
+    assert metadata.block_tables[0][0] is metadata.manager_block_tables[0]
+    assert metadata.slot_mappings[0][0] is metadata.manager_slot_mappings[0]
+    assert metadata.manager_block_tables[0].device.type == "meta"
+    assert metadata.manager_slot_mappings[0].device.type == "meta"
 
 
 # === [Candidate A] In-place refresh ===
@@ -2620,27 +2626,29 @@ def test_capture_path_never_uses_inplace_target() -> None:
         assert getattr(fresh, name) is not getattr(captured, name), name
 
 
-# -- (g) known boundary: host-path .item() D2H -------------------------------
+# -- (g) vectorized host slot mapping ---------------------------------------
 
 
-def test_host_path_item_d2h_is_a_known_boundary(monkeypatch) -> None:
-    # The candidate removes allocations/copies, not the per-row ``.item()`` on
-    # the host SWA/token slot loop (the device slot path is what removes that).
-    # This pins the boundary so a later reader does not mis-attribute the win.
+def test_host_slot_mapping_avoids_scalar_reads_and_preserves_inplace_values(monkeypatch) -> None:
     backend = _inplace_make_backend()
     capture_meta, replay_meta = _paired_metadata(seed=0)
-    persistent = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
+    persistent = backend._build_dsa_metadata_for_forward(capture_meta)
+    expected = backend._build_dsa_metadata_for_forward(replay_meta)
 
-    original_item = torch.Tensor.item
-    calls: list[int] = []
+    def reject_scalar_read(self):  # type: ignore[no-untyped-def]
+        raise AssertionError("slot mapping must gather block ids in a batch")
 
-    def counting_item(self):  # type: ignore[no-untyped-def]
-        calls.append(1)
-        return original_item(self)
-
-    monkeypatch.setattr(torch.Tensor, "item", counting_item)
-    backend._build_dsa_metadata_for_forward(replay_meta, inplace_target=persistent)  # noqa: SLF001
-    assert calls, "expected the host slot loop to keep its per-row .item()"
+    monkeypatch.setattr(torch.Tensor, "item", reject_scalar_read)
+    refreshed = backend._build_dsa_metadata_for_forward(replay_meta, inplace_target=persistent)
+    for actual_grid, expected_grid in (
+        (refreshed.block_tables, expected.block_tables),
+        (refreshed.slot_mappings, expected.slot_mappings),
+    ):
+        for actual_layer, expected_layer in zip(actual_grid, expected_grid, strict=True):
+            for actual, reference in zip(actual_layer, expected_layer, strict=True):
+                assert torch.equal(actual, reference)
+    for name in _INPLACE_FIELDS:
+        assert torch.equal(getattr(refreshed, name), getattr(expected, name)), name
 
 
 def test_replay_copy_guard_skips_alias_and_copies_disjoint(monkeypatch) -> None:

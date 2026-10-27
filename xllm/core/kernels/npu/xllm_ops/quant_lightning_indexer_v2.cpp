@@ -16,14 +16,14 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/library.h>
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <tuple>
+#include <vector>
 
 #include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
 #include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
-#include <cstdint>
-#include <optional>
-#include <vector>
 
 // QuantLightningIndexerV2Va, DeepSeek-V4.1 "_va" variant: the fused candidate
 // entry of the two-level top-k index pool, dispatched to the ACLNN entry point
@@ -52,12 +52,13 @@ construct_quant_lightning_indexer_v2_va_output(const torch::Tensor& query,
   for (size_t i = 0; i < query.sizes().size(); i++) {
     CHECK(query.size(i) > 0)
         << "All values within query's shape should be greater "
-           "than 0, but shape[" << i << "] is " << query.size(i);
+           "than 0, but shape["
+        << i << "] is " << query.size(i);
   }
   for (size_t i = 0; i < key.sizes().size(); i++) {
-    CHECK(key.size(i) > 0)
-        << "All values within key's shape should be greater "
-           "than 0, but shape[" << i << "] is " << key.size(i);
+    CHECK(key.size(i) > 0) << "All values within key's shape should be greater "
+                              "than 0, but shape["
+                           << i << "] is " << key.size(i);
   }
   CHECK(sparse_count > 0)
       << "sparse count should be greater than 0, but now is " << sparse_count;
@@ -125,8 +126,7 @@ quant_lightning_indexer_v2_va(
         query_dequant_scale.scalar_type() == torch::kHalf &&
         key_dequant_scale.scalar_type() == torch::kHalf)
       << "QLI V2 weights/scales must be FP16";
-  CHECK(candidate_mode >= 1 && candidate_mode <= 3)
-      << "Invalid candidate_mode";
+  CHECK(candidate_mode >= 1 && candidate_mode <= 3) << "Invalid candidate_mode";
   CHECK(candidate_mode != 2 || candidate_topk_index.has_value())
       << "Consumer requires candidate blocks";
 

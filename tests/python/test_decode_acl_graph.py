@@ -75,7 +75,7 @@ def _metadata(linear_state_indices: torch.Tensor) -> SimpleNamespace:
     )
 
 
-def test_spec_verify_rows_expand_to_token_row_bucket() -> None:
+def test_spec_verify_rows_keep_sequence_admission_and_expand_buffers() -> None:
     attention_backend = SimpleNamespace(page_size=4, is_mla=False)
     runner = DecodeAclGraphRunner(
         nn.Identity(),
@@ -88,11 +88,16 @@ def test_spec_verify_rows_expand_to_token_row_bucket() -> None:
     )
     metadata = _metadata(torch.arange(2, dtype=torch.int32))
 
+    metadata.spec_verify_width = 6
     assert runner.sequence_batch_capacity == 2
-    assert runner.max_batch == 16
+    assert runner.max_batch == 2
     assert runner._engram_graph_token_capacity() == 16
     with patch.object(runner, "_has_compatible_decode_metadata", return_value=True):
         assert runner.can_execute(torch.zeros(12, dtype=torch.int32), metadata)
+        assert not runner.can_execute(torch.zeros(18, dtype=torch.int32), metadata)
+    runner.warmup(torch.zeros(12, dtype=torch.int32), torch.arange(12), metadata)
+    with pytest.raises(ValueError, match="exceeds ACL graph capacity"):
+        runner.warmup(torch.zeros(18, dtype=torch.int32), torch.arange(18), metadata)
 
 
 def test_plain_decode_does_not_inherit_spec_verify_capacity() -> None:

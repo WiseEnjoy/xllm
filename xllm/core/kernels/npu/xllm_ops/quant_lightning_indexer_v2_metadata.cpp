@@ -13,15 +13,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <glog/logging.h>
 #include <torch/library.h>
 
+#include <cstdint>
+#include <optional>
 #include <string>
 
 #include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
 #include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
-#include <glog/logging.h>
-#include <cstdint>
-#include <optional>
 
 // QuantLightningIndexerV2 metadata factory, DeepSeek-V4.1 "_va" variant:
 // builds the 1024 x int32 per-core schedule buffer consumed by
