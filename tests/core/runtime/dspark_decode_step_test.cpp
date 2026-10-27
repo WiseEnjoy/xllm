@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/speculative/spec_input_builder.h"
+#include "core/framework/speculative/spec_verify.h"
 #include "platform/device.h"
 #include "runtime/dflash/dflash2_worker_impl.h"
 #include "runtime/dspark_worker_impl.h"
@@ -1047,6 +1048,33 @@ TEST(DSparkDecodeStepTest,
       EXPECT_FALSE(input.json_object_states.front().is_complete());
     }
   }
+}
+
+TEST(DSparkDecodeStepTest, RetiredJsonRowsDoNotRequireTargetMask) {
+  Device device(0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(0, 1, nullptr);
+  runtime::Options options;
+  options.speculative_algorithm("DSpark").num_speculative_tokens(2);
+  DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
+  ForwardInput input;
+  input.input_params.meta.num_sequences = 2;
+  input.json_object_states = {JsonObjectGrammarState(),
+                              JsonObjectGrammarState()};
+  const torch::Tensor tokens = torch::zeros(
+      {2, 2}, torch::TensorOptions().dtype(torch::kLong).pinned_memory(true));
+  auto stream = device.get_stream_from_pool();
+  const StreamEventPtr ready = stream->record_event();
+  ASSERT_NE(ready, nullptr);
+  const ForwardInput validation = DFlashWorkerImplTestPeer::prepare_json_states(
+      worker, input, tokens, ready);
+  ASSERT_EQ(validation.json_object_states.size(), 6);
+  EXPECT_FALSE(validation.sampling_params.filter_bitmask.defined());
+  EXPECT_FALSE(validation.sampling_params.filter_mask.defined());
+  spec_verify::check_target_masks(ForwardOutput(),
+                                  validation.sampling_params.filter_mask,
+                                  validation.sampling_params.filter_bitmask);
 }
 
 TEST(DSparkDecodeStepTest, JsonConsumesHostTokensOnlyAfterReadyEvent) {
