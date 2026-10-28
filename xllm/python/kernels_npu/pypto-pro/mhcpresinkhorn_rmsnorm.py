@@ -239,6 +239,12 @@ def _gates1_vf(mixr, ssqr, jloc, scale24, pmul24, eps24, base,
     rj = vf.div(one, m3, preg)
     # z = mix * r * scale + base
     mix_r = vf.load_align(mixr, 0)
+    # Match the V4 BF16 linear output before the FP32 gate computation.
+    mix_bf = vf.astype(mix_r, preg24, dtype=pl.DT_BF16,
+                       layout=pl.CastLayout.ZERO)
+    preg_bf = vf.create_mask(pattern=pl.MaskPattern.ALL, dtype=pl.DT_BF16)
+    mix_r = vf.astype(mix_bf, preg_bf, dtype=pl.DT_FP32,
+                      layout=pl.CastLayout.ZERO)
     z1 = vf.mul(mix_r, scale_r, preg24)
     z2 = vf.mul(rj, z1, preg24)
     z = vf.add(z2, base_r, preg24)
