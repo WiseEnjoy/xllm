@@ -1117,13 +1117,16 @@ def _get_workspaces(t: int, device: torch.device) -> _WorkspaceEntry:
         if entry is not None and entry[0].query():
             return _WS_CACHE.pop(key)
     # Allocation may synchronize the device; do not hold the cache lock.
+    return torch.npu.Event(), _allocate_workspaces(t, device)
+
+
+def _allocate_workspaces(t: int, device: torch.device) -> _Workspaces:
     ng = (t + TG - 1) // TG
     ssq_ws = torch.empty((SSQ_SLICES, ng * TG), dtype=torch.float32,
                          device=device)
     pmix3 = torch.empty((NB, ng * TG, MIXC), dtype=torch.float32,
                         device=device)
-    ws = (pmix3, pmix3.view(NB, ng * TG * MIXC), ssq_ws)
-    return torch.npu.Event(), ws
+    return pmix3, pmix3.view(NB, ng * TG * MIXC), ssq_ws
 
 
 def _mark_workspaces_done(t: int, device: torch.device,
@@ -1245,13 +1248,19 @@ def mhcpresinkhorn_rmsnorm(
     comb = torch.empty((t, HC, HC), dtype=torch.float32, device=device)
     comb16 = comb.view(t, HC * HC)
 
-    entry = _get_workspaces(t, device)
-    pmix3, pmix3f, ssq_ws = entry[1]
+    # Captured allocations belong to the graph pool. Captured events cannot
+    # be queried or synchronized by the eager workspace retirement path.
+    capturing = torch.npu.is_current_stream_capturing()
+    entry = None if capturing else _get_workspaces(t, device)
+    pmix3, pmix3f, ssq_ws = (
+        _allocate_workspaces(t, device) if entry is None else entry[1]
+    )
     try:
         mhcpresinkhorn_rmsnorm_kernel_k[None, NB](
             x_2d, x, hc_fn, hc_scale.view(1, 3), hc_base.view(1, MIX_HC),
             gamma.view(1, D), y, rstd, post, comb16, pmix3, pmix3f, ssq_ws)
     finally:
         # Retain scratch even if a failed invocation enqueued partial work.
-        _mark_workspaces_done(t, device, entry)
+        if entry is not None:
+            _mark_workspaces_done(t, device, entry)
     return y, rstd, post, comb

@@ -149,6 +149,7 @@ class _FakeNpu:
         self.streams: dict[int, _FakeStream] = {}
         self.synchronized: list[Any] = []
         self.next_event_done = True
+        self.capturing = False
         self.allocations: list[tuple[tuple[int, ...], torch.dtype, Any]] = []
 
     def current_stream(self, device: torch.device | None = None) -> _FakeStream:
@@ -161,6 +162,9 @@ class _FakeNpu:
 
     def current_device(self) -> int:
         return self.current_device_id
+
+    def is_current_stream_capturing(self) -> bool:
+        return self.capturing
 
     def Event(self) -> _FakeEvent:  # noqa: N802 - mirrors the torch.npu API
         return _FakeEvent(done=self.next_event_done)
@@ -303,12 +307,12 @@ def test_ub_layout_does_not_overlap(op: Any) -> None:
         ("PMUL24_UB", 1 * 32 * 4),
         ("EPS24_UB", 1 * 32 * 4),
         ("BASE_UB", 1 * 32 * 4),
-        ("ZST_UB", 1 * op.MIX_HC * 4),
+        ("ZST_UB", 8 * op.MIX_HC * 4),
         ("ZSD_UB", op.MIX_HC * op.TG * 4),
         ("CBT_UB", 16 * 8 * 4),
-        ("CBTT_UB", 1 * 16 * 4),
-        ("PST_UB", op.HC * 8 * 4),
-        ("PSTT_UB", 1 * 8 * 4),
+        ("CBTT_UB", 8 * 16 * 4),
+        ("PST_UB", 8 * 8 * 4),
+        ("PSTT_UB", 8 * 8 * 4),
         ("PRE_UB", 1 * 8 * 4),
         ("XSUB_UB", 2 * op.HC * op.DC * 2),
         ("YUB_UB", 2 * 1 * op.DC * 2),
@@ -604,3 +608,20 @@ def test_marks_workspaces_done_when_kernel_raises(op: Any) -> None:
     # Scratch is retained even for a failed launch, so the partial work is
     # drained before the buffers can be handed out again.
     assert op._WS_CACHE[op._ws_key(4, device)][0].recorded == 1
+
+def test_capture_does_not_query_or_publish_eager_workspace_events(op: Any) -> None:
+    device = _npu_device()
+    entry = op._get_workspaces(4, device)
+    entry[0].raise_on_query = True
+    op._WS_CACHE[op._ws_key(4, device)] = entry
+    op._WS_RETIRED.append(entry)
+    op._fake_npu.capturing = True
+
+    for _ in range(16):
+        op.mhcpresinkhorn_rmsnorm(**_valid_args(device))
+
+    assert op._WS_CACHE[op._ws_key(4, device)] is entry
+    assert op._WS_RETIRED == [entry]
+    assert entry[0].recorded == entry[0].synchronized == 0
+    assert op._fake_npu.synchronized == []
+    assert len(op._fake_kernel.calls) == 16

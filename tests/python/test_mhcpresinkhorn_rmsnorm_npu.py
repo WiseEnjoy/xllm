@@ -198,3 +198,29 @@ def test_rmsnorm_output_matches_standalone_rmsnorm() -> None:
     # rstd must not depend on gamma.
     torch.testing.assert_close(rstd.cpu(), rstd_ones.cpu(), rtol=0, atol=0)
     assert torch.isfinite(y.float()).all()
+
+def test_multilayer_graph_replay_with_changed_inputs() -> None:
+    torch_npu.npu.set_device(0)
+    args = _inputs(6)
+    for _ in range(3):
+        op.mhcpresinkhorn_rmsnorm(**args)
+    torch_npu.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    stream = torch.npu.Stream()
+    with torch.npu.graph(graph, stream=stream):
+        outputs = [op.mhcpresinkhorn_rmsnorm(**args) for _ in range(64)]
+
+    for seed in (42, 0, 2026):
+        new_args = _inputs(6, seed)
+        for name, tensor in args.items():
+            tensor.copy_(new_args[name])
+        graph.replay()
+        torch_npu.npu.synchronize()
+        reference = _reference(**args)
+        for result in outputs:
+            for actual, expected, tolerance in zip(
+                result, reference, (2e-2, 2e-3, 2e-3, 2e-3)
+            ):
+                torch.testing.assert_close(
+                    actual.cpu(), expected, rtol=tolerance, atol=tolerance
+                )
