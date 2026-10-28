@@ -120,13 +120,14 @@ SCALE24_UB = 0x07800         # [1,32] fp32 128B
 PMUL24_UB = 0x07900          # [1,32] fp32 128B
 EPS24_UB = 0x07A00           # [1,32] fp32 128B
 BASE_UB = 0x07B00            # [1,32] fp32 128B
-ZST_UB = 0x07C00             # [1,MIX_HC] fp32 96B (single-token zstage)
-ZSD_UB = 0x07C80             # [MIX_HC,TG] fp32 1.5KB (after transpose)
-CBT_UB = 0x08300             # [16,8] fp32 512B (sinkhorn comb output, strided stores)
-CBTT_UB = 0x08500            # [1,16] fp32 64B (after transpose)
-PST_UB = 0x08540             # [HC,8] fp32 128B (post storage)
-PSTT_UB = 0x08600            # [1,8] fp32 32B; disjoint from PST [0x08540,0x085C0)
-PRE_UB = 0x08640             # [1,8] fp32 32B (pre, for the y BRC)
+# Pad physical rows for the PyPTO transpose contract; valid shapes stay per-token.
+ZST_UB = 0x07C00             # [8,MIX_HC] fp32 768B
+ZSD_UB = 0x07F00             # [MIX_HC,TG] fp32 1.5KB
+CBT_UB = 0x08500             # [16,8] fp32 512B
+CBTT_UB = 0x08700            # [8,16] fp32 512B
+PST_UB = 0x08900             # [8,8] fp32 256B
+PSTT_UB = 0x08A00            # [8,8] fp32 256B
+PRE_UB = 0x08B00             # [1,8] fp32 32B
 XSUB_UB = 0x09000            # 2 slots [HC,DC] bf16 4KBx2 (x slices of y, double buffered)
 YUB_UB = 0x0B000             # 2 slots [1,DC] bf16 1KBx2 (one y_norm chunk, double buffered)
 YROW_UB = 0x0C000            # [1,D] bf16 8KB (staging of a whole y row: written by pass1 / read by pass2)
@@ -801,8 +802,9 @@ def _make_vector_tiles():
                          valid_shape=[-1, -1]),
         addrs=BASE_UB, mutex_ids=[16])
     zst = pl.make_tile_group(
-        type=pl.TileType(shape=[1, MIX_HC], dtype=pl.DT_FP32,
-                         target_memory=pl.MemorySpace.Vec),
+        type=pl.TileType(shape=[8, MIX_HC], dtype=pl.DT_FP32,
+                         target_memory=pl.MemorySpace.Vec,
+                         valid_shape=[-1, -1]),
         addrs=ZST_UB, mutex_ids=[21])
     zsd = pl.make_tile_group(
         type=pl.TileType(shape=[MIX_HC, TG], dtype=pl.DT_FP32,
@@ -814,16 +816,17 @@ def _make_vector_tiles():
                          target_memory=pl.MemorySpace.Vec),
         addrs=CBT_UB, mutex_ids=[23])
     cbtt = pl.make_tile_group(
-        type=pl.TileType(shape=[1, 16], dtype=pl.DT_FP32,
+        type=pl.TileType(shape=[8, 16], dtype=pl.DT_FP32,
                          target_memory=pl.MemorySpace.Vec,
                          valid_shape=[-1, -1]),
         addrs=CBTT_UB, mutex_ids=[24])
     pst = pl.make_tile_group(
-        type=pl.TileType(shape=[HC, 8], dtype=pl.DT_FP32,
-                         target_memory=pl.MemorySpace.Vec),
+        type=pl.TileType(shape=[8, 8], dtype=pl.DT_FP32,
+                         target_memory=pl.MemorySpace.Vec,
+                         valid_shape=[-1, -1]),
         addrs=PST_UB, mutex_ids=[25])
     pstt = pl.make_tile_group(
-        type=pl.TileType(shape=[1, 8], dtype=pl.DT_FP32,
+        type=pl.TileType(shape=[8, 8], dtype=pl.DT_FP32,
                          target_memory=pl.MemorySpace.Vec,
                          valid_shape=[-1, -1]),
         addrs=PSTT_UB, mutex_ids=[26])
