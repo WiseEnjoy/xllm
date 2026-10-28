@@ -951,3 +951,80 @@ def test_moe_dp_rejects_metadata_token_count_mismatch(monkeypatch: pytest.Monkey
 
     with forward_context(ctx), pytest.raises(RuntimeError, match="local token count"):
         DeepseekV4MoE.forward(moe, torch.randn(4, 8))
+
+
+@pytest.mark.parametrize("enabled,graph,t,fused", [
+    (True, True, 1, True), (True, True, 32, True),
+    (True, True, 33, False), (True, True, 0, False),
+    (True, False, 6, False), (False, True, 6, False),
+])
+def test_hc_pre_norm_routes_only_measured_graph_shapes(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, graph: bool, t: int, fused: bool
+) -> None:
+    cfg = DeepseekV4Config.from_dict(_DSV4_CONFIG)
+    hc = DeepseekV4HyperConnection(cfg, torch.float32, torch.device("cpu"))
+    x = torch.empty(t, 4, 4096)
+    expected = (torch.ones(t, 4096), torch.ones(t, 4), torch.ones(t, 4, 4))
+    fused_call = MagicMock(return_value=(expected[0], None, expected[1], expected[2]))
+    hc._hc_pre_rmsnorm = fused_call if enabled else None
+    legacy = MagicMock(return_value=expected)
+    norm = MagicMock(return_value=expected[0] * 2)
+    norm.weight = torch.ones(4096)
+    monkeypatch.setattr(hc, "hc_pre", legacy)
+    monkeypatch.setattr(deepseek_v4, "in_acl_graph", lambda: graph)
+    result = hc.hc_pre_norm(x, hc.hc_attn_fn, hc.hc_attn_scale, hc.hc_attn_base, norm)
+    if fused:
+        fused_call.assert_called_once_with(x, hc.hc_attn_fn, hc.hc_attn_scale, hc.hc_attn_base, norm.weight)
+        legacy.assert_not_called()
+        norm.assert_not_called()
+        assert result[0] is expected[0]
+    else:
+        fused_call.assert_not_called()
+        legacy.assert_called_once()
+        norm.assert_called_once_with(expected[0])
+        torch.testing.assert_close(result[0], expected[0] * 2)
+    assert result[1] is expected[1] and result[2] is expected[2]
+
+
+@pytest.mark.parametrize("override", [
+    {}, {"hidden_size": 7168}, {"hc_mult": 8}, {"hc_sinkhorn_iters": 10},
+    {"hc_eps": 1e-5}, {"rms_norm_eps": 1e-5}, {"weight_quant_method": ""},
+])
+def test_pypto_mhc_configuration_gate(
+    monkeypatch: pytest.MonkeyPatch, override: dict[str, object]
+) -> None:
+    monkeypatch.setenv("XLLM_ENABLE_PYPTO_MHC_RMSNORM", "1")
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(get_device_name=lambda device: "Ascend950PR_9579"), raising=False)
+    cfg = DeepseekV4Config.from_dict({**_DSV4_CONFIG, "weight_quant_method": "fp8", **override})
+    device = SimpleNamespace(type="npu")
+    assert deepseek_v4._pypto_mhc_rmsnorm_enabled(cfg, torch.bfloat16, device) is (not override)
+    assert not deepseek_v4._pypto_mhc_rmsnorm_enabled(cfg, torch.float32, device)
+    assert not deepseek_v4._pypto_mhc_rmsnorm_enabled(cfg, torch.bfloat16, torch.device("cpu"))
+    monkeypatch.delenv("XLLM_ENABLE_PYPTO_MHC_RMSNORM")
+    assert not deepseek_v4._pypto_mhc_rmsnorm_enabled(cfg, torch.bfloat16, device)
+
+
+def test_decoder_passes_each_norm_to_its_hc_pre_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    layer = DeepseekV4DecoderLayer.__new__(DeepseekV4DecoderLayer)
+    torch.nn.Module.__init__(layer)
+    hidden = torch.empty(1, 4, 8)
+    intermediate = torch.empty_like(hidden)
+    output = torch.empty_like(hidden)
+    attn_input, ffn_input = torch.empty(1, 8), torch.empty(1, 8)
+    post, comb = torch.empty(1, 4), torch.empty(1, 4, 4)
+    layer.hc = MagicMock()
+    layer.hc.hc_pre_norm.side_effect = [(attn_input, post, comb), (ffn_input, post, comb)]
+    layer.hc.hc_post.side_effect = [intermediate, output]
+    layer.input_layernorm = torch.nn.Identity()
+    layer.post_attention_layernorm = torch.nn.Identity()
+    layer.self_attn = MagicMock(return_value=attn_input)
+    layer.mlp = torch.nn.Identity()
+    monkeypatch.setattr(deepseek_v4, "get_forward_context", lambda: SimpleNamespace(metadata=None))
+
+    actual, residual = layer(hidden, None, torch.zeros(1), torch.zeros(1))
+
+    calls = layer.hc.hc_pre_norm.call_args_list
+    assert len(calls) == 2
+    assert calls[0].args[0] is hidden and calls[0].args[-1] is layer.input_layernorm
+    assert calls[1].args[0] is intermediate and calls[1].args[-1] is layer.post_attention_layernorm
+    assert actual is output and residual is None

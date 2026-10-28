@@ -33,8 +33,10 @@ linear / MLP / MoE / YaRN-RoPE / weight-loader primitives from
 
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass, field, replace
+from importlib import import_module
 from typing import Any, Callable, ClassVar, Sequence
 
 import torch
@@ -578,6 +580,25 @@ class DeepseekV4RotaryEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _pypto_mhc_rmsnorm_enabled(
+    cfg: DeepseekV4Config, dtype: torch.dtype, device: torch.device
+) -> bool:
+    """Select the measured A5 specialization before loading its optional runtime."""
+    if not (
+        os.getenv("XLLM_ENABLE_PYPTO_MHC_RMSNORM", "0") == "1"
+        and cfg.uses_mx_formats
+        and dtype == torch.bfloat16
+        and device.type == "npu"
+        and cfg.hc_mult == 4
+        and cfg.hidden_size == 4096
+        and cfg.hc_sinkhorn_iters == 20
+        and cfg.hc_eps == 1e-6
+        and cfg.rms_norm_eps == 1e-6
+    ):
+        return False
+    return torch.npu.get_device_name(device).startswith("Ascend950")
+
+
 class DeepseekV4HyperConnection(nn.Module):
     """HyperConnection residual path (hc_pre + hc_post).
 
@@ -617,6 +638,11 @@ class DeepseekV4HyperConnection(nn.Module):
                 nn.Parameter(torch.empty(3, dtype=torch.float32, device=device)),
             )
 
+        self._hc_pre_rmsnorm: Callable[..., tuple[torch.Tensor, ...]] | None = None
+        if _pypto_mhc_rmsnorm_enabled(cfg, dtype, device):
+            module = import_module("xllm.python.kernels_npu.pypto-pro.mhcpresinkhorn_rmsnorm")
+            self._hc_pre_rmsnorm = module.mhcpresinkhorn_rmsnorm
+
     def process_weights_after_loading(self) -> None:
         """Convert mixed-residual weights once to the kernel's BF16 path.
 
@@ -653,6 +679,21 @@ class DeepseekV4HyperConnection(nn.Module):
             self.norm_eps,
             self.hc_eps,
         )
+
+    def hc_pre_norm(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm: RMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fuse the measured small-token graph path, preserving eager execution."""
+        if self._hc_pre_rmsnorm is not None and 0 < x.shape[0] <= 32 and in_acl_graph():
+            y, _, post, comb = self._hc_pre_rmsnorm(x, hc_fn, hc_scale, hc_base, norm.weight)
+            return y, post, comb
+        y, post, comb = self.hc_pre(x, hc_fn, hc_scale, hc_base)
+        return norm(y), post, comb
 
     def hc_post(
         self,
@@ -2208,24 +2249,24 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Match DeepseekV4DecoderLayerImpl::forward exactly: HyperConnection
         # selects the 2D sub-input first, then RMSNorm is applied to that input.
         residual_attn = hidden
-        attn_input, post_attn, comb_attn = self.hc.hc_pre(
+        attn_input, post_attn, comb_attn = self.hc.hc_pre_norm(
             hidden,
             self.hc.hc_attn_fn,
             self.hc.hc_attn_scale,
             self.hc.hc_attn_base,
+            self.input_layernorm,
         )
-        attn_input = self.input_layernorm(attn_input)
         attn_output = self.self_attn(attn_input, positions, cos_sin_cache, cos=cos, sin=sin)
         hidden = self.hc.hc_post(attn_output, residual_attn, post_attn, comb_attn)
 
         residual_ffn = hidden
-        ffn_input, post_ffn, comb_ffn = self.hc.hc_pre(
+        ffn_input, post_ffn, comb_ffn = self.hc.hc_pre_norm(
             hidden,
             self.hc.hc_ffn_fn,
             self.hc.hc_ffn_scale,
             self.hc.hc_ffn_base,
+            self.post_attention_layernorm,
         )
-        ffn_input = self.post_attention_layernorm(ffn_input)
         dsa = getattr(get_forward_context().metadata, "dsa_metadata", None)
         cp_ctx = getattr(dsa, "v4_cp_context", None) if dsa is not None else None
         if cp_ctx is not None and cp_ctx.enabled():
