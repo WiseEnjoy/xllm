@@ -1028,3 +1028,22 @@ def test_decoder_passes_each_norm_to_its_hc_pre_chain(monkeypatch: pytest.Monkey
     assert calls[0].args[0] is hidden and calls[0].args[-1] is layer.input_layernorm
     assert calls[1].args[0] is intermediate and calls[1].args[-1] is layer.post_attention_layernorm
     assert actual is output and residual is None
+
+
+def test_pypto_mhc_accepts_reflected_fp32_epsilon_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XLLM_ENABLE_PYPTO_MHC_RMSNORM", "1")
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(get_device_name=lambda device: "Ascend950PR_9579"), raising=False)
+    epsilon = torch.tensor(1e-6, dtype=torch.float32)
+    reflected = epsilon.item()
+    assert reflected != 1e-6
+    cfg = DeepseekV4Config.from_dict({
+        **_DSV4_CONFIG, "weight_quant_method": "fp8", "hc_eps": reflected, "rms_norm_eps": reflected,
+    })
+    device = SimpleNamespace(type="npu")
+    assert deepseek_v4._pypto_mhc_rmsnorm_enabled(cfg, torch.bfloat16, device)
+    adjacent = torch.nextafter(epsilon, torch.tensor(float("inf"))).item()
+    cfg.hc_eps = adjacent
+    assert not deepseek_v4._pypto_mhc_rmsnorm_enabled(cfg, torch.bfloat16, device)
+    cfg.hc_eps = reflected
+    cfg.rms_norm_eps = adjacent
+    assert not deepseek_v4._pypto_mhc_rmsnorm_enabled(cfg, torch.bfloat16, device)

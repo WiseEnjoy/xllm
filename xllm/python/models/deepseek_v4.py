@@ -33,15 +33,19 @@ linear / MLP / MoE / YaRN-RoPE / weight-loader primitives from
 
 from __future__ import annotations
 
+import ctypes
 import os
 import threading
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from importlib import import_module
 from typing import Any, Callable, ClassVar, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from scripts.logger import logger
 
 # CPU test environments (tests/python/conftest.py stubs the kernels package)
 # have no torch_npu; only the NPU kernel paths below need it.
@@ -592,11 +596,18 @@ def _pypto_mhc_rmsnorm_enabled(
         and cfg.hc_mult == 4
         and cfg.hidden_size == 4096
         and cfg.hc_sinkhorn_iters == 20
-        and cfg.hc_eps == 1e-6
-        and cfg.rms_norm_eps == 1e-6
+        # ModelArgs reflects C++ float values into Python doubles. Compare
+        # the FP32 values consumed by both device implementations.
+        and ctypes.c_float(cfg.hc_eps).value == ctypes.c_float(1e-6).value
+        and ctypes.c_float(cfg.rms_norm_eps).value == ctypes.c_float(1e-6).value
     ):
         return False
     return torch.npu.get_device_name(device).startswith("Ascend950")
+
+
+@lru_cache(maxsize=1)
+def _log_pypto_mhc_rmsnorm_active() -> None:
+    logger.info("PyPTO mhcpresinkhorn_rmsnorm active for V4 graph inputs of 1..32 tokens")
 
 
 class DeepseekV4HyperConnection(nn.Module):
@@ -691,6 +702,7 @@ class DeepseekV4HyperConnection(nn.Module):
         """Fuse the measured small-token graph path, preserving eager execution."""
         if self._hc_pre_rmsnorm is not None and 0 < x.shape[0] <= 32 and in_acl_graph():
             y, _, post, comb = self._hc_pre_rmsnorm(x, hc_fn, hc_scale, hc_base, norm.weight)
+            _log_pypto_mhc_rmsnorm_active()
             return y, post, comb
         y, post, comb = self.hc_pre(x, hc_fn, hc_scale, hc_base)
         return norm(y), post, comb
