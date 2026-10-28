@@ -19,13 +19,11 @@ is covered by ``test_mhcpresinkhorn_rmsnorm.py`` on CPU.  This module runs the
 real kernel on an Ascend device and compares it against a pure-torch
 re-implementation of the fused chain:
 
-1. ``mix = x @ hc_fn``            (bf16 matmul, K = 4 * 4096 split over cores)
-2. ``r = 1 / sqrt(mean(x^2) + eps)`` per token over all ``4 * 4096`` lanes
-3. ``z = mix * r * hc_scale + hc_base``
-4. ``pp = sigmoid(z) * pmul + eps`` for the 8 "comb" lanes, ``z`` for the 16
-   "post" lanes
-5. ``y = sum_m pp[m] * x[m]`` then ``y_norm = y * rstd * gamma``
-6. Sinkhorn normalization (20 iterations) over the 4x4 comb matrix
+1. FP32 accumulation of the BF16 inputs: ``mix = x @ hc_fn.T``.
+2. Per-token inverse RMS over all ``4 * 4096`` input lanes.
+3. Scale and bias the 4 pre, 4 post and 16 combination logits.
+4. Sigmoid pre/post gates and 20 Sinkhorn iterations on the combination logits.
+5. Collapse streams to BF16, then apply RMSNorm with the fused gamma.
 """
 
 from __future__ import annotations
@@ -76,11 +74,6 @@ RMS_EPS = op.RMS_EPS
 SINKHORN_ITERS = op.SINKHORN_ITERS
 
 
-def _pmul() -> torch.Tensor:
-    """Per-lane multiplier used by the kernel (4x1, 4x2, 16x1)."""
-    return torch.tensor([1.0] * 4 + [2.0] * 4 + [1.0] * 16, dtype=torch.float32)
-
-
 def _reference(
     x: torch.Tensor,
     hc_fn: torch.Tensor,
@@ -88,45 +81,49 @@ def _reference(
     hc_base: torch.Tensor,
     gamma: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """fp32 reference of the whole fused chain."""
+    """CPU mathematical reference; preserve the BF16 boundary before RMSNorm."""
     t = x.shape[0]
-    x_fp32 = x.float()
-    x_2d = x_fp32.reshape(t, HC_D)
+    x_fp32 = x.detach().cpu().float()
+    fn_fp32 = hc_fn.detach().cpu().float()
+    scale = hc_scale.detach().cpu().float()
+    base = hc_base.detach().cpu().float()
+    gamma_fp32 = gamma.detach().cpu().float()
+    flattened = x_fp32.reshape(t, HC_D)
+    # BF16 operands are exact in FP32; do not round the FP32 accumulator.
+    mix = flattened @ fn_fp32.T
+    inv_rms = torch.rsqrt(flattened.square().mean(dim=-1, keepdim=True) + EPS)
+    mix = mix * inv_rms
+    pre = torch.sigmoid(mix[:, :HC] * scale[0] + base[:HC]) + EPS
+    post = torch.sigmoid(mix[:, HC:2 * HC] * scale[1] + base[HC:2 * HC]) * 2.0
+    logits = (mix[:, 2 * HC:] * scale[2] + base[2 * HC:]).reshape(t, HC, HC)
 
-    # 1. mix = x @ hc_fn, computed in bf16 like the cube unit does.
-    mix = (x.reshape(t, HC_D) @ hc_fn).float()
-
-    # 2. r = 1 / sqrt(mean(x^2) + eps) over the whole 4 * 4096 row.
-    ssq = x_2d.square().sum(dim=-1, keepdim=True)
-    r = torch.rsqrt(ssq * (1.0 / HC_D) + EPS)
-
-    # 3. z = mix * r * scale + base; scale is broadcast per 4/4/16 lanes.
-    scale = torch.cat([
-        hc_scale[0].expand(4),
-        hc_scale[1].expand(4),
-        hc_scale[2].expand(16),
-    ])
-    z = mix * r * scale + hc_base
-
-    # 4. sigmoid on the 8 comb lanes, linear on the 16 post lanes.
-    sig = torch.sigmoid(z[:, :8])
-    pp = torch.cat([sig * _pmul()[:8] + EPS, z[:, 8:]], dim=-1)
-
-    # 5. y = sum_m pp[m] * x[m], then RmsNorm with the fused gamma.
-    y = torch.einsum("tm,tmd->td", pp[:, :HC], x_fp32)
+    # hc_pre emits BF16; the subsequent model RMSNorm consumes that value.
+    y = (x_fp32 * pre.unsqueeze(-1)).sum(dim=1).to(torch.bfloat16).float()
     rstd = torch.rsqrt(y.square().mean(dim=-1, keepdim=True) + RMS_EPS)
-    y_norm = (y * rstd * gamma.float()).to(torch.bfloat16)
+    y_norm = (y * rstd * gamma_fp32).to(torch.bfloat16)
 
-    # 6. Sinkhorn over the 4x4 comb matrix (row softmax, then 20 iterations).
-    comb = pp[:, :HC * HC].reshape(t, HC, HC).clone()
-    comb = torch.softmax(comb, dim=-1) + EPS
+    comb = torch.softmax(logits, dim=-1) + EPS
     comb = comb / (comb.sum(dim=-2, keepdim=True) + EPS)
     for _ in range(SINKHORN_ITERS - 1):
         comb = comb / (comb.sum(dim=-1, keepdim=True) + EPS)
         comb = comb / (comb.sum(dim=-2, keepdim=True) + EPS)
-
-    post = pp[:, HC * HC:HC * HC + HC].contiguous()
     return y_norm, rstd, post, comb
+
+
+def test_reference_constant_input() -> None:
+    """Zero logits give uniform gates; constant streams collapse to exactly 2."""
+    y, rstd, post, comb = _reference(
+        torch.ones(1, HC, D, dtype=torch.bfloat16),
+        torch.zeros(MIX_HC, HC_D, dtype=torch.bfloat16),
+        torch.ones(3),
+        torch.zeros(MIX_HC),
+        torch.ones(D, dtype=torch.bfloat16),
+    )
+    torch.testing.assert_close(y, torch.ones_like(y), rtol=0, atol=0)
+    expected_rstd = torch.rsqrt(torch.full_like(rstd, 4.0 + RMS_EPS))
+    torch.testing.assert_close(rstd, expected_rstd, rtol=0, atol=0)
+    torch.testing.assert_close(post, torch.ones_like(post), rtol=0, atol=0)
+    torch.testing.assert_close(comb, torch.full_like(comb, 0.25), rtol=0, atol=EPS)
 
 
 def _inputs(t: int, seed: int = 2026) -> dict[str, torch.Tensor]:
@@ -140,10 +137,11 @@ def _inputs(t: int, seed: int = 2026) -> dict[str, torch.Tensor]:
     )
 
 
-@pytest.mark.parametrize("t", [1, 15, 16, 33])
-def test_matches_reference(t: int) -> None:
+@pytest.mark.parametrize("t", [1, 15, 16, 17, 33])
+@pytest.mark.parametrize("seed", [2026, 42])
+def test_matches_reference(t: int, seed: int) -> None:
     torch_npu.npu.set_device(0)
-    args = _inputs(t)
+    args = _inputs(t, seed)
 
     y, rstd, post, comb = op.mhcpresinkhorn_rmsnorm(**args)
     torch_npu.npu.synchronize()
